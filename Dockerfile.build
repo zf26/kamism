@@ -1,0 +1,44 @@
+# 用于在 Linux 容器内编译 kamism-server
+# 使用方式：
+#   docker build -f Dockerfile.build -t kamism-builder .
+#   docker run --rm -v "%cd%/dist-server:/out" kamism-builder
+# 产物会输出到 ./dist-server/kamism-server
+
+FROM rust:1.89-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制 Cargo 文件
+COPY Cargo.toml ./
+COPY server/Cargo.toml server/
+COPY src-tauri/Cargo.toml src-tauri/
+
+# 占位源文件，先缓存依赖
+RUN mkdir -p server/src src-tauri/src \
+    && echo 'fn main(){}' > server/src/main.rs \
+    && printf '[lib]\nname="kamism_lib"\n' >> src-tauri/Cargo.toml \
+    && echo 'pub fn run(){}\npub async fn start_server() -> anyhow::Result<()> { Ok(()) }' > src-tauri/src/lib.rs \
+    && echo 'fn main(){}' > src-tauri/src/main.rs
+
+RUN cargo build --release -p kamism-server 2>/dev/null || true
+
+# 复制真实源码
+COPY src-tauri/src src-tauri/src
+COPY src-tauri/migrations src-tauri/migrations
+COPY src-tauri/build.rs src-tauri/build.rs
+COPY server/src server/src
+
+RUN touch src-tauri/src/lib.rs server/src/main.rs
+RUN cargo build --release -p kamism-server
+
+# 输出阶段：把二进制复制到 /out
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/kamism-server /kamism-server
+CMD ["cp", "/kamism-server", "/out/kamism-server"]
+

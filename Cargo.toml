@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "src-tauri",
+    "server",
+]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1

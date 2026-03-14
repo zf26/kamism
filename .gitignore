@@ -1,0 +1,21 @@
+# 依赖和构建产物
+target/
+node_modules/
+dist/
+dist-server/
+
+# 环境变量（不提交真实配置）
+.env
+src-tauri/.env
+.env.production
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# 日志
+*.log
+check_output.txt

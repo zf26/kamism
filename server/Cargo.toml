@@ -1,0 +1,15 @@
+[package]
+name = "kamism-server"
+version = "0.1.0"
+edition = "2021"
+default-run = "kamism-server"
+
+[[bin]]
+name = "kamism-server"
+path = "src/main.rs"
+
+[dependencies]
+# 不启用 desktop feature，避免引入 Tauri 和 GTK 依赖
+kamism = { path = "../src-tauri", default-features = false }
+tokio = { version = "1", features = ["full"] }
+dotenvy = "0.15"
