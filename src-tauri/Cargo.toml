@@ -58,3 +58,7 @@ lettre = { version = "0.11", features = ["tokio1-native-tls", "smtp-transport", 
 
 # Redis（验证码存储）
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# RabbitMQ（异步降级任务）
+lapin = "4"
+futures-lite = "2"

@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuthStore } from '../../stores/auth';
 import { authApi } from '../../lib/api';
-import { Zap, Mail, Lock, ArrowRight } from 'lucide-react';
+import { Mail, Lock, ArrowRight } from 'lucide-react';
 import toast from 'react-hot-toast';
+import appIcon from '../../assets/app-icon.png';
 
 export default function Login() {
   const navigate = useNavigate();
@@ -40,14 +41,11 @@ export default function Login() {
       <div style={{ width: '100%', maxWidth: 400, padding: '0 20px' }}>
         {/* Logo */}
         <div style={{ textAlign: 'center', marginBottom: 40 }}>
-          <div style={{
-            width: 52, height: 52, margin: '0 auto 16px',
-            background: 'linear-gradient(135deg, var(--accent), #a78bfa)',
-            borderRadius: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 8px 32px rgba(124,106,247,0.3)',
-          }}>
-            <Zap size={24} color="#fff" />
-          </div>
+          <img
+            src={appIcon}
+            alt="KamiSM"
+            style={{ width: 52, height: 52, margin: '0 auto 16px', display: 'block', borderRadius: 14, boxShadow: '0 8px 32px rgba(124,106,247,0.3)' }}
+          />
           <h1 style={{ fontSize: 26, fontWeight: 800, letterSpacing: '-0.5px' }}>KamiSM</h1>
           <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: 4 }}>卡密管理平台 · 商户登录</p>
         </div>

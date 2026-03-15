@@ -5,4 +5,5 @@ pub mod apps;
 pub mod cards;
 pub mod activations;
 pub mod public_api;
+pub mod plan_config;
 

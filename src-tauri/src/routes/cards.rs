@@ -1,12 +1,13 @@
 use crate::{
     middleware::auth::{AppState, auth_middleware},
     models::card::Card,
+    routes::plan_config::get_config_by_plan,
     utils::{card_gen::generate_card_code, jwt::Claims},
 };
 use axum::{
     extract::{Path, Query, State},
     middleware,
-    routing::{get, patch},
+    routing::{get, patch, post},
     Extension, Json, Router,
 };
 use serde::Deserialize;
@@ -31,9 +32,17 @@ pub struct CardQuery {
     pub page_size: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub struct BatchCardStatusRequest {
+    pub ids: Vec<Uuid>,
+    /// "disabled" 或 "unused"（启用）
+    pub action: String,
+}
+
 pub fn cards_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/cards", get(list_cards).post(generate_cards))
+        .route("/cards/batch-status", post(batch_update_card_status))
         .route("/cards/:id", get(get_card).delete(delete_card))
         .route("/cards/:id/disable", patch(disable_card))
         .route("/cards/:id/enable", patch(enable_card))
@@ -113,6 +122,43 @@ async fn generate_cards(
         return Json(json!({"success": false, "message": "设备数量需在 1-100 之间"}));
     }
 
+    // 非管理员检查套餐限制
+    if claims.role != "admin" {
+        let plan: (String,) = sqlx::query_as("SELECT plan FROM merchants WHERE id = $1")
+            .bind(merchant_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or_else(|_| ("free".to_string(),));
+        let config = get_config_by_plan(&state.pool, &plan.0).await;
+
+        if config.max_gen_once != -1 && body.count > config.max_gen_once as u32 {
+            return Json(json!({
+                "success": false,
+                "message": format!("{}单次最多生成 {} 张卡密", config.label, config.max_gen_once)
+            }));
+        }
+        if config.max_cards != -1 {
+            let card_count: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM cards WHERE merchant_id = $1")
+                    .bind(merchant_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap_or((0,));
+            if card_count.0 + body.count as i64 > config.max_cards as i64 {
+                return Json(json!({
+                    "success": false,
+                    "message": format!("{}最多拥有 {} 张卡密（当前已有 {} 张），请升级套餐", config.label, config.max_cards, card_count.0)
+                }));
+            }
+        }
+        if config.max_devices != -1 && body.max_devices > config.max_devices {
+            return Json(json!({
+                "success": false,
+                "message": format!("{}单张卡密最多绑定 {} 台设备，请升级套餐", config.label, config.max_devices)
+            }));
+        }
+    }
+
     // 验证 app 归属
     let app_exists: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM apps WHERE id = $1 AND (merchant_id = $2 OR $3 = 'admin') AND status = 'active'",
@@ -128,28 +174,43 @@ async fn generate_cards(
         return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
     }
 
-    let mut generated = 0u32;
-    for _ in 0..body.count {
-        let code = generate_card_code();
-        let _ = sqlx::query(
-            "INSERT INTO cards (app_id, merchant_id, code, duration_days, max_devices, note) VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(body.app_id)
-        .bind(merchant_id)
-        .bind(&code)
-        .bind(body.duration_days)
-        .bind(body.max_devices)
-        .bind(&body.note)
-        .execute(&state.pool)
-        .await;
-        generated += 1;
-    }
+    // 批量生成：先在内存中生成所有 code，再用单条 INSERT ... VALUES 写入
+    let codes: Vec<String> = (0..body.count).map(|_| generate_card_code()).collect();
 
-    Json(json!({
-        "success": true,
-        "message": format!("成功生成 {} 张卡密", generated),
-        "count": generated
-    }))
+    // 构建 VALUES 占位符：($1,$2,$3,$4,$5,$6), ($7,...) ...
+    let mut params_sql = String::new();
+    let base = 6usize;
+    for i in 0..codes.len() {
+        let n = i * base;
+        if i > 0 { params_sql.push(','); }
+        params_sql.push_str(&format!(
+            "(${},${},${},${},${},${})",
+            n+1, n+2, n+3, n+4, n+5, n+6
+        ));
+    }
+    let sql = format!(
+        "INSERT INTO cards (app_id, merchant_id, code, duration_days, max_devices, note) VALUES {}",
+        params_sql
+    );
+
+    let mut q = sqlx::query(&sql);
+    for code in &codes {
+        q = q
+            .bind(body.app_id)
+            .bind(merchant_id)
+            .bind(code)
+            .bind(body.duration_days)
+            .bind(body.max_devices)
+            .bind(&body.note);
+    }
+    match q.execute(&state.pool).await {
+        Ok(r) => Json(json!({
+            "success": true,
+            "message": format!("成功生成 {} 张卡密", r.rows_affected()),
+            "count": r.rows_affected()
+        })),
+        Err(e) => Json(json!({"success": false, "message": format!("生成失败: {}", e)})),
+    }
 }
 
 async fn get_card(
@@ -202,18 +263,27 @@ async fn disable_card(
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
     let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
-    let result = sqlx::query(
-        "UPDATE cards SET status = 'disabled' WHERE id = $1 AND (merchant_id = $2 OR $3 = 'admin')",
-    )
-    .bind(id)
-    .bind(merchant_id)
-    .bind(&claims.role)
-    .execute(&state.pool)
-    .await;
+    let result = if claims.role == "admin" {
+        // 管理员禁用：打 admin_disabled 标记
+        sqlx::query(
+            "UPDATE cards SET status = 'disabled', admin_disabled = TRUE WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE cards SET status = 'disabled' WHERE id = $1 AND merchant_id = $2 AND admin_disabled = FALSE",
+        )
+        .bind(id)
+        .bind(merchant_id)
+        .execute(&state.pool)
+        .await
+    };
 
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "卡密已禁用"})),
-        Ok(_) => Json(json!({"success": false, "message": "卡密不存在或无权限"})),
+        Ok(_) => Json(json!({"success": false, "message": "卡密不存在、无权限或已被管理员锁定"})),
         Err(e) => Json(json!({"success": false, "message": format!("操作失败: {}", e)})),
     }
 }
@@ -224,19 +294,92 @@ async fn enable_card(
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
     let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
-    // 只允许将 disabled 状态的卡密重新启用为 unused
-    let result = sqlx::query(
-        "UPDATE cards SET status = 'unused' WHERE id = $1 AND status = 'disabled' AND (merchant_id = $2 OR $3 = 'admin')",
-    )
-    .bind(id)
-    .bind(merchant_id)
-    .bind(&claims.role)
-    .execute(&state.pool)
-    .await;
+    let result = if claims.role == "admin" {
+        // 管理员启用：同时清除 admin_disabled
+        sqlx::query(
+            "UPDATE cards SET status = 'unused', admin_disabled = FALSE WHERE id = $1 AND status = 'disabled'",
+        )
+        .bind(id)
+        .execute(&state.pool)
+        .await
+    } else {
+        // 商户：只能启用非管理员禁用的卡密
+        sqlx::query(
+            "UPDATE cards SET status = 'unused' WHERE id = $1 AND status = 'disabled' AND merchant_id = $2 AND admin_disabled = FALSE",
+        )
+        .bind(id)
+        .bind(merchant_id)
+        .execute(&state.pool)
+        .await
+    };
 
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "卡密已启用"})),
-        Ok(_) => Json(json!({"success": false, "message": "卡密不存在、状态不符或无权限"})),
+        Ok(_) => Json(json!({"success": false, "message": "卡密不存在、状态不符、无权限或已被管理员锁定"})),
         Err(e) => Json(json!({"success": false, "message": format!("操作失败: {}", e)})),
+    }
+}
+
+/// 批量禁用/启用卡密（单条 SQL ANY，防止大量请求冲击数据库）
+async fn batch_update_card_status(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<BatchCardStatusRequest>,
+) -> Json<Value> {
+    if body.ids.is_empty() {
+        return Json(json!({"success": false, "message": "ids 不能为空"}));
+    }
+    if body.ids.len() > 500 {
+        return Json(json!({"success": false, "message": "单次批量操作最多 500 张"}));
+    }
+    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+
+    let result = match body.action.as_str() {
+        "disabled" => {
+            if claims.role == "admin" {
+                sqlx::query(
+                    "UPDATE cards SET status = 'disabled', admin_disabled = TRUE WHERE id = ANY($1)",
+                )
+                .bind(&body.ids)
+                .execute(&state.pool)
+                .await
+            } else {
+                sqlx::query(
+                    "UPDATE cards SET status = 'disabled' WHERE id = ANY($1) AND merchant_id = $2 AND admin_disabled = FALSE",
+                )
+                .bind(&body.ids)
+                .bind(merchant_id)
+                .execute(&state.pool)
+                .await
+            }
+        }
+        "unused" => {
+            if claims.role == "admin" {
+                sqlx::query(
+                    "UPDATE cards SET status = 'unused', admin_disabled = FALSE WHERE id = ANY($1) AND status = 'disabled'",
+                )
+                .bind(&body.ids)
+                .execute(&state.pool)
+                .await
+            } else {
+                // 商户：排除 admin_disabled 的卡密
+                sqlx::query(
+                    "UPDATE cards SET status = 'unused' WHERE id = ANY($1) AND status = 'disabled' AND merchant_id = $2 AND admin_disabled = FALSE",
+                )
+                .bind(&body.ids)
+                .bind(merchant_id)
+                .execute(&state.pool)
+                .await
+            }
+        }
+        _ => return Json(json!({"success": false, "message": "action 仅支持 disabled / unused"})),
+    };
+
+    match result {
+        Ok(r) => Json(json!({
+            "success": true,
+            "message": format!("已更新 {} 张卡密", r.rows_affected())
+        })),
+        Err(e) => Json(json!({"success": false, "message": format!("批量操作失败: {}", e)})),
     }
 }

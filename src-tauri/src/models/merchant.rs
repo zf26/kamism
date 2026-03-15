@@ -10,6 +10,8 @@ pub struct Merchant {
     pub password_hash: String,
     pub api_key: String,
     pub status: String,
+    pub plan: String,
+    pub plan_expires_at: Option<DateTime<Utc>>,
     pub email_verified: bool,
     pub verify_token: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -23,6 +25,8 @@ pub struct MerchantPublic {
     pub email: String,
     pub api_key: String,
     pub status: String,
+    pub plan: String,
+    pub plan_expires_at: Option<DateTime<Utc>>,
     pub email_verified: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -35,9 +39,10 @@ impl From<Merchant> for MerchantPublic {
             email: m.email,
             api_key: m.api_key,
             status: m.status,
+            plan: m.plan,
+            plan_expires_at: m.plan_expires_at,
             email_verified: m.email_verified,
             created_at: m.created_at,
         }
     }
 }
-

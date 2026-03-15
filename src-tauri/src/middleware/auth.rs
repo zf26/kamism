@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use lapin::Channel;
 use redis::aio::ConnectionManager;
 use serde_json::json;
 
@@ -16,6 +17,7 @@ pub struct AppState {
     pub jwt_secret: String,
     pub mailer: MailerConfig,
     pub redis: ConnectionManager,
+    pub mq_channel: std::sync::Arc<Channel>,
 }
 
 pub async fn auth_middleware(

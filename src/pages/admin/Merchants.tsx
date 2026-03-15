@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { adminApi } from '../../lib/api';
-import { CheckCircle, XCircle, RefreshCw, Search } from 'lucide-react';
+import { CheckCircle, XCircle, RefreshCw, Search, Crown, Gift, Clock } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface Merchant {
@@ -9,20 +9,70 @@ interface Merchant {
   email: string;
   api_key: string;
   status: string;
+  plan: string;
+  plan_expires_at: string | null;
   email_verified: boolean;
   created_at: string;
 }
 
+interface PlanConfig {
+  plan: string;
+  label: string;
+  max_apps: number;
+  max_cards: number;
+  max_devices: number;
+  max_gen_once: number;
+}
+
+// 升级弹窗状态
+interface UpgradeModal {
+  merchantId: string;
+  username: string;
+}
+
 const PAGE_SIZE_OPTIONS = [5, 10, 15, 20];
+
+function displayVal(v: number) {
+  return v === -1 ? '无限' : String(v);
+}
+
+function formatExpiry(expiresAt: string | null, plan: string) {
+  if (plan !== 'pro') return null;
+  if (!expiresAt) return <span style={{ color: '#a78bfa', fontSize: 11 }}>永久</span>;
+  const d = new Date(expiresAt);
+  const now = new Date();
+  const days = Math.ceil((d.getTime() - now.getTime()) / 86400000);
+  const color = days <= 3 ? '#ef4444' : days <= 7 ? '#f59e0b' : '#a78bfa';
+  return (
+    <span style={{ color, fontSize: 11, display: 'flex', alignItems: 'center', gap: 3 }}>
+      <Clock size={10} />
+      {days <= 0 ? '已到期' : `${days}天后到期`}
+    </span>
+  );
+}
 
 export default function Merchants() {
   const [merchants, setMerchants] = useState<Merchant[]>([]);
+  const [planConfigs, setPlanConfigs] = useState<Record<string, PlanConfig>>({});
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [total, setTotal] = useState(0);
   const [keyword, setKeyword] = useState('');
   const [search, setSearch] = useState('');
+  const [planLoading, setPlanLoading] = useState<string | null>(null);
+  const [upgradeModal, setUpgradeModal] = useState<UpgradeModal | null>(null);
+  const [expiresDays, setExpiresDays] = useState<string>('30');
+
+  const loadPlanConfigs = () => {
+    adminApi.getPlanConfigs().then(res => {
+      if (res.data.success) {
+        const map: Record<string, PlanConfig> = {};
+        (res.data.data as PlanConfig[]).forEach(c => { map[c.plan] = c; });
+        setPlanConfigs(map);
+      }
+    });
+  };
 
   const load = (p = page, ps = pageSize, kw = search) => {
     setLoading(true);
@@ -35,7 +85,10 @@ export default function Merchants() {
       }).finally(() => setLoading(false));
   };
 
-  useEffect(() => { load(page, pageSize, search); }, [page, pageSize]);
+  useEffect(() => {
+    loadPlanConfigs();
+    load(page, pageSize, search);
+  }, [page, pageSize]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,10 +117,81 @@ export default function Merchants() {
     }
   };
 
+  const togglePlan = async (id: string, current: string) => {
+    // 降为免费版直接操作，升级专业版弹窗输入天数
+    if (current !== 'pro') {
+      const m = merchants.find(m => m.id === id);
+      setUpgradeModal({ merchantId: id, username: m?.username ?? '' });
+      setExpiresDays('30');
+      return;
+    }
+    // 降为免费
+    setPlanLoading(id);
+    try {
+      const res = await adminApi.updateMerchantPlan(id, 'free');
+      if (res.data.success) {
+        toast.success('已降级为免费版');
+        load();
+      } else toast.error(res.data.message);
+    } catch { toast.error('操作失败'); }
+    finally { setPlanLoading(null); }
+  };
+
+  const confirmUpgrade = async () => {
+    if (!upgradeModal) return;
+    const days = expiresDays === '' ? undefined : parseInt(expiresDays);
+    if (days !== undefined && (isNaN(days) || days < 1)) {
+      toast.error('请输入有效天数（留空为永久）');
+      return;
+    }
+    setPlanLoading(upgradeModal.merchantId);
+    setUpgradeModal(null);
+    try {
+      const res = await adminApi.updateMerchantPlan(upgradeModal.merchantId, 'pro', days);
+      if (res.data.success) {
+        toast.success(res.data.message ?? '已升级为专业版');
+        load();
+      } else toast.error(res.data.message);
+    } catch { toast.error('操作失败'); }
+    finally { setPlanLoading(null); }
+  };
+
   const totalPages = Math.ceil(total / pageSize);
 
   return (
     <div className="fade-in">
+      {/* 升级专业版弹窗 */}
+      {upgradeModal && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12, padding: 28, width: 360, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Crown size={18} color="#a78bfa" />
+              <h3 style={{ fontWeight: 700, fontSize: 16 }}>升级专业版</h3>
+            </div>
+            <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>为商户 <strong style={{ color: 'var(--text)' }}>{upgradeModal.username}</strong> 设置专业版有效期</p>
+            <div>
+              <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>
+                有效天数（留空为永久）
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={expiresDays}
+                onChange={e => setExpiresDays(e.target.value)}
+                placeholder="例如：30"
+                style={{ width: '100%' }}
+                autoFocus
+              />
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-ghost" onClick={() => setUpgradeModal(null)}>取消</button>
+              <button className="btn btn-primary" onClick={confirmUpgrade}>
+                <Crown size={13} /> 确认升级
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="page-header">
         <div>
           <h1 className="page-title">商户管理</h1>
@@ -90,31 +214,79 @@ export default function Merchants() {
         </div>
       </div>
 
+      {/* 套餐说明 */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
+        {Object.values(planConfigs).map((config) => (
+          <div key={config.plan} style={{
+            display: 'flex', alignItems: 'center', gap: 10,
+            padding: '10px 16px', borderRadius: 8,
+            background: config.plan === 'pro' ? 'rgba(124,58,237,0.08)' : 'var(--surface)',
+            border: `1px solid ${config.plan === 'pro' ? 'rgba(124,58,237,0.3)' : 'var(--border)'}`,
+            fontSize: 13,
+          }}>
+            {config.plan === 'pro' ? <Crown size={14} color="#a78bfa" /> : <Gift size={14} color="var(--text-muted)" />}
+            <span style={{ fontWeight: 600, color: config.plan === 'pro' ? '#a78bfa' : 'var(--text)' }}>
+              {config.label}
+            </span>
+            <span style={{ color: 'var(--text-muted)' }}>
+              应用 {displayVal(config.max_apps)} · 卡密 {displayVal(config.max_cards)} · 设备 {displayVal(config.max_devices)}/张
+            </span>
+          </div>
+        ))}
+      </div>
+
       <div className="table-wrap">
         <table>
           <thead><tr>
-            <th>用户名</th><th>邮箱</th><th>API Key</th><th>状态</th><th>注册时间</th><th>操作</th>
+            <th>用户名</th><th>邮箱</th><th>API Key</th><th>套餐</th><th>到期时间</th><th>状态</th><th>注册时间</th><th>操作</th>
           </tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={6} style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}><span className="spinner" /></td></tr>
+              <tr><td colSpan={7} style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}><span className="spinner" /></td></tr>
             ) : merchants.length === 0 ? (
-              <tr><td colSpan={6}><div className="empty-state"><div className="empty-state-icon">👤</div><div className="empty-state-text">暂无商户</div></div></td></tr>
+              <tr><td colSpan={7}><div className="empty-state"><div className="empty-state-icon">👤</div><div className="empty-state-text">暂无商户</div></div></td></tr>
             ) : merchants.map(m => (
               <tr key={m.id}>
                 <td><span style={{ color: 'var(--text)', fontWeight: 600 }}>{m.username}</span></td>
                 <td>{m.email}</td>
                 <td><span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.5px' }}>{m.api_key.slice(0, 12)}…</span></td>
+                <td>
+                  <span style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    fontSize: 12, fontWeight: 600, padding: '2px 8px', borderRadius: 999,
+                    background: m.plan === 'pro' ? 'rgba(124,58,237,0.15)' : 'rgba(255,255,255,0.06)',
+                    color: m.plan === 'pro' ? '#a78bfa' : 'var(--text-muted)',
+                    border: `1px solid ${m.plan === 'pro' ? 'rgba(124,58,237,0.35)' : 'var(--border)'}`,
+                  }}>
+                    {m.plan === 'pro' ? <><Crown size={10} /> 专业版</> : <><Gift size={10} /> 免费版</>}
+                  </span>
+                </td>
+                <td>{formatExpiry(m.plan_expires_at, m.plan) ?? <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>—</span>}</td>
                 <td><span className={`badge badge-${m.status}`}>{m.status === 'active' ? '正常' : '禁用'}</span></td>
                 <td>{new Date(m.created_at).toLocaleDateString('zh-CN')}</td>
                 <td>
-                  <button
-                    className={`btn btn-sm ${m.status === 'active' ? 'btn-danger' : 'btn-ghost'}`}
-                    onClick={() => toggleStatus(m.id, m.status)}
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
-                  >
-                    {m.status === 'active' ? <><XCircle size={12} /> 禁用</> : <><CheckCircle size={12} /> 启用</>}
-                  </button>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      className={`btn btn-sm ${m.plan === 'pro' ? 'btn-ghost' : 'btn-primary'}`}
+                      onClick={() => togglePlan(m.id, m.plan)}
+                      disabled={planLoading === m.id}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12 }}
+                    >
+                      {planLoading === m.id
+                        ? <span className="spinner" style={{ width: 10, height: 10 }} />
+                        : m.plan === 'pro'
+                          ? <><Gift size={11} /> 降为免费</>
+                          : <><Crown size={11} /> 升专业版</>
+                      }
+                    </button>
+                    <button
+                      className={`btn btn-sm ${m.status === 'active' ? 'btn-danger' : 'btn-ghost'}`}
+                      onClick={() => toggleStatus(m.id, m.status)}
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                    >
+                      {m.status === 'active' ? <><XCircle size={12} /> 禁用</> : <><CheckCircle size={12} /> 启用</>}
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}

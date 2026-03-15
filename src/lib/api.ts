@@ -111,6 +111,16 @@ export const adminApi = {
     api.get('/admin/merchants', { params }),
   updateMerchantStatus: (id: string, status: string) =>
     api.patch(`/admin/merchants/${id}/status`, { status }),
+  updateMerchantPlan: (id: string, plan: 'free' | 'pro', expires_days?: number) =>
+    api.patch(`/admin/merchants/${id}/plan`, { plan, expires_days }),
+  getPlanConfigs: () => api.get('/admin/plan-configs'),
+  updatePlanConfig: (id: string, data: {
+    label?: string;
+    max_apps?: number;
+    max_cards?: number;
+    max_devices?: number;
+    max_gen_once?: number;
+  }) => api.patch(`/admin/plan-configs/${id}`, data),
 };
 
 // ─── Apps ───────────────────────────────────────────

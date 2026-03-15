@@ -1,6 +1,7 @@
 use crate::{
     middleware::auth::{admin_only, auth_middleware, AppState},
     models::merchant::MerchantPublic,
+    utils::mq,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -23,6 +24,7 @@ pub fn admin_router_with_state(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/admin/merchants", get(list_merchants))
         .route("/admin/merchants/:id/status", patch(update_merchant_status))
+        .route("/admin/merchants/:id/plan", patch(update_merchant_plan))
         .route("/admin/stats", get(get_stats))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -85,6 +87,86 @@ async fn update_merchant_status(
 
     match result {
         Ok(_) => Json(json!({"success": true, "message": "状态已更新"})),
+        Err(e) => Json(json!({"success": false, "message": format!("更新失败: {}", e)})),
+    }
+}
+
+async fn update_merchant_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    let plan = match body.get("plan").and_then(|s| s.as_str()) {
+        Some(s) if s == "free" || s == "pro" => s.to_string(),
+        _ => return Json(json!({"success": false, "message": "无效套餐，仅支持 free / pro"})),
+    };
+
+    // expires_days: 仅 pro 有效，None 表示永久，0 表示立即到期
+    let expires_days = body.get("expires_days").and_then(|v| v.as_i64());
+
+    let result = if plan == "pro" {
+        match expires_days {
+            Some(days) if days > 0 => {
+                sqlx::query(
+                    "UPDATE merchants
+                     SET plan = $1,
+                         plan_expires_at = NOW() + ($2 || ' days')::INTERVAL,
+                         updated_at = NOW()
+                     WHERE id = $3",
+                )
+                .bind(&plan)
+                .bind(days.to_string())
+                .bind(id)
+                .execute(&state.pool)
+                .await
+            }
+            _ => {
+                // 永久专业版，清空到期时间
+                sqlx::query(
+                    "UPDATE merchants
+                     SET plan = $1,
+                         plan_expires_at = NULL,
+                         updated_at = NOW()
+                     WHERE id = $2",
+                )
+                .bind(&plan)
+                .bind(id)
+                .execute(&state.pool)
+                .await
+            }
+        }
+    } else {
+        // 手动降为免费版，清空到期时间
+        sqlx::query(
+            "UPDATE merchants
+             SET plan = $1,
+                 plan_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(&plan)
+        .bind(id)
+        .execute(&state.pool)
+        .await
+    };
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            let msg = if plan == "pro" {
+                // 升级为专业版：异步发布恢复消息
+                if let Err(e) = mq::publish_upgrade(&state.mq_channel, &id.to_string()).await {
+                    tracing::error!("发布升级恢复消息失败 {}: {}", id, e);
+                }
+                match expires_days {
+                    Some(d) if d > 0 => format!("已升级为专业版，有效期 {} 天", d),
+                    _ => "已升级为专业版（永久）".to_string(),
+                }
+            } else {
+                "已降级为免费版".to_string()
+            };
+            Json(json!({"success": true, "message": msg}))
+        }
+        Ok(_) => Json(json!({"success": false, "message": "商户不存在"})),
         Err(e) => Json(json!({"success": false, "message": format!("更新失败: {}", e)})),
     }
 }

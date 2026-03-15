@@ -8,13 +8,15 @@ services:
     restart: unless-stopped
     ports:
       - "9527:9527"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
     extra_hosts:
-      # Linux 宿主机访问：让容器内可以用 host.docker.internal 访问宿主机服务
       - "host.docker.internal:host-gateway"
     environment:
-      # 连接宿主机上已有的 PG 和 Redis
       DATABASE_URL: postgres://kamism:${POSTGRES_PASSWORD}@host.docker.internal:5432/kamism
       REDIS_URL: redis://host.docker.internal:6379
+      AMQP_URL: amqp://kamism:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f
       JWT_SECRET: ${JWT_SECRET}
       PORT: 9527
       ADMIN_EMAIL: ${ADMIN_EMAIL}
@@ -26,6 +28,26 @@ services:
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-KamiSM}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       RUST_LOG: ${RUST_LOG:-info}
+
+  # ─── RabbitMQ（异步降级任务队列）───────────────────
+  # rabbitmq:
+  #   image: rabbitmq:3.13-management-alpine
+  #   container_name: kamism-rabbitmq
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5672:5672"    # AMQP
+  #     - "15672:15672"  # Management UI
+  #   environment:
+  #     RABBITMQ_DEFAULT_USER: kamism
+  #     RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+  #     RABBITMQ_DEFAULT_VHOST: /
+  #   volumes:
+  #     - rabbitmq_data:/var/lib/rabbitmq
+  #   healthcheck:
+  #     test: ["CMD", "rabbitmq-diagnostics", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 10
 
   # ─── 如果服务器上没有 PG 和 Redis，取消下面的注释 ──
   # postgres:
@@ -57,6 +79,7 @@ services:
   #     timeout: 3s
   #     retries: 10
 
-# volumes:
-#   postgres_data:
-#   redis_data:
+volumes:
+  rabbitmq_data:
+  # postgres_data:
+  # redis_data:

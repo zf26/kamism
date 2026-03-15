@@ -10,6 +10,7 @@ import Register from './pages/auth/Register';
 // Admin pages
 import AdminDashboard from './pages/admin/Dashboard';
 import Merchants from './pages/admin/Merchants';
+import PlanConfigs from './pages/admin/PlanConfigs';
 
 // Merchant pages
 import MerchantDashboard from './pages/merchant/Dashboard';
@@ -57,6 +58,9 @@ export default function App() {
         } />
         <Route path="/admin/merchants" element={
           <RequireAuth role="admin"><Layout><Merchants /></Layout></RequireAuth>
+        } />
+        <Route path="/admin/plan-configs" element={
+          <RequireAuth role="admin"><Layout><PlanConfigs /></Layout></RequireAuth>
         } />
 
         {/* Merchant routes */}

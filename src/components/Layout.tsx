@@ -2,8 +2,9 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../stores/auth';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Zap, Shield
+  Settings, LogOut, Shield
 } from 'lucide-react';
+import appIcon from '../assets/app-icon.png';
 
 interface NavItem {
   label: string;
@@ -14,6 +15,7 @@ interface NavItem {
 const adminNav: NavItem[] = [
   { label: '总览', path: '/admin/dashboard', icon: <LayoutDashboard size={16} /> },
   { label: '商户管理', path: '/admin/merchants', icon: <Users size={16} /> },
+  { label: '套餐配置', path: '/admin/plan-configs', icon: <Settings size={16} /> },
 ];
 
 const merchantNav: NavItem[] = [
@@ -51,14 +53,11 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         {/* Logo */}
         <div style={{ padding: '0 20px 24px', borderBottom: '1px solid var(--border)', marginBottom: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <div style={{
-              width: 32, height: 32,
-              background: 'linear-gradient(135deg, var(--accent), #a78bfa)',
-              borderRadius: 8,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-            }}>
-              <Zap size={16} color="#fff" />
-            </div>
+            <img
+              src={appIcon}
+              alt="KamiSM"
+              style={{ width: 32, height: 32, borderRadius: 8, objectFit: 'cover' }}
+            />
             <div>
               <div style={{ fontWeight: 800, fontSize: 15, letterSpacing: '-0.3px' }}>KamiSM</div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: '0.5px', textTransform: 'uppercase' }}>

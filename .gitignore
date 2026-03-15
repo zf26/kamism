@@ -19,3 +19,5 @@ Thumbs.db
 # 日志
 *.log
 check_output.txt
+# 门户网站
+website/

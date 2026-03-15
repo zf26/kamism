@@ -3,9 +3,11 @@ mod middleware;
 mod models;
 mod routes;
 mod utils;
+mod workers;
 
 use dotenvy::dotenv;
 use std::env;
+use std::sync::Arc;
 use axum::http::Method;
 use tower_http::cors::{Any, CorsLayer};
 use crate::middleware::auth::AppState;
@@ -49,12 +51,13 @@ pub async fn start_server() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "kamism-super-secret-key-change-in-production".to_string());
     let redis_url = env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let amqp_url = env::var("AMQP_URL")
+        .unwrap_or_else(|_| "amqp://guest:guest@localhost:5672/%2f".to_string());
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(9527);
-   // 显示数据库url
-    println!("数据库url: {}", database_url);
+
     tracing::info!("正在连接数据库...");
     let pool = db::create_pool(&database_url).await?;
     tracing::info!("数据库连接成功");
@@ -67,14 +70,46 @@ pub async fn start_server() -> anyhow::Result<()> {
     let redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
     tracing::info!("Redis 连接成功");
 
-    init_admin(&pool).await;
+    tracing::info!("正在连接 RabbitMQ...");
+    let mq_channel = utils::mq::connect(&amqp_url).await?;
+    let mq_channel = Arc::new(mq_channel);
+    tracing::info!("RabbitMQ 连接成功");
 
+    init_admin(&pool).await;
     let state = AppState {
-        pool,
+        pool: pool.clone(),
         jwt_secret: jwt_secret.clone(),
         mailer: crate::utils::mailer::MailerConfig::from_env(),
-        redis: redis_conn,
+        redis: redis_conn.clone(),
+        mq_channel: mq_channel.clone(),
     };
+
+    // 启动降级消费者（独立 task，传入独立 Redis 连接）
+    let worker_pool = pool.clone();
+    let worker_channel = (*mq_channel).clone();
+    let worker_redis = redis_conn.clone();
+    tokio::spawn(async move {
+        workers::downgrade::run_downgrade_worker(worker_pool, worker_channel, worker_redis).await;
+    });
+
+    // 启动升级恢复消费者（独立 task，传入独立 Redis 连接）
+    let upgrade_pool = pool.clone();
+    let upgrade_channel = (*mq_channel).clone();
+    let upgrade_redis = redis_conn.clone();
+    tokio::spawn(async move {
+        workers::downgrade::run_upgrade_worker(upgrade_pool, upgrade_channel, upgrade_redis).await;
+    });
+
+    // 启动定时扫描任务：每 60 秒扫描一次到期商户，发布降级消息
+    let scanner_pool = pool.clone();
+    let scanner_channel = mq_channel.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            scan_and_enqueue(&scanner_pool, &scanner_channel).await;
+        }
+    });
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -89,6 +124,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::cards::cards_router(state.clone()))
         .merge(routes::activations::activations_router(state.clone()))
         .merge(routes::public_api::public_api_router(state.clone()))
+        .merge(routes::plan_config::plan_config_router(state.clone()))
         .layer(cors)
         .with_state(state);
 
@@ -102,6 +138,27 @@ pub async fn start_server() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// 扫描到期商户，将商户 ID 投递到降级队列
+async fn scan_and_enqueue(pool: &db::DbPool, channel: &Arc<lapin::Channel>) {
+    let expired: Vec<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT id FROM merchants
+         WHERE plan = 'pro'
+           AND plan_expires_at IS NOT NULL
+           AND plan_expires_at <= NOW()",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (merchant_id,) in expired {
+        if let Err(e) = utils::mq::publish_downgrade(channel, &merchant_id.to_string()).await {
+            tracing::error!("发布降级消息失败 {}: {}", merchant_id, e);
+        } else {
+            tracing::info!("已发布降级消息: 商户 {}", merchant_id);
+        }
+    }
 }
 
 async fn init_admin(pool: &db::DbPool) {
