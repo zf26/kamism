@@ -32,7 +32,7 @@ export default function App() {
   const { role } = useAuthStore();
 
   return (
-    <BrowserRouter>
+    <BrowserRouter basename="/kamism">
       <Toaster
         position="top-right"
         toastOptions={{

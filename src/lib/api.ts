@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 // API 地址在构建时通过 VITE_API_URL 环境变量注入，回退到默认值
-const BASE_URL = import.meta.env.VITE_API_URL || 'https://km.fly-fly.fun';
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9527/api';
 
 export const api = axios.create({
   baseURL: BASE_URL,
@@ -89,7 +89,7 @@ function logout() {
   localStorage.removeItem('refreshToken');
   localStorage.removeItem('role');
   localStorage.removeItem('user');
-  window.location.href = '/login';
+  window.location.href = '/kamism/login';
 }
 
 // ─── Auth ───────────────────────────────────────────
