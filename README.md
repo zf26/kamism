@@ -432,26 +432,22 @@ CREATE TABLE activations (
 
 Copyright © 2026 KamiSM Contributors
 
-Licensed under the Apache License, Version 2.0 with Additional Commercial Restrictions.
-
-### 附加限制（Additional Restrictions）
-
-在 Apache 2.0 许可证的基础上，本项目附加以下限制：
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
 
 **允许（Permitted）：**
 - ✅ 个人自用、学习、研究
-- ✅ 修改源码用于个人或内部项目
-- ✅ 在自己的软件中集成本项目的功能
-- ✅ 在组织/公司内部部署使用
+- ✅ 修改源码并用于个人或内部项目
+- ✅ 在自己的软件中集成使用
+
+**要求（Required）：**
+- 📋 修改后的版本必须以 AGPL-3.0 开源
+- 📋 通过网络提供服务时，必须公开对应的完整源码
+- 📋 保留原始版权声明和许可证
 
 **禁止（Prohibited）：**
-- ❌ 将本软件（原版或修改版）直接作为商品出售
-- ❌ 将本软件打包为付费产品、SaaS 服务对外收费销售
-- ❌ 在不做实质性增值的情况下转售本软件
+- ❌ 将本软件闭源后作为商品出售或提供付费服务，而不公开修改后的源码
 
-如需商业授权，请联系作者获取单独许可。
-
-完整 Apache 2.0 协议文本见：https://www.apache.org/licenses/LICENSE-2.0
+完整协议文本见 [LICENSE](./LICENSE) 或 https://www.gnu.org/licenses/agpl-3.0.html
 
 ---
 
