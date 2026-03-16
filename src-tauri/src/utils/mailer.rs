@@ -31,7 +31,15 @@ impl MailerConfig {
     }
 }
 
+fn get_icon_base64() -> String {
+    let bytes = include_bytes!("../../icons/icon.png");
+    use base64::{engine::general_purpose, Engine as _};
+    general_purpose::STANDARD.encode(bytes)
+}
+
 fn build_verify_email(code: &str) -> String {
+    let icon_b64 = get_icon_base64();
+    let icon_src = format!("data:image/png;base64,{}", icon_b64);
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -50,7 +58,7 @@ fn build_verify_email(code: &str) -> String {
           <table cellpadding="0" cellspacing="0" style="margin:0 auto;">
             <tr>
               <td style="background:linear-gradient(135deg,#7c6af7,#a78bfa);border-radius:12px;width:44px;height:44px;text-align:center;vertical-align:middle;">
-                <span style="font-size:22px;line-height:44px;">⚡</span>
+                <img src="{icon_src}" alt="KamiSM" width="28" height="28" style="display:block;margin:8px auto;border-radius:6px;" />
               </td>
               <td style="padding-left:10px;vertical-align:middle;">
                 <span style="font-size:22px;font-weight:800;color:#e8e8f0;letter-spacing:-0.5px;">KamiSM</span>
@@ -108,7 +116,7 @@ fn build_verify_email(code: &str) -> String {
         <tr><td style="padding:24px 0 0 0;text-align:center;">
           <p style="margin:0;font-size:12px;color:#55556a;line-height:1.7;">
             此邮件由 KamiSM 自动发送，请勿直接回复。<br />
-            &copy; 2024 KamiSM. All rights reserved.
+            &copy; 2026 KamiSM. All rights reserved.
           </p>
         </td></tr>
 
@@ -117,7 +125,8 @@ fn build_verify_email(code: &str) -> String {
   </table>
 </body>
 </html>"#,
-        code = code
+        code = code,
+        icon_src = icon_src
     )
 }
 

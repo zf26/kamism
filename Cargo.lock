@@ -2764,6 +2764,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base32",
+ "base64 0.22.1",
  "bcrypt",
  "chrono",
  "dotenvy",
