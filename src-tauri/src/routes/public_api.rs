@@ -1,6 +1,7 @@
 //! 对外公开 API，供第三方软件调用（使用 api_key 鉴权，无需 JWT）
 
 use crate::{
+    db::encrypted_fields::EncryptedFieldsOps,
     middleware::auth::AppState,
     models::{activation::Activation, card::Card},
 };
@@ -57,9 +58,11 @@ async fn activate(
         return Json(json!({"success": false, "message": "设备ID不能为空"}));
     }
 
+    // 查询所有商户并使用哈希索引查询 API Key
+    let api_key_hash = EncryptedFieldsOps::generate_hash(&body.api_key);
     let merchant: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM merchants WHERE api_key = $1 AND status = 'active'")
-            .bind(&body.api_key)
+        sqlx::query_as("SELECT id FROM merchants WHERE api_key_hash = $1 AND status = 'active'")
+            .bind(&api_key_hash)
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None);
@@ -69,10 +72,12 @@ async fn activate(
         None => return Json(json!({"success": false, "message": "无效的 API Key"})),
     };
 
+    // 查询该商户的卡密（使用哈希索引查询）
+    let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
-        "SELECT * FROM cards WHERE code = $1 AND merchant_id = $2",
+        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2",
     )
-    .bind(&body.card_code)
+    .bind(&code_hash)
     .bind(merchant_id)
     .fetch_optional(&state.pool)
     .await
@@ -99,22 +104,30 @@ async fn activate(
         }
     }
 
-    // 检查该设备是否已绑定此卡密
-    let existing: Option<Activation> = sqlx::query_as(
-        "SELECT * FROM activations WHERE card_id = $1 AND device_id = $2",
+    // 检查该设备是否已绑定此卡密（需要遍历并解密比较）
+    let activations: Vec<Activation> = sqlx::query_as(
+        "SELECT * FROM activations WHERE card_id = $1",
     )
     .bind(card.id)
-    .bind(&body.device_id)
-    .fetch_optional(&state.pool)
+    .fetch_all(&state.pool)
     .await
-    .unwrap_or(None);
+    .unwrap_or_default();
 
-    if existing.is_some() {
+    let mut existing_activation: Option<Activation> = None;
+    for activation in activations {
+        if let Ok(decrypted_device_id) = EncryptedFieldsOps::decrypt_device_id(&state.encryptor, &activation.device_id) {
+            if decrypted_device_id == body.device_id {
+                existing_activation = Some(activation);
+                break;
+            }
+        }
+    }
+
+    if let Some(existing) = existing_activation {
         let _ = sqlx::query(
-            "UPDATE activations SET last_verified_at = NOW() WHERE card_id = $1 AND device_id = $2",
+            "UPDATE activations SET last_verified_at = NOW() WHERE id = $1",
         )
-        .bind(card.id)
-        .bind(&body.device_id)
+        .bind(existing.id)
         .execute(&state.pool)
         .await;
 
@@ -155,12 +168,31 @@ async fn activate(
     };
 
     let ip = addr.ip().to_string();
+    let activation_id = Uuid::new_v4();
+
+    // 加密设备 ID 并生成哈希
+    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    let encrypted_device_id = match EncryptedFieldsOps::encrypt_device_id(
+        &state.pool,
+        &state.encryptor,
+        activation_id,
+        &body.device_id,
+    ).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("加密设备 ID 失败: {}", e);
+            return Json(json!({"success": false, "message": "激活失败"}));
+        }
+    };
+
     let _ = sqlx::query(
-        "INSERT INTO activations (card_id, app_id, device_id, device_name, ip_address) VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO activations (id, card_id, app_id, device_id_encrypted, device_id_hash, device_name, ip_address) VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
+    .bind(activation_id)
     .bind(card.id)
     .bind(card.app_id)
-    .bind(&body.device_id)
+    .bind(&encrypted_device_id)
+    .bind(&device_id_hash)
     .bind(&body.device_name)
     .bind(&ip)
     .execute(&state.pool)
@@ -194,9 +226,11 @@ async fn verify(
     State(state): State<AppState>,
     Json(body): Json<VerifyRequest>,
 ) -> Json<Value> {
+    // 查询所有商户并使用哈希索引查询 API Key
+    let api_key_hash = EncryptedFieldsOps::generate_hash(&body.api_key);
     let merchant: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM merchants WHERE api_key = $1 AND status = 'active'")
-            .bind(&body.api_key)
+        sqlx::query_as("SELECT id FROM merchants WHERE api_key_hash = $1 AND status = 'active'")
+            .bind(&api_key_hash)
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None);
@@ -206,10 +240,12 @@ async fn verify(
         None => return Json(json!({"success": false, "message": "无效的 API Key"})),
     };
 
+    // 查询该商户的卡密（使用哈希索引查询）
+    let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
-        "SELECT * FROM cards WHERE code = $1 AND merchant_id = $2",
+        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2",
     )
-    .bind(&body.card_code)
+    .bind(&code_hash)
     .bind(merchant_id)
     .fetch_optional(&state.pool)
     .await
@@ -238,12 +274,13 @@ async fn verify(
         _ => {}
     }
 
-    // 检查设备绑定
+    // 检查设备绑定（使用哈希索引查询）
+    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
     let activation: Option<Activation> = sqlx::query_as(
-        "SELECT * FROM activations WHERE card_id = $1 AND device_id = $2",
+        "SELECT * FROM activations WHERE card_id = $1 AND device_id_hash = $2",
     )
     .bind(card.id)
-    .bind(&body.device_id)
+    .bind(&device_id_hash)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
@@ -256,12 +293,13 @@ async fn verify(
         }));
     }
 
+    let activation = activation.unwrap();
+
     // 更新最后验证时间
     let _ = sqlx::query(
-        "UPDATE activations SET last_verified_at = NOW() WHERE card_id = $1 AND device_id = $2",
+        "UPDATE activations SET last_verified_at = NOW() WHERE id = $1",
     )
-    .bind(card.id)
-    .bind(&body.device_id)
+    .bind(activation.id)
     .execute(&state.pool)
     .await;
 
@@ -292,9 +330,11 @@ async fn unbind(
     State(state): State<AppState>,
     Json(body): Json<UnbindRequest>,
 ) -> Json<Value> {
+    // 查询所有商户并使用哈希索引查询 API Key
+    let api_key_hash = EncryptedFieldsOps::generate_hash(&body.api_key);
     let merchant: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM merchants WHERE api_key = $1 AND status = 'active'")
-            .bind(&body.api_key)
+        sqlx::query_as("SELECT id FROM merchants WHERE api_key_hash = $1 AND status = 'active'")
+            .bind(&api_key_hash)
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None);
@@ -304,25 +344,44 @@ async fn unbind(
         None => return Json(json!({"success": false, "message": "无效的 API Key"})),
     };
 
-    let card: Option<(Uuid, i32)> = sqlx::query_as(
-        "SELECT id, max_devices FROM cards WHERE code = $1 AND merchant_id = $2",
+    // 查询该商户的卡密（使用哈希索引查询）
+    let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
+    let card: Option<Card> = sqlx::query_as(
+        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2",
     )
-    .bind(&body.card_code)
+    .bind(&code_hash)
     .bind(merchant_id)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
 
-    let (card_id, _) = match card {
+    let card = match card {
         Some(c) => c,
         None => return Json(json!({"success": false, "message": "卡密不存在"})),
     };
 
-    let result = sqlx::query(
-        "DELETE FROM activations WHERE card_id = $1 AND device_id = $2",
+    let card_id = card.id;
+
+    // 查询该卡密的激活记录（使用哈希索引查询）
+    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    let activation: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM activations WHERE card_id = $1 AND device_id_hash = $2",
     )
     .bind(card_id)
-    .bind(&body.device_id)
+    .bind(&device_id_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let activation_id = match activation {
+        Some((id,)) => id,
+        None => return Json(json!({"success": false, "message": "设备未绑定该卡密"})),
+    };
+
+    let result = sqlx::query(
+        "DELETE FROM activations WHERE id = $1",
+    )
+    .bind(activation_id)
     .execute(&state.pool)
     .await;
 

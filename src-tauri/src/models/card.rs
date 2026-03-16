@@ -7,6 +7,7 @@ pub struct Card {
     pub id: Uuid,
     pub app_id: Uuid,
     pub merchant_id: Uuid,
+    #[sqlx(rename = "code_encrypted")]
     pub code: String,
     pub duration_days: i32,
     pub max_devices: i32,

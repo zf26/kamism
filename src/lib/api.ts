@@ -1,8 +1,9 @@
 import axios from 'axios';
 
-// API 地址在构建时通过 VITE_API_URL 环境变量注入，回退到默认值
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9527/api';
-
+// API 地址在构建时通过 VITE_API_URL 环境变量注入
+// 生产环境：从 .env.production 读取 (https://yourdomain/api)
+// 开发环境：回退到本地后端服务器 (http://localhost:9527)
+const BASE_URL = (import.meta.env.VITE_API_URL as string) || 'http://localhost:9527';
 export const api = axios.create({
   baseURL: BASE_URL,
   timeout: 15000,
@@ -89,7 +90,7 @@ function logout() {
   localStorage.removeItem('refreshToken');
   localStorage.removeItem('role');
   localStorage.removeItem('user');
-  window.location.href = '/kamism/login';
+  window.location.href = '/login';
 }
 
 // ─── Auth ───────────────────────────────────────────
@@ -152,7 +153,7 @@ export const cardsApi = {
 
 // ─── Activations ────────────────────────────────────
 export const activationsApi = {
-  list: (params?: { page?: number; page_size?: number }) =>
+  list: (params?: { page?: number; page_size?: number; card_code?: string }) =>
     api.get('/activations', { params }),
   unbind: (id: string) => api.delete(`/activations/${id}`),
 };

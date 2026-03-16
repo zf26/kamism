@@ -1,8 +1,8 @@
-mod db;
-mod middleware;
-mod models;
-mod routes;
-mod utils;
+pub mod db;
+pub mod middleware;
+pub mod models;
+pub mod routes;
+pub mod utils;
 mod workers;
 
 use dotenvy::dotenv;
@@ -75,6 +75,11 @@ pub async fn start_server() -> anyhow::Result<()> {
     let mq_channel = Arc::new(mq_channel);
     tracing::info!("RabbitMQ 连接成功");
 
+    tracing::info!("正在初始化 KMS...");
+    let kms = utils::kms::KmsManager::new()?;
+    let encryptor = Arc::new(utils::kms::Encryptor::new(kms));
+    tracing::info!("KMS 初始化成功");
+
     init_admin(&pool).await;
     let state = AppState {
         pool: pool.clone(),
@@ -82,6 +87,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         mailer: crate::utils::mailer::MailerConfig::from_env(),
         redis: redis_conn.clone(),
         mq_channel: mq_channel.clone(),
+        encryptor: encryptor.clone(),
     };
 
     // 启动降级消费者（独立 task，传入独立 Redis 连接）

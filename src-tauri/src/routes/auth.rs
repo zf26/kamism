@@ -1,4 +1,5 @@
 use crate::{
+    db::encrypted_fields::EncryptedFieldsOps,
     middleware::{
         auth::AppState,
         rate_limit::login_rate_limit,
@@ -21,6 +22,7 @@ use rand::Rng;
 use redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -68,10 +70,11 @@ async fn send_code(
         return Json(json!({"success": false, "message": "邮箱格式不正确"}));
     }
 
-    // 检查邮箱是否已注册
+    // 检查邮箱是否已注册（使用哈希索引查询）
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
     let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id::text FROM merchants WHERE email = $1 LIMIT 1")
-            .bind(&body.email)
+        sqlx::query_as("SELECT id::text FROM merchants WHERE email_hash = $1 LIMIT 1")
+            .bind(&email_hash)
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None);
@@ -144,17 +147,31 @@ async fn register(
         }
     }
 
+    // 检查用户名是否已存在
     let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id::text FROM merchants WHERE email = $1 OR username = $2 LIMIT 1",
+        "SELECT id::text FROM merchants WHERE username = $1 LIMIT 1",
     )
-    .bind(&body.email)
     .bind(&body.username)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
 
     if exists.is_some() {
-        return Json(json!({"success": false, "message": "邮箱或用户名已存在"}));
+        return Json(json!({"success": false, "message": "用户名已存在"}));
+    }
+    
+    // 检查邮箱是否已注册（使用哈希索引查询）
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
+    let email_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id::text FROM merchants WHERE email_hash = $1 LIMIT 1",
+    )
+    .bind(&email_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    if email_exists.is_some() {
+        return Json(json!({"success": false, "message": "邮箱已存在"}));
     }
 
     let password_hash = match hash(&body.password, DEFAULT_COST) {
@@ -163,14 +180,49 @@ async fn register(
     };
 
     let api_key = generate_api_key();
+    let merchant_id = Uuid::new_v4();
+
+    // 生成哈希值
+    let api_key_hash = EncryptedFieldsOps::generate_hash(&api_key);
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
+
+    // 加密 API Key 和邮箱
+    let encrypted_api_key = match EncryptedFieldsOps::encrypt_merchant_api_key(
+        &state.pool,
+        &state.encryptor,
+        merchant_id,
+        &api_key,
+    ).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("加密 API Key 失败: {}", e);
+            return Json(json!({"success": false, "message": "注册失败"}));
+        }
+    };
+
+    let encrypted_email = match EncryptedFieldsOps::encrypt_merchant_email(
+        &state.pool,
+        &state.encryptor,
+        merchant_id,
+        &body.email,
+    ).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("加密邮箱失败: {}", e);
+            return Json(json!({"success": false, "message": "注册失败"}));
+        }
+    };
 
     let result = sqlx::query(
-        "INSERT INTO merchants (username, email, password_hash, api_key, email_verified) VALUES ($1, $2, $3, $4, TRUE)",
+        "INSERT INTO merchants (id, username, email_encrypted, email_hash, password_hash, api_key_encrypted, api_key_hash, email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)",
     )
+    .bind(merchant_id)
     .bind(&body.username)
-    .bind(&body.email)
+    .bind(&encrypted_email)
+    .bind(&email_hash)
     .bind(&password_hash)
-    .bind(&api_key)
+    .bind(&encrypted_api_key)
+    .bind(&api_key_hash)
     .execute(&state.pool)
     .await;
 
@@ -218,10 +270,11 @@ async fn login(
         }));
     }
 
-    // 再查商户表
+    // 再查商户表（使用哈希索引查询）
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
     let merchant: Option<Merchant> =
-        sqlx::query_as("SELECT * FROM merchants WHERE email = $1")
-            .bind(&body.email)
+        sqlx::query_as("SELECT * FROM merchants WHERE email_hash = $1")
+            .bind(&email_hash)
             .fetch_optional(&state.pool)
             .await
             .unwrap_or(None);
@@ -249,6 +302,23 @@ async fn login(
         Err(_) => return Json(json!({"success": false, "message": "生成令牌失败"})),
     };
 
+    // 解密 API Key 和邮箱
+    let api_key = match EncryptedFieldsOps::decrypt_merchant_api_key(&state.encryptor, &merchant.api_key) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!("解密 API Key 失败: {}", e);
+            return Json(json!({"success": false, "message": "解密失败"}));
+        }
+    };
+
+    let email = match EncryptedFieldsOps::decrypt_merchant_email(&state.encryptor, &merchant.email) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("解密邮箱失败: {}", e);
+            return Json(json!({"success": false, "message": "解密失败"}));
+        }
+    };
+
     Json(json!({
         "success": true,
         "token": token,
@@ -257,8 +327,8 @@ async fn login(
         "user": {
             "id": merchant.id,
             "username": merchant.username,
-            "email": merchant.email,
-            "api_key": merchant.api_key,
+            "email": email,
+            "api_key": api_key,
             "status": merchant.status,
             "email_verified": merchant.email_verified,
             "created_at": merchant.created_at

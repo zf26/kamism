@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "KamiSM - 卡密管理系统"
 authors = ["zf26"]
 edition = "2021"
+default-run = "kamism"
 
 [lib]
 name = "kamism_lib"
@@ -62,3 +63,8 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 # RabbitMQ（异步降级任务）
 lapin = "4"
 futures-lite = "2"
+
+# 加密
+aes-gcm = "0.10"
+hex = "0.4"
+sha2 = "0.10"

@@ -29,15 +29,49 @@ export default function Cards() {
   const [showModal, setShowModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [form, setForm] = useState({ app_id: '', count: 10, duration_days: 30, max_devices: 1, note: '' });
+  
+  // 搜索过滤状态
+  const [searchCode, setSearchCode] = useState('');
+  const [filterAppId, setFilterAppId] = useState('');
+  const [filterExpireDate, setFilterExpireDate] = useState('');
 
   const load = (p = page, ps = pageSize) => {
     setLoading(true);
     cardsApi.list({ page: p, page_size: ps }).then(res => {
-      if (res.data.success) { setCards(res.data.data); setTotal(res.data.total); }
+      if (res.data.success) { 
+        let filtered = res.data.data;
+        
+        // 按卡密代码搜索
+        if (searchCode) {
+          filtered = filtered.filter((c: Card) => c.code.toLowerCase().includes(searchCode.toLowerCase()));
+        }
+        
+        // 按应用过滤
+        if (filterAppId) {
+          filtered = filtered.filter((c: Card) => c.app_id === filterAppId);
+        }
+        
+        // 按到期时间过滤
+        if (filterExpireDate) {
+          const filterDate = new Date(filterExpireDate);
+          filtered = filtered.filter((c: Card) => {
+            if (!c.expires_at) return false;
+            const expiresDate = new Date(c.expires_at);
+            return expiresDate.toDateString() === filterDate.toDateString();
+          });
+        }
+        
+        setCards(filtered); 
+        setTotal(res.data.total); 
+      }
     }).finally(() => setLoading(false));
   };
 
   const handlePageSize = (ps: number) => { setPageSize(ps); setPage(1); };
+  
+  const getAppName = (appId: string) => {
+    return apps.find(a => a.id === appId)?.app_name || '—';
+  };
 
   useEffect(() => {
     load(1, pageSize);
@@ -45,6 +79,9 @@ export default function Cards() {
   }, []);
 
   useEffect(() => { load(page, pageSize); }, [page, pageSize]);
+  
+  // 搜索/过滤时重置到第一页
+  useEffect(() => { setPage(1); }, [searchCode, filterAppId, filterExpireDate]);
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -112,16 +149,63 @@ export default function Cards() {
         </div>
       </div>
 
+      {/* 搜索过滤区域 */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 20 }}>
+        <div className="form-group" style={{ margin: 0 }}>
+          <label className="form-label" style={{ fontSize: 12 }}>搜索卡密</label>
+          <input 
+            type="text" 
+            placeholder="输入卡密代码..." 
+            value={searchCode}
+            onChange={e => setSearchCode(e.target.value)}
+            style={{ fontSize: 13 }}
+          />
+        </div>
+        <div className="form-group" style={{ margin: 0 }}>
+          <label className="form-label" style={{ fontSize: 12 }}>按应用过滤</label>
+          <select 
+            value={filterAppId}
+            onChange={e => setFilterAppId(e.target.value)}
+            style={{ fontSize: 13 }}
+          >
+            <option value="">全部应用</option>
+            {apps.map(a => (
+              <option key={a.id} value={a.id}>{a.app_name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="form-group" style={{ margin: 0 }}>
+          <label className="form-label" style={{ fontSize: 12 }}>按到期日期过滤</label>
+          <input 
+            type="date" 
+            value={filterExpireDate}
+            onChange={e => setFilterExpireDate(e.target.value)}
+            style={{ fontSize: 13 }}
+          />
+        </div>
+        {(searchCode || filterAppId || filterExpireDate) && (
+          <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+            <button 
+              className="btn btn-ghost" 
+              onClick={() => { setSearchCode(''); setFilterAppId(''); setFilterExpireDate(''); }}
+              style={{ fontSize: 12 }}
+            >
+              清除过滤
+            </button>
+          </div>
+        )}
+      </div>
+
       <div className="table-wrap">
         <table>
           <thead><tr>
-            <th>卡密</th><th>有效期</th><th>设备上限</th><th>状态</th><th>过期时间</th><th>备注</th><th>操作</th>
+            <th>卡密</th><th>应用</th><th>有效期</th><th>设备上限</th><th>状态</th><th>过期时间</th><th>备注</th><th>操作</th>
           </tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7} style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></td></tr>
+              <tr><td colSpan={8} style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></td></tr>
             ) : cards.length === 0 ? (
-              <tr><td colSpan={7}><div className="empty-state"><div className="empty-state-icon">🔑</div><div className="empty-state-text">暂无卡密，点击「生成卡密」</div></div></td></tr>
+              <tr><td colSpan={8}><div className="empty-state"><div className="empty-state-icon">🔑</div><div className="empty-state-text">暂无卡密，点击「生成卡密」</div></div></td></tr>
             ) : cards.map(card => (
               <tr key={card.id}>
                 <td>
@@ -130,6 +214,7 @@ export default function Cards() {
                     <button style={{ background: 'none', color: 'var(--text-muted)', padding: 2, borderRadius: 4 }} onClick={() => copyCode(card.code)}><Copy size={12} /></button>
                   </div>
                 </td>
+                <td><span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{getAppName(card.app_id)}</span></td>
                 <td>{card.duration_days} 天</td>
                 <td>{card.max_devices} 台</td>
                 <td><span className={`badge badge-${card.status}`}>{statusLabel[card.status]}</span></td>

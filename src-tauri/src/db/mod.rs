@@ -3,6 +3,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::time::Duration;
 
+pub mod encrypted_fields;
+
 pub type DbPool = PgPool;
 
 pub async fn create_pool(database_url: &str) -> Result<DbPool> {

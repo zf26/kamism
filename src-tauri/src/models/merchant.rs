@@ -6,9 +6,11 @@ use uuid::Uuid;
 pub struct Merchant {
     pub id: Uuid,
     pub username: String,
-    pub email: String,
     pub password_hash: String,
+    #[sqlx(rename = "api_key_encrypted")]
     pub api_key: String,
+    #[sqlx(rename = "email_encrypted")]
+    pub email: String,
     pub status: String,
     pub plan: String,
     pub plan_expires_at: Option<DateTime<Utc>>,

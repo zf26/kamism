@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { authApi } from '../../lib/api';
-import { Zap, Mail, Lock, User, ArrowRight, ShieldCheck } from 'lucide-react';
+import { Mail, Lock, User, ArrowRight, ShieldCheck } from 'lucide-react';
+import appIcon from '../../assets/app-icon.png';
 import toast from 'react-hot-toast';
 
 export default function Register() {
@@ -71,14 +72,11 @@ export default function Register() {
     }}>
       <div style={{ width: '100%', maxWidth: 420, padding: '0 20px' }}>
         <div style={{ textAlign: 'center', marginBottom: 40 }}>
-          <div style={{
-            width: 52, height: 52, margin: '0 auto 16px',
-            background: 'linear-gradient(135deg, var(--accent), #a78bfa)',
-            borderRadius: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 8px 32px rgba(124,106,247,0.3)',
-          }}>
-            <Zap size={24} color="#fff" />
-          </div>
+          <img
+            src={appIcon}
+            alt="KamiSM"
+            style={{ width: 52, height: 52, margin: '0 auto 16px', display: 'block', borderRadius: 14, boxShadow: '0 8px 32px rgba(124,106,247,0.3)' }}
+          />
           <h1 style={{ fontSize: 26, fontWeight: 800, letterSpacing: '-0.5px' }}>创建账号</h1>
           <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: 4 }}>注册商户账号，开始使用 KamiSM</p>
         </div>

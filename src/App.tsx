@@ -30,9 +30,10 @@ function RequireAuth({ children, role }: { children: React.ReactNode; role?: str
 
 export default function App() {
   const { role } = useAuthStore();
+  
 
   return (
-    <BrowserRouter basename="/kamism">
+    <BrowserRouter basename="/">
       <Toaster
         position="top-right"
         toastOptions={{

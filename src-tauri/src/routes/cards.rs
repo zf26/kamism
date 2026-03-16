@@ -1,4 +1,5 @@
 use crate::{
+    db::encrypted_fields::EncryptedFieldsOps,
     middleware::auth::{AppState, auth_middleware},
     models::card::Card,
     routes::plan_config::get_config_by_plan,
@@ -59,7 +60,7 @@ async fn list_cards(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let (cards, total): (Vec<Card>, i64) = if claims.role == "admin" {
+    let (mut cards, total): (Vec<Card>, i64) = if claims.role == "admin" {
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cards")
             .fetch_one(&state.pool)
             .await
@@ -92,6 +93,13 @@ async fn list_cards(
         .unwrap_or_default();
         (cards, total.0)
     };
+
+    // 解密所有卡密代码
+    for card in &mut cards {
+        if let Err(e) = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &card.code) {
+            tracing::warn!("解密卡密 {} 失败: {}", card.id, e);
+        }
+    }
 
     Json(json!({
         "success": true,
@@ -174,41 +182,75 @@ async fn generate_cards(
         return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
     }
 
-    // 批量生成：先在内存中生成所有 code，再用单条 INSERT ... VALUES 写入
+    // 批量生成：先在内存中生成所有 code 并加密
     let codes: Vec<String> = (0..body.count).map(|_| generate_card_code()).collect();
+    
+    // 加密所有卡密代码并生成哈希
+    let mut encrypted_codes = Vec::new();
+    for code in &codes {
+        let temp_id = Uuid::new_v4();
+        let key_id = format!("card_code_{}", temp_id);
+        let code_hash = EncryptedFieldsOps::generate_hash(code);
+        match state.encryptor.encrypt(code, &key_id) {
+            Ok(encrypted) => encrypted_codes.push((temp_id, encrypted, code_hash)),
+            Err(e) => return Json(json!({"success": false, "message": format!("加密失败: {}", e)})),
+        }
+    }
 
-    // 构建 VALUES 占位符：($1,$2,$3,$4,$5,$6), ($7,...) ...
+    // 构建 VALUES 占位符：($1,$2,$3,$4,$5,$6,$7), ($8,...) ...
     let mut params_sql = String::new();
-    let base = 6usize;
-    for i in 0..codes.len() {
+    let base = 7usize;
+    for i in 0..encrypted_codes.len() {
         let n = i * base;
         if i > 0 { params_sql.push(','); }
         params_sql.push_str(&format!(
-            "(${},${},${},${},${},${})",
-            n+1, n+2, n+3, n+4, n+5, n+6
+            "(${},${},${},${},${},${},${})",
+            n+1, n+2, n+3, n+4, n+5, n+6, n+7
         ));
     }
     let sql = format!(
-        "INSERT INTO cards (app_id, merchant_id, code, duration_days, max_devices, note) VALUES {}",
+        "INSERT INTO cards (app_id, merchant_id, code_encrypted, code_hash, duration_days, max_devices, note) VALUES {} RETURNING id",
         params_sql
     );
 
-    let mut q = sqlx::query(&sql);
-    for code in &codes {
+    let mut q = sqlx::query_as::<_, (Uuid,)>(&sql);
+    for (_, encrypted_code, code_hash) in &encrypted_codes {
         q = q
             .bind(body.app_id)
             .bind(merchant_id)
-            .bind(code)
+            .bind(encrypted_code)
+            .bind(code_hash)
             .bind(body.duration_days)
             .bind(body.max_devices)
             .bind(&body.note);
     }
-    match q.execute(&state.pool).await {
-        Ok(r) => Json(json!({
-            "success": true,
-            "message": format!("成功生成 {} 张卡密", r.rows_affected()),
-            "count": r.rows_affected()
-        })),
+    
+    match q.fetch_all(&state.pool).await {
+        Ok(inserted_cards) => {
+            // 记录加密日志
+            let pool = state.pool.clone();
+            let encrypted_codes_clone = encrypted_codes.clone();
+            tokio::spawn(async move {
+                for ((temp_id, _, _), (card_id,)) in encrypted_codes_clone.iter().zip(inserted_cards.iter()) {
+                    let key_id = format!("card_code_{}", temp_id);
+                    if let Err(e) = EncryptedFieldsOps::log_encryption(
+                        &pool,
+                        "cards",
+                        *card_id,
+                        "code",
+                        &key_id,
+                    ).await {
+                        tracing::error!("记录加密日志失败: {}", e);
+                    }
+                }
+            });
+
+            Json(json!({
+                "success": true,
+                "message": format!("成功生成 {} 张卡密", encrypted_codes.len()),
+                "count": encrypted_codes.len()
+            }))
+        }
         Err(e) => Json(json!({"success": false, "message": format!("生成失败: {}", e)})),
     }
 }
@@ -219,7 +261,7 @@ async fn get_card(
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
     let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
-    let card: Option<Card> = sqlx::query_as(
+    let mut card: Option<Card> = sqlx::query_as(
         "SELECT * FROM cards WHERE id = $1 AND (merchant_id = $2 OR $3 = 'admin')",
     )
     .bind(id)
@@ -228,6 +270,12 @@ async fn get_card(
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
+
+    if let Some(ref mut c) = card {
+        if let Err(e) = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &c.code) {
+            tracing::warn!("解密卡密 {} 失败: {}", c.id, e);
+        }
+    }
 
     match card {
         Some(c) => Json(json!({"success": true, "data": c})),
