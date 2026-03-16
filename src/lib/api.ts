@@ -1,9 +1,10 @@
 import axios from 'axios';
 
-// API 地址在构建时通过 VITE_API_URL 环境变量注入
-// 生产环境：从 .env.production 读取 (https://yourdomain/api)
-// 开发环境：回退到本地后端服务器 (http://localhost:9527)
-const BASE_URL = (import.meta.env.VITE_API_URL as string) || 'http://localhost:9527';
+// API 地址从环境变量读取
+// 开发环境：npm run tauri dev 时从 .env.development 读取
+// 生产环境：npm run tauri build 时从 .env.production 读取
+// 回退值：http://localhost:9527
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9527';
 export const api = axios.create({
   baseURL: BASE_URL,
   timeout: 15000,

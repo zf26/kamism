@@ -166,8 +166,8 @@ sudo systemctl start kamism
 在同一域名下托管前端控制台和后端 API：
 
 | 访问地址 | 服务 |
-|---|---|
-| `https://yourdomain.com/kamism/` | 前端控制台 |
+|---|:--|
+| `https://yourdomain.com` | 前端控制台 |
 | `https://yourdomain.com/api/` | Rust 后端（9527） |
 
 **构建前端：**
@@ -176,7 +176,7 @@ sudo systemctl start kamism
 # 前端控制台（在 .env.production 中配置 VITE_API_URL=https://yourdomain.com/api）
 npm install
 npm run build
-# 上传 dist/ 到服务器 /www/wwwroot/yourdomain.com/kamism/
+# 上传 dist/ 到服务器 /www/wwwroot/yourdomain.com
 ```
 
 **Nginx 关键配置：**
@@ -195,8 +195,8 @@ location /api/ {
 }
 
 # 前端控制台（SPA fallback）
-location /kamism/ {
-    alias /www/wwwroot/yourdomain.com/kamism/;
+location / {
+    alias /www/wwwroot/yourdomain.com/;
     try_files $uri $uri/ /kamism/index.html;
 }
 ```

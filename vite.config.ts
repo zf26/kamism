@@ -6,16 +6,10 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => {
-
-  
   return {
     plugins: [react()],
     // Tauri 必须用 './' 相对路径，网页部署用 '/kamism/'
     base: './',
-    define: {
-      // @ts-expect-error process is a nodejs global
-      'import.meta.env.VITE_API_URL': JSON.stringify(process.env.VITE_API_URL || 'http://localhost:9527'),
-    },
 
     // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
     //
