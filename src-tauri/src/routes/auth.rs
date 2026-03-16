@@ -48,11 +48,20 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+#[derive(Deserialize)]
+pub struct ResetPasswordRequest {
+    pub email: String,
+    pub code: String,
+    pub new_password: String,
+}
+
 pub fn auth_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/auth/send-code", post(send_code))
         .route("/auth/register", post(register))
         .route("/auth/refresh", post(refresh_token))
+        .route("/auth/send-reset-code", post(send_reset_code))
+        .route("/auth/reset-password", post(reset_password))
         .route(
             "/auth/login",
             post(login).route_layer(
@@ -388,4 +397,121 @@ async fn refresh_token(
         "token": new_token,
         "refresh_token": new_refresh
     }))
+}
+
+/// 发送密码重置验证码
+async fn send_reset_code(
+    State(state): State<AppState>,
+    Json(body): Json<SendCodeRequest>,
+) -> Json<Value> {
+    if !body.email.contains('@') {
+        return Json(json!({"success": false, "message": "邮箱格式不正确"}));
+    }
+
+    // 检查邮箱是否已注册
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id::text FROM merchants WHERE email_hash = $1 LIMIT 1")
+            .bind(&email_hash)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    if exists.is_none() {
+        return Json(json!({"success": false, "message": "该邮箱未注册"}));
+    }
+
+    let mut redis = state.redis.clone();
+    let cooldown_key = format!("reset:cooldown:{}", body.email);
+
+    // 60秒冷却防刷
+    let in_cooldown: bool = redis.exists(&cooldown_key).await.unwrap_or(false);
+    if in_cooldown {
+        return Json(json!({"success": false, "message": "请求过于频繁，请60秒后再试"}));
+    }
+
+    // 生成6位数字验证码
+    let code: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Uniform::new(0u32, 10))
+        .take(6)
+        .map(|d| char::from_digit(d, 10).unwrap())
+        .collect();
+
+    // 存入 Redis：验证码 10 分钟过期，冷却标记 60 秒过期
+    let code_key = format!("reset:code:{}", body.email);
+    let _: () = redis.set_ex(&code_key, &code, 600).await.unwrap_or(());
+    let _: () = redis.set_ex(&cooldown_key, "1", 60).await.unwrap_or(());
+
+    // 发送邮件
+    match send_verify_code(&state.mailer, &body.email, &code).await {
+        Ok(_) => Json(json!({"success": true, "message": "验证码已发送，请查收邮件"})),
+        Err(e) => {
+            tracing::error!("发送密码重置验证码失败: {}", e);
+            let _: () = redis.del(&code_key).await.unwrap_or(());
+            let _: () = redis.del(&cooldown_key).await.unwrap_or(());
+            Json(json!({"success": false, "message": "邮件发送失败，请稍后重试"}))
+        }
+    }
+}
+
+/// 重置密码
+async fn reset_password(
+    State(state): State<AppState>,
+    Json(body): Json<ResetPasswordRequest>,
+) -> Json<Value> {
+    if !body.email.contains('@') {
+        return Json(json!({"success": false, "message": "邮箱格式不正确"}));
+    }
+    if body.new_password.len() < 8 {
+        return Json(json!({"success": false, "message": "密码至少8位"}));
+    }
+    if body.code.len() != 6 || !body.code.chars().all(|c| c.is_ascii_digit()) {
+        return Json(json!({"success": false, "message": "验证码格式错误"}));
+    }
+
+    let mut redis = state.redis.clone();
+    let code_key = format!("reset:code:{}", body.email);
+
+    // 从 Redis 取出验证码
+    let stored_code: Option<String> = redis.get(&code_key).await.unwrap_or(None);
+    match stored_code {
+        None => return Json(json!({"success": false, "message": "验证码无效或已过期"})),
+        Some(c) if c != body.code => return Json(json!({"success": false, "message": "验证码错误"})),
+        Some(_) => {
+            let _: () = redis.del(&code_key).await.unwrap_or(());
+        }
+    }
+
+    // 查询商户
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
+    let merchant: Option<Merchant> =
+        sqlx::query_as("SELECT * FROM merchants WHERE email_hash = $1")
+            .bind(&email_hash)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+
+    let merchant = match merchant {
+        Some(m) => m,
+        None => return Json(json!({"success": false, "message": "邮箱不存在"})),
+    };
+
+    // 加密新密码
+    let new_password_hash = match hash(&body.new_password, DEFAULT_COST) {
+        Ok(h) => h,
+        Err(_) => return Json(json!({"success": false, "message": "密码加密失败"})),
+    };
+
+    // 更新密码
+    let result = sqlx::query(
+        "UPDATE merchants SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&new_password_hash)
+    .bind(merchant.id)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(_) => Json(json!({"success": true, "message": "密码重置成功，请重新登录"})),
+        Err(e) => Json(json!({"success": false, "message": format!("重置失败: {}", e)})),
+    }
 }

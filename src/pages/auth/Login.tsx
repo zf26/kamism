@@ -80,12 +80,18 @@ export default function Login() {
           </form>
 
           <div style={{ textAlign: 'center', marginTop: 20, color: 'var(--text-muted)', fontSize: 13 }}>
-            没有账号？
-            <Link to="/register" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600, marginLeft: 4 }}>立即注册</Link>
+            <div>
+              没有账号？
+              <Link to="/register" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600, marginLeft: 4 }}>立即注册</Link>
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <Link to="/reset-password" style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}>
+                忘记密码？
+              </Link>
+            </div>
           </div>
         </div>
       </div>
     </div>
   );
 }
-

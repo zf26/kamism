@@ -104,6 +104,10 @@ export const authApi = {
     api.post('/auth/login', data),
   refresh: (refreshToken: string) =>
     api.post('/auth/refresh', { refresh_token: refreshToken }),
+  sendResetCode: (email: string) =>
+    api.post('/auth/send-reset-code', { email }),
+  resetPassword: (data: { email: string; code: string; new_password: string }) =>
+    api.post('/auth/reset-password', data),
 };
 
 // ─── Admin ──────────────────────────────────────────

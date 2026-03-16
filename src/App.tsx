@@ -6,6 +6,7 @@ import Layout from './components/Layout';
 // Auth pages
 import Login from './pages/auth/Login';
 import Register from './pages/auth/Register';
+import ResetPassword from './pages/auth/ResetPassword';
 
 // Admin pages
 import AdminDashboard from './pages/admin/Dashboard';
@@ -52,6 +53,7 @@ export default function App() {
         {/* Public */}
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
+        <Route path="/reset-password" element={<ResetPassword />} />
 
         {/* Admin routes */}
         <Route path="/admin/dashboard" element={
