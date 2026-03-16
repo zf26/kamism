@@ -42,9 +42,9 @@ pub fn public_api_router(state: AppState) -> Router<AppState> {
     use crate::middleware::rate_limit::api_rate_limit;
     use axum::middleware;
     Router::new()
-        .route("/api/v1/activate", post(activate))
-        .route("/api/v1/verify", post(verify))
-        .route("/api/v1/unbind", post(unbind))
+        .route("/v1/activate", post(activate))
+        .route("/v1/verify", post(verify))
+        .route("/v1/unbind", post(unbind))
         .route_layer(middleware::from_fn_with_state(state, api_rate_limit))
 }
 

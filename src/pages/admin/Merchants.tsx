@@ -60,6 +60,7 @@ export default function Merchants() {
   const [total, setTotal] = useState(0);
   const [keyword, setKeyword] = useState('');
   const [search, setSearch] = useState('');
+  const [planFilter, setPlanFilter] = useState<string>('');
   const [planLoading, setPlanLoading] = useState<string | null>(null);
   const [upgradeModal, setUpgradeModal] = useState<UpgradeModal | null>(null);
   const [expiresDays, setExpiresDays] = useState<string>('30');
@@ -74,9 +75,9 @@ export default function Merchants() {
     });
   };
 
-  const load = (p = page, ps = pageSize, kw = search) => {
+  const load = (p = page, ps = pageSize, kw = search, pf = planFilter) => {
     setLoading(true);
-    adminApi.getMerchants({ page: p, page_size: ps, keyword: kw || undefined })
+    adminApi.getMerchants({ page: p, page_size: ps, keyword: kw || undefined, plan: pf || undefined })
       .then(res => {
         if (res.data.success) {
           setMerchants(res.data.data);
@@ -87,14 +88,19 @@ export default function Merchants() {
 
   useEffect(() => {
     loadPlanConfigs();
-    load(page, pageSize, search);
-  }, [page, pageSize]);
+    load(page, pageSize, search, planFilter);
+  }, [page, pageSize, planFilter]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     setPage(1);
     setSearch(keyword);
-    load(1, pageSize, keyword);
+    load(1, pageSize, keyword, planFilter);
+  };
+
+  const handlePlanFilter = (pf: string) => {
+    setPlanFilter(pf);
+    setPage(1);
   };
 
   const handlePageSize = (ps: number) => {
@@ -212,6 +218,28 @@ export default function Merchants() {
           </form>
           <button className="btn btn-ghost" onClick={() => load()}><RefreshCw size={14} /> 刷新</button>
         </div>
+      </div>
+
+      {/* 套餐筛选 Tab */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+        {[{ value: '', label: '全部' }, { value: 'free', label: '免费版' }, { value: 'pro', label: '专业版' }].map(tab => (
+          <button
+            key={tab.value}
+            onClick={() => handlePlanFilter(tab.value)}
+            style={{
+              padding: '5px 16px', borderRadius: 999, fontSize: 13, fontWeight: 600,
+              border: '1px solid',
+              borderColor: planFilter === tab.value ? (tab.value === 'pro' ? 'rgba(124,58,237,0.6)' : 'var(--primary)') : 'var(--border)',
+              background: planFilter === tab.value ? (tab.value === 'pro' ? 'rgba(124,58,237,0.15)' : 'rgba(124,106,247,0.12)') : 'transparent',
+              color: planFilter === tab.value ? (tab.value === 'pro' ? '#a78bfa' : 'var(--primary-light)') : 'var(--text-muted)',
+              cursor: 'pointer', transition: 'all 0.15s',
+            }}
+          >
+            {tab.value === 'pro' && <Crown size={11} style={{ marginRight: 4, verticalAlign: 'middle' }} />}
+            {tab.value === 'free' && <Gift size={11} style={{ marginRight: 4, verticalAlign: 'middle' }} />}
+            {tab.label}
+          </button>
+        ))}
       </div>
 
       {/* 套餐说明 */}

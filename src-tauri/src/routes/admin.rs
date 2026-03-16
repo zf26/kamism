@@ -1,4 +1,5 @@
 use crate::{
+    db::encrypted_fields::EncryptedFieldsOps,
     middleware::auth::{admin_only, auth_middleware, AppState},
     models::merchant::MerchantPublic,
     utils::mq,
@@ -18,6 +19,7 @@ pub struct MerchantQuery {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
     pub keyword: Option<String>,
+    pub plan: Option<String>,
 }
 
 pub fn admin_router_with_state(state: AppState) -> Router<AppState> {
@@ -39,30 +41,67 @@ async fn list_merchants(
     let offset = (page - 1) * page_size;
     let keyword = q.keyword.unwrap_or_default();
     let like = format!("%{}%", keyword);
+    let plan_filter = q.plan.as_deref().unwrap_or("");
 
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM merchants WHERE username ILIKE $1 OR email ILIKE $1",
-    )
-    .bind(&like)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or((0,));
+    let (total, merchants) = if plan_filter.is_empty() {
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM merchants WHERE username ILIKE $1",
+        )
+        .bind(&like)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or((0,));
+        let rows: Vec<crate::models::merchant::Merchant> = sqlx::query_as(
+            "SELECT * FROM merchants WHERE username ILIKE $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(&like)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+        (total.0, rows)
+    } else {
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM merchants WHERE username ILIKE $1 AND plan = $2",
+        )
+        .bind(&like)
+        .bind(plan_filter)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or((0,));
+        let rows: Vec<crate::models::merchant::Merchant> = sqlx::query_as(
+            "SELECT * FROM merchants WHERE username ILIKE $1 AND plan = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+        )
+        .bind(&like)
+        .bind(plan_filter)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+        (total.0, rows)
+    };
 
-    let merchants: Vec<crate::models::merchant::Merchant> = sqlx::query_as(
-        "SELECT * FROM merchants WHERE username ILIKE $1 OR email ILIKE $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-    )
-    .bind(&like)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
+    // 解密 email 和 api_key
+    let public: Vec<MerchantPublic> = merchants.into_iter().map(|mut m| {
+        if let Ok(plain) = EncryptedFieldsOps::decrypt_merchant_email(&state.encryptor, &m.email) {
+            m.email = plain;
+        } else {
+            tracing::warn!("解密商户 {} email 失败", m.id);
+        }
+        if let Ok(plain) = EncryptedFieldsOps::decrypt_merchant_api_key(&state.encryptor, &m.api_key) {
+            m.api_key = plain;
+        } else {
+            tracing::warn!("解密商户 {} api_key 失败", m.id);
+        }
+        m.into()
+    }).collect();
 
-    let public: Vec<MerchantPublic> = merchants.into_iter().map(Into::into).collect();
     Json(json!({
         "success": true,
         "data": public,
-        "total": total.0,
+        "total": total,
         "page": page,
         "page_size": page_size
     }))

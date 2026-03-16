@@ -113,7 +113,7 @@ export const authApi = {
 // ─── Admin ──────────────────────────────────────────
 export const adminApi = {
   getStats: () => api.get('/admin/stats'),
-  getMerchants: (params?: { page?: number; page_size?: number; keyword?: string }) =>
+  getMerchants: (params?: { page?: number; page_size?: number; keyword?: string; plan?: string }) =>
     api.get('/admin/merchants', { params }),
   updateMerchantStatus: (id: string, status: string) =>
     api.patch(`/admin/merchants/${id}/status`, { status }),
