@@ -96,8 +96,9 @@ async fn list_cards(
 
     // 解密所有卡密代码
     for card in &mut cards {
-        if let Err(e) = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &card.code) {
-            tracing::warn!("解密卡密 {} 失败: {}", card.id, e);
+        match EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &card.code) {
+            Ok(plain) => card.code = plain,
+            Err(e) => tracing::warn!("解密卡密 {} 失败: {}", card.id, e),
         }
     }
 
@@ -272,8 +273,9 @@ async fn get_card(
     .unwrap_or(None);
 
     if let Some(ref mut c) = card {
-        if let Err(e) = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &c.code) {
-            tracing::warn!("解密卡密 {} 失败: {}", c.id, e);
+        match EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &c.code) {
+            Ok(plain) => c.code = plain,
+            Err(e) => tracing::warn!("解密卡密 {} 失败: {}", c.id, e),
         }
     }
 
