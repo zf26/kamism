@@ -19,6 +19,7 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 pub struct ActivateRequest {
     pub api_key: String,
+    pub app_id: Uuid,
     pub card_code: String,
     pub device_id: String,
     pub device_name: Option<String>,
@@ -27,6 +28,7 @@ pub struct ActivateRequest {
 #[derive(Deserialize)]
 pub struct VerifyRequest {
     pub api_key: String,
+    pub app_id: Uuid,
     pub card_code: String,
     pub device_id: String,
 }
@@ -34,6 +36,7 @@ pub struct VerifyRequest {
 #[derive(Deserialize)]
 pub struct UnbindRequest {
     pub api_key: String,
+    pub app_id: Uuid,
     pub card_code: String,
     pub device_id: String,
 }
@@ -72,13 +75,28 @@ async fn activate(
         None => return Json(json!({"success": false, "message": "无效的 API Key"})),
     };
 
-    // 查询该商户的卡密（使用哈希索引查询）
+    // 验证 app_id 归属于该商户且处于 active 状态
+    let app_valid: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM apps WHERE id = $1 AND merchant_id = $2 AND status = 'active'",
+    )
+    .bind(body.app_id)
+    .bind(merchant_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    if app_valid.is_none() {
+        return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
+    }
+
+    // 查询该商户指定应用下的卡密（使用哈希索引查询）
     let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
-        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2",
+        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2 AND app_id = $3",
     )
     .bind(&code_hash)
     .bind(merchant_id)
+    .bind(body.app_id)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
@@ -240,13 +258,28 @@ async fn verify(
         None => return Json(json!({"success": false, "message": "无效的 API Key"})),
     };
 
-    // 查询该商户的卡密（使用哈希索引查询）
+    // 验证 app_id 归属于该商户且处于 active 状态
+    let app_valid: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM apps WHERE id = $1 AND merchant_id = $2 AND status = 'active'",
+    )
+    .bind(body.app_id)
+    .bind(merchant_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    if app_valid.is_none() {
+        return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
+    }
+
+    // 查询该商户指定应用下的卡密（使用哈希索引查询）
     let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
-        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2",
+        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2 AND app_id = $3",
     )
     .bind(&code_hash)
     .bind(merchant_id)
+    .bind(body.app_id)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
@@ -344,13 +377,28 @@ async fn unbind(
         None => return Json(json!({"success": false, "message": "无效的 API Key"})),
     };
 
-    // 查询该商户的卡密（使用哈希索引查询）
+    // 验证 app_id 归属于该商户且处于 active 状态
+    let app_valid: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM apps WHERE id = $1 AND merchant_id = $2 AND status = 'active'",
+    )
+    .bind(body.app_id)
+    .bind(merchant_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    if app_valid.is_none() {
+        return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
+    }
+
+    // 查询该商户指定应用下的卡密（使用哈希索引查询）
     let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
-        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2",
+        "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2 AND app_id = $3",
     )
     .bind(&code_hash)
     .bind(merchant_id)
+    .bind(body.app_id)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);

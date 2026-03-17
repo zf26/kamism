@@ -235,6 +235,7 @@ Content-Type: application/json
 
 {
   "api_key": "km_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "app_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "card_code": "KAMI-XXXX-XXXX-XXXX-XXXX",
   "device_id": "设备唯一标识符",
   "device_name": "用户的电脑名称"
@@ -249,6 +250,7 @@ Content-Type: application/json
 
 {
   "api_key": "km_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "app_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "card_code": "KAMI-XXXX-XXXX-XXXX-XXXX",
   "device_id": "设备唯一标识符"
 }
@@ -262,6 +264,7 @@ Content-Type: application/json
 
 {
   "api_key": "km_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "app_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "card_code": "KAMI-XXXX-XXXX-XXXX-XXXX",
   "device_id": "设备唯一标识符"
 }

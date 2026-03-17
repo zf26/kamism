@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { appsApi } from '../../lib/api';
-import { Plus, Trash2, RefreshCw, Power } from 'lucide-react';
+import { Plus, Trash2, RefreshCw, Power, Copy } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface App {
@@ -97,7 +97,16 @@ export default function Apps() {
               <tr key={app.id}>
                 <td><span style={{ color: 'var(--text)', fontWeight: 600 }}>{app.app_name}</span></td>
                 <td><span style={{ color: 'var(--text-muted)' }}>{app.description || '—'}</span></td>
-                <td><span className="mono" style={{ fontSize: 11 }}>{app.id.slice(0, 8)}…</span></td>
+                <td>
+                  <span
+                    className="mono"
+                    style={{ fontSize: 11, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--text-muted)' }}
+                    title="点击复制完整 ID"
+                    onClick={() => { navigator.clipboard.writeText(app.id); toast.success('ID 已复制'); }}
+                  >
+                    {app.id.slice(0, 8)}…<Copy size={10} />
+                  </span>
+                </td>
                 <td><span className={`badge badge-${app.status}`}>{app.status === 'active' ? '正常' : '禁用'}</span></td>
                 <td>{new Date(app.created_at).toLocaleDateString('zh-CN')}</td>
                 <td>
