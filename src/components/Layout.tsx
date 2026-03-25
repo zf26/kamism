@@ -1,8 +1,9 @@
+import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../stores/auth';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield
+  Settings, LogOut, Shield, X
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 
@@ -30,6 +31,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, role, logout } = useAuthStore();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const navItems = role === 'admin' ? adminNav : merchantNav;
 
@@ -38,20 +40,16 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     navigate('/login');
   };
 
-  return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
-      {/* Sidebar */}
-      <aside style={{
-        width: 220,
-        minWidth: 220,
-        background: 'var(--bg-card)',
-        borderRight: '1px solid var(--border)',
-        display: 'flex',
-        flexDirection: 'column',
-        padding: '20px 0',
-      }}>
-        {/* Logo */}
-        <div style={{ padding: '0 20px 24px', borderBottom: '1px solid var(--border)', marginBottom: 12 }}>
+  const handleNav = (path: string) => {
+    navigate(path);
+    setSidebarOpen(false);
+  };
+
+  const SidebarContent = () => (
+    <>
+      {/* Logo */}
+      <div style={{ padding: '0 20px 24px', borderBottom: '1px solid var(--border)', marginBottom: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <img
               src={appIcon}
@@ -65,72 +63,134 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               </div>
             </div>
           </div>
-        </div>
-
-        {/* Nav */}
-        <nav style={{ flex: 1, padding: '0 12px' }}>
-          {navItems.map((item) => {
-            const active = location.pathname === item.path;
-            return (
-              <button
-                key={item.path}
-                onClick={() => navigate(item.path)}
-                style={{
-                  width: '100%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '10px 12px',
-                  borderRadius: 8,
-                  marginBottom: 2,
-                  background: active ? 'var(--accent-glow)' : 'transparent',
-                  color: active ? 'var(--accent)' : 'var(--text-dim)',
-                  fontWeight: active ? 700 : 500,
-                  fontSize: 13,
-                  border: active ? '1px solid rgba(124,106,247,0.2)' : '1px solid transparent',
-                  textAlign: 'left',
-                  cursor: 'pointer',
-                  transition: 'all 0.15s',
-                }}
-                onMouseEnter={e => { if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-hover)'; }}
-                onMouseLeave={e => { if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
-              >
-                {item.icon}
-                {item.label}
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* User info */}
-        <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-            <div style={{
-              width: 32, height: 32, borderRadius: '50%',
-              background: 'linear-gradient(135deg, var(--accent-dim), #6d28d9)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 13, fontWeight: 700, color: '#fff', flexShrink: 0,
-            }}>
-              {user?.username?.[0]?.toUpperCase() ?? 'U'}
-            </div>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {user?.username}
-              </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3 }}>
-                {role === 'admin' && <Shield size={10} />}
-                {role === 'admin' ? '管理员' : '商户'}
-              </div>
-            </div>
-          </div>
-          <button className="btn btn-ghost" style={{ width: '100%', justifyContent: 'center', fontSize: 12 }} onClick={handleLogout}>
-            <LogOut size={13} /> 退出登录
+          {/* 移动端关闭按钮 */}
+          <button
+            onClick={() => setSidebarOpen(false)}
+            style={{
+              background: 'none', border: 'none', color: 'var(--text-muted)',
+              cursor: 'pointer', padding: 4, borderRadius: 6,
+              display: 'none',
+            }}
+            className="sidebar-close-btn"
+          >
+            <X size={18} />
           </button>
         </div>
+      </div>
+
+      {/* Nav */}
+      <nav style={{ flex: 1, padding: '0 12px' }}>
+        {navItems.map((item) => {
+          const active = location.pathname === item.path;
+          return (
+            <button
+              key={item.path}
+              onClick={() => handleNav(item.path)}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '10px 12px',
+                borderRadius: 8,
+                marginBottom: 2,
+                background: active ? 'var(--accent-glow)' : 'transparent',
+                color: active ? 'var(--accent)' : 'var(--text-dim)',
+                fontWeight: active ? 700 : 500,
+                fontSize: 13,
+                border: active ? '1px solid rgba(124,106,247,0.2)' : '1px solid transparent',
+                textAlign: 'left',
+                cursor: 'pointer',
+                transition: 'all 0.15s',
+              }}
+              onMouseEnter={e => { if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-hover)'; }}
+              onMouseLeave={e => { if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
+            >
+              {item.icon}
+              {item.label}
+            </button>
+          );
+        })}
+      </nav>
+
+      {/* User info */}
+      <div style={{ padding: '16px 20px', borderTop: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <div style={{
+            width: 32, height: 32, borderRadius: '50%',
+            background: 'linear-gradient(135deg, var(--accent-dim), #6d28d9)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 13, fontWeight: 700, color: '#fff', flexShrink: 0,
+          }}>
+            {user?.username?.[0]?.toUpperCase() ?? 'U'}
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {user?.username}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3 }}>
+              {role === 'admin' && <Shield size={10} />}
+              {role === 'admin' ? '管理员' : '商户'}
+            </div>
+          </div>
+        </div>
+        <button
+          className="btn btn-ghost"
+          style={{ width: '100%', justifyContent: 'center', fontSize: 12 }}
+          onClick={handleLogout}
+        >
+          <LogOut size={13} /> 退出登录
+        </button>
+      </div>
+    </>
+  );
+
+  return (
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+
+      {/* ── 移动端顶部 Header ── */}
+      <header className="mobile-header">
+        <div className="mobile-header-logo">
+          <img src={appIcon} alt="KamiSM" style={{ width: 28, height: 28, borderRadius: 7 }} />
+          KamiSM
+        </div>
+        <button className="hamburger" onClick={() => setSidebarOpen(true)} aria-label="打开菜单">
+          <span /><span /><span />
+        </button>
+      </header>
+
+      {/* ── 移动端遮罩 ── */}
+      <div
+        className={`sidebar-overlay${sidebarOpen ? ' open' : ''}`}
+        onClick={() => setSidebarOpen(false)}
+      />
+
+      {/* ── Sidebar ── */}
+      <aside
+        className={`layout-sidebar${sidebarOpen ? ' open' : ''}`}
+        style={{
+          width: 'var(--sidebar-w)',
+          minWidth: 'var(--sidebar-w)',
+          background: 'var(--bg-card)',
+          borderRight: '1px solid var(--border)',
+          display: 'flex',
+          flexDirection: 'column',
+          padding: '20px 0',
+          overflowY: 'auto',
+        }}
+      >
+        <SidebarContent />
       </aside>
 
-      {/* Main */}
-      <main style={{ flex: 1, overflow: 'auto', padding: '32px 36px' }} className="fade-in">
+      {/* ── Main ── */}
+      <main
+        className="layout-main fade-in"
+        style={{
+          flex: 1,
+          overflow: 'auto',
+          padding: '32px 36px',
+        }}
+      >
         {children}
       </main>
     </div>

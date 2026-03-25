@@ -178,7 +178,6 @@ async fn activate(
             "success": true,
             "message": "卡密已激活（设备已绑定）",
             "data": {
-                "card_code": card.code,
                 "expires_at": expires_at,
                 "remaining_days": remaining_days,
                 "max_devices": card.max_devices
@@ -253,7 +252,6 @@ async fn activate(
         "success": true,
         "message": "激活成功",
         "data": {
-            "card_code": card.code,
             "expires_at": expires_at,
             "remaining_days": remaining_days,
             "max_devices": card.max_devices,
@@ -372,7 +370,6 @@ async fn verify(
         "valid": true,
         "message": "卡密有效",
         "data": {
-            "card_code": card.code,
             "expires_at": card.expires_at,
             "remaining_days": remaining_days,
             "max_devices": card.max_devices,
