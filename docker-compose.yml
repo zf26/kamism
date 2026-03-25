@@ -1,21 +1,75 @@
+# ══════════════════════════════════════════════
+# KamiSM Docker Compose
+# 单容器启动（推荐）：docker compose -f docker-compose.standalone.yml up -d --build
+# 多容器启动：       docker compose up -d --build
+# ══════════════════════════════════════════════
+
 services:
-  # ─── KamiSM 后端服务 ────────────────────────────────
+  # ─── PostgreSQL ──────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: kamism-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: kamism
+      POSTGRES_USER: kamism
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kamism -d kamism"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Redis ───────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: kamism-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── RabbitMQ ────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    container_name: kamism-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: kamism
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── 后端服务（不对外暴露，由 Nginx 代理）────────────
   app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: kamism-app
     restart: unless-stopped
-    ports:
-      - "9527:9527"
     depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: postgres://kamism:${POSTGRES_PASSWORD}@host.docker.internal:5432/kamism
-      REDIS_URL: redis://host.docker.internal:6379
+      DATABASE_URL: postgres://kamism:${POSTGRES_PASSWORD}@postgres:5432/kamism
+      REDIS_URL: redis://redis:6379
       AMQP_URL: amqp://kamism:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2f
       JWT_SECRET: ${JWT_SECRET}
       PORT: 9527
@@ -28,58 +82,24 @@ services:
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-KamiSM}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       RUST_LOG: ${RUST_LOG:-info}
+    expose:
+      - "9527"
 
-  # ─── RabbitMQ（异步降级任务队列）───────────────────
-  # rabbitmq:
-  #   image: rabbitmq:3.13-management-alpine
-  #   container_name: kamism-rabbitmq
-  #   restart: unless-stopped
-  #   ports:
-  #     - "5672:5672"    # AMQP
-  #     - "15672:15672"  # Management UI
-  #   environment:
-  #     RABBITMQ_DEFAULT_USER: kamism
-  #     RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
-  #     RABBITMQ_DEFAULT_VHOST: /
-  #   volumes:
-  #     - rabbitmq_data:/var/lib/rabbitmq
-  #   healthcheck:
-  #     test: ["CMD", "rabbitmq-diagnostics", "ping"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 10
-
-  # ─── 如果服务器上没有 PG 和 Redis，取消下面的注释 ──
-  # postgres:
-  #   image: postgres:16-alpine
-  #   container_name: kamism-postgres
-  #   restart: unless-stopped
-  #   environment:
-  #     POSTGRES_DB: kamism
-  #     POSTGRES_USER: kamism
-  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U kamism -d kamism"]
-  #     interval: 5s
-  #     timeout: 5s
-  #     retries: 10
-  #
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: kamism-redis
-  #   restart: unless-stopped
-  #   command: redis-server --appendonly yes
-  #   volumes:
-  #     - redis_data:/data
-  #   healthcheck:
-  #     test: ["CMD", "redis-cli", "ping"]
-  #     interval: 5s
-  #     timeout: 3s
-  #     retries: 10
+  # ─── 前端（Nginx 反代，统一对外暴露 1420）────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        VITE_API_URL: /api
+    container_name: kamism-web
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "${FRONTEND_PORT:-1420}:80"
 
 volumes:
+  postgres_data:
+  redis_data:
   rabbitmq_data:
-  # postgres_data:
-  # redis_data:

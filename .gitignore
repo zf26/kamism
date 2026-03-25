@@ -3,7 +3,8 @@ target/
 node_modules/
 dist/
 dist-server/
-
+Cargo.lock
+package-lock.json
 # 环境变量（不提交真实配置）
 .env
 src-tauri/.env

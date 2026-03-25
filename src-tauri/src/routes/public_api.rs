@@ -7,6 +7,7 @@ use crate::{
 };
 use axum::{
     extract::{ConnectInfo, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -41,6 +42,27 @@ pub struct UnbindRequest {
     pub device_id: String,
 }
 
+/// 从请求头提取真实客户端 IP，优先读反向代理头
+fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
+    if let Some(val) = headers.get("x-forwarded-for") {
+        if let Ok(s) = val.to_str() {
+            let first = s.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    if let Some(val) = headers.get("x-real-ip") {
+        if let Ok(s) = val.to_str() {
+            let s = s.trim();
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    addr.ip().to_string()
+}
+
 pub fn public_api_router(state: AppState) -> Router<AppState> {
     use crate::middleware::rate_limit::api_rate_limit;
     use axum::middleware;
@@ -55,6 +77,7 @@ pub fn public_api_router(state: AppState) -> Router<AppState> {
 async fn activate(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<ActivateRequest>,
 ) -> Json<Value> {
     if body.device_id.trim().is_empty() {
@@ -185,7 +208,7 @@ async fn activate(
         card.expires_at
     };
 
-    let ip = addr.ip().to_string();
+    let ip = extract_client_ip(&headers, &addr);
     let activation_id = Uuid::new_v4();
 
     // 加密设备 ID 并生成哈希

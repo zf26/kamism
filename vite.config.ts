@@ -8,8 +8,9 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => {
   return {
     plugins: [react()],
-    // Tauri 必须用 './' 相对路径，网页部署用 '/kamism/'
-    base: './',
+    // Docker/web 部署用 '/'，Tauri 桌面端打包时 tauri-cli 会自动覆盖
+    base: '/',
+    // 注意：如果用 tauri build 打包桌面端，请改回 './'
 
     // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
     //

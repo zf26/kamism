@@ -1,0 +1,37 @@
+# KamiSM 单容器启动（推荐新手使用）
+# 用法：
+#   cp env.example .env && nano .env
+#   docker compose -f docker-compose.standalone.yml up -d --build
+# 访问：http://your-server-ip:1420
+
+services:
+  kamism:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+    container_name: kamism
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-KamiSM}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      RUST_LOG: ${RUST_LOG:-info}
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@127.0.0.1/kamism
+      REDIS_URL: redis://127.0.0.1:6379
+      AMQP_URL: amqp://kamism:${RABBITMQ_PASSWORD}@127.0.0.1:5672
+    volumes:
+      - kamism_data:/data
+    ports:
+      - "${FRONTEND_PORT:-1420}:80"
+
+volumes:
+  kamism_data:
+
