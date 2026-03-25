@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import { useAuthStore } from './stores/auth';
 import Layout from './components/Layout';
+import ConfirmDialog from './components/ConfirmDialog';
 
 // Auth pages
 import Login from './pages/auth/Login';
@@ -12,6 +13,7 @@ import ResetPassword from './pages/auth/ResetPassword';
 import AdminDashboard from './pages/admin/Dashboard';
 import Merchants from './pages/admin/Merchants';
 import PlanConfigs from './pages/admin/PlanConfigs';
+import AdminMessages from './pages/admin/Messages';
 
 // Merchant pages
 import MerchantDashboard from './pages/merchant/Dashboard';
@@ -19,6 +21,7 @@ import Apps from './pages/merchant/Apps';
 import Cards from './pages/merchant/Cards';
 import Activations from './pages/merchant/Activations';
 import Settings from './pages/merchant/Settings';
+import MerchantMessages from './pages/merchant/Messages';
 
 function RequireAuth({ children, role }: { children: React.ReactNode; role?: string }) {
   const { token, role: userRole } = useAuthStore();
@@ -49,6 +52,7 @@ export default function App() {
           error: { iconTheme: { primary: 'var(--danger)', secondary: 'var(--bg-card)' } },
         }}
       />
+      <ConfirmDialog />
       <Routes>
         {/* Public */}
         <Route path="/login" element={<Login />} />
@@ -64,6 +68,9 @@ export default function App() {
         } />
         <Route path="/admin/plan-configs" element={
           <RequireAuth role="admin"><Layout><PlanConfigs /></Layout></RequireAuth>
+        } />
+        <Route path="/admin/messages" element={
+          <RequireAuth role="admin"><Layout><AdminMessages /></Layout></RequireAuth>
         } />
 
         {/* Merchant routes */}
@@ -81,6 +88,9 @@ export default function App() {
         } />
         <Route path="/settings" element={
           <RequireAuth role="merchant"><Layout><Settings /></Layout></RequireAuth>
+        } />
+        <Route path="/messages" element={
+          <RequireAuth role="merchant"><Layout><MerchantMessages /></Layout></RequireAuth>
         } />
 
         {/* Default redirect */}

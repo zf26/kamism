@@ -3,6 +3,7 @@ import { useAuthStore } from '../../stores/auth';
 import { merchantApi } from '../../lib/api';
 import { Copy, RefreshCw, Lock, Key } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { useConfirm } from '../../stores/confirm';
 
 export default function Settings() {
   const { user, setAuth, role } = useAuthStore();
@@ -34,8 +35,11 @@ export default function Settings() {
     finally { setPwLoading(false); }
   };
 
+  const confirm = useConfirm();
+
   const handleRegenerateApiKey = async () => {
-    if (!confirm('重新生成 API Key 后，旧 Key 立即失效，已集成的软件需同步更新！确认继续？')) return;
+    const ok = await confirm({ title: '重新生成 API Key', message: '旧 Key 将立即失效，已集成的软件需同步更新。确认继续？', confirmText: '重新生成', danger: true });
+    if (!ok) return;
     setApiLoading(true);
     try {
       const res = await merchantApi.regenerateApiKey();

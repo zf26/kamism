@@ -4,3 +4,4 @@ pub mod error;
 pub mod mailer;
 pub mod mq;
 pub mod kms;
+pub mod ws;

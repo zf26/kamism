@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { activationsApi } from '../../lib/api';
 import { Unlink, RefreshCw } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { useConfirm } from '../../stores/confirm';
 
 interface Activation {
   id: string;
@@ -41,8 +42,11 @@ export default function Activations() {
     load(1, pageSize, searchCode);
   }, [searchCode]);
 
+  const confirm = useConfirm();
+
   const handleUnbind = async (id: string) => {
-    if (!confirm('确认解绑此设备？')) return;
+    const ok = await confirm({ title: '解绑设备', message: '确认解绑此设备？解绑后该设备将无法使用当前卡密。', confirmText: '解绑', danger: true });
+    if (!ok) return;
     try {
       const res = await activationsApi.unbind(id);
       if (res.data.success) { toast.success('设备已解绑'); load(); }

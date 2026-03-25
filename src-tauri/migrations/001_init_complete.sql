@@ -142,3 +142,45 @@ VALUES
     ('pro',  '专业版', -1, -1,  100, 1000)
 ON CONFLICT (plan) DO NOTHING;
 
+
+-- ============================================================================
+-- 站内信 / 公告系统
+-- ============================================================================
+
+-- 消息主表
+-- type: 'notice' = 公告（全体可见，无需已读追踪）
+--       'message' = 站内信（有收件人，追踪已读）
+-- target_type: 'all' = 全体商户，'single' = 单个商户（仅 message 类型有效）
+CREATE TABLE IF NOT EXISTS messages (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    type         VARCHAR(16) NOT NULL CHECK (type IN ('notice', 'message')),
+    title        VARCHAR(256) NOT NULL,
+    content      TEXT        NOT NULL,
+    sender_id    UUID        NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+    target_type  VARCHAR(16) NOT NULL DEFAULT 'all' CHECK (target_type IN ('all', 'single')),
+    target_id    UUID        REFERENCES merchants(id) ON DELETE CASCADE,
+    pinned       BOOLEAN     NOT NULL DEFAULT FALSE,
+    expires_at   TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 已读记录表（仅 type='message' 时使用）
+-- 广播消息只存一行，各商户已读状态在此表追踪
+CREATE TABLE IF NOT EXISTS message_reads (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id   UUID        NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    merchant_id  UUID        NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    read_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(message_id, merchant_id)
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_messages_type        ON messages(type);
+CREATE INDEX IF NOT EXISTS idx_messages_sender_id   ON messages(sender_id);
+CREATE INDEX IF NOT EXISTS idx_messages_target_id   ON messages(target_id);
+CREATE INDEX IF NOT EXISTS idx_messages_pinned      ON messages(pinned) WHERE pinned = TRUE;
+CREATE INDEX IF NOT EXISTS idx_messages_expires_at  ON messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_reads_merchant ON message_reads(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_message_reads_message  ON message_reads(message_id);
+

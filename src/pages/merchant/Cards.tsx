@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { cardsApi, appsApi } from '../../lib/api';
 import { Plus, Ban, Trash2, RefreshCw, Copy, CheckCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { useConfirm } from '../../stores/confirm';
 
 interface Card {
   id: string;
@@ -118,8 +119,11 @@ export default function Cards() {
     } catch { toast.error('操作失败'); }
   };
 
+  const confirm = useConfirm();
+
   const handleDelete = async (id: string) => {
-    if (!confirm('确认删除？仅可删除未使用的卡密。')) return;
+    const ok = await confirm({ title: '删除卡密', message: '确认删除？仅可删除未使用的卡密，此操作不可撤销。', confirmText: '删除', danger: true });
+    if (!ok) return;
     try {
       const res = await cardsApi.delete(id);
       if (res.data.success) { toast.success('删除成功'); load(); }

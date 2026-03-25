@@ -1,6 +1,7 @@
 use crate::utils::jwt::{verify_token, Claims};
 use crate::utils::kms::Encryptor;
 use crate::utils::mailer::MailerConfig;
+use crate::utils::ws::WsRegistry;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -20,6 +21,7 @@ pub struct AppState {
     pub redis: ConnectionManager,
     pub mq_channel: std::sync::Arc<Channel>,
     pub encryptor: std::sync::Arc<Encryptor>,
+    pub ws_registry: WsRegistry,
 }
 
 pub async fn auth_middleware(

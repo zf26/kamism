@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { appsApi } from '../../lib/api';
 import { Plus, Trash2, RefreshCw, Power, Copy } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { useConfirm } from '../../stores/confirm';
 
 interface App {
   id: string;
@@ -54,8 +55,11 @@ export default function Apps() {
     finally { setSubmitting(false); }
   };
 
+  const confirm = useConfirm();
+
   const handleDelete = async (id: string) => {
-    if (!confirm('确认删除此应用？关联的卡密也将被删除。')) return;
+    const ok = await confirm({ title: '删除应用', message: '确认删除此应用？关联的卡密也将被一并删除，此操作不可撤销。', confirmText: '删除', danger: true });
+    if (!ok) return;
     try {
       const res = await appsApi.delete(id);
       if (res.data.success) { toast.success('删除成功'); load(); }

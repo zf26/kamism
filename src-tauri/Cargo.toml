@@ -25,10 +25,11 @@ tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-shell = { version = "2", optional = true }
 
 # Web 框架
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+futures-util = { version = "0.3", features = ["sink"] }
 
 # 数据库
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "migrate"] }

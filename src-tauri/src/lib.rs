@@ -81,6 +81,7 @@ pub async fn start_server() -> anyhow::Result<()> {
     tracing::info!("KMS 初始化成功");
 
     init_admin(&pool).await;
+    let ws_registry = crate::utils::ws::WsRegistry::new();
     let state = AppState {
         pool: pool.clone(),
         jwt_secret: jwt_secret.clone(),
@@ -88,6 +89,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         redis: redis_conn.clone(),
         mq_channel: mq_channel.clone(),
         encryptor: encryptor.clone(),
+        ws_registry: ws_registry.clone(),
     };
 
     // 启动降级消费者（独立 task，传入独立 Redis 连接）
@@ -131,6 +133,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::activations::activations_router(state.clone()))
         .merge(routes::public_api::public_api_router(state.clone()))
         .merge(routes::plan_config::plan_config_router(state.clone()))
+        .merge(routes::messages::messages_admin_router(state.clone()))
+        .merge(routes::messages::messages_merchant_router(state.clone()))
+        .merge(routes::messages::messages_ws_router())
         .layer(cors)
         .with_state(state);
 

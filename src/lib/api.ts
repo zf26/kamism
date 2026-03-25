@@ -170,3 +170,44 @@ export const merchantApi = {
     api.post('/merchant/change-password', data),
   regenerateApiKey: () => api.post('/merchant/regenerate-apikey'),
 };
+
+// ─── Messages (Admin) ───────────────────────────────
+export const adminMessagesApi = {
+  list: (params?: { page?: number; page_size?: number; msg_type?: string }) =>
+    api.get('/api/admin/messages', { params }),
+  send: (data: {
+    msg_type: string;
+    title: string;
+    content: string;
+    target_type?: string;
+    target_id?: string;
+    target_email?: string;
+    pinned?: boolean;
+    expires_at?: string;
+  }) => api.post('/api/admin/messages', data),
+  update: (id: string, data: {
+    title?: string;
+    content?: string;
+    pinned?: boolean;
+    expires_at?: string;
+  }) => api.patch(`/api/admin/messages/${id}`, data),
+  delete: (id: string) => api.delete(`/api/admin/messages/${id}`),
+};
+
+// ─── Messages (Merchant) ────────────────────────────
+export const merchantMessagesApi = {
+  listNotices: (params?: { page?: number; page_size?: number }) =>
+    api.get('/api/merchant/notices', { params }),
+  listMessages: (params?: { page?: number; page_size?: number }) =>
+    api.get('/api/merchant/messages', { params }),
+  unreadCount: () => api.get('/api/merchant/messages/unread_count'),
+  markRead: (id: string) => api.post(`/api/merchant/messages/${id}/read`),
+};
+
+// ─── WebSocket URL helper ────────────────────────────
+export function getWsUrl(): string {
+  const base = (import.meta.env.VITE_API_URL || 'http://localhost:9527') as string;
+  const ws = base.replace(/^http/, 'ws');
+  const token = localStorage.getItem('token') ?? '';
+  return `${ws}/api/ws/messages?token=${encodeURIComponent(token)}`;
+}
