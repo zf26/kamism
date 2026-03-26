@@ -8,9 +8,11 @@ use crate::{
 use axum::{
     extract::{Path, Query, State},
     middleware,
+    response::Response,
     routing::{get, patch, post},
     Extension, Json, Router,
 };
+use axum::http::{header, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -43,6 +45,7 @@ pub struct BatchCardStatusRequest {
 pub fn cards_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/cards", get(list_cards).post(generate_cards))
+        .route("/cards/export", get(export_cards_csv))
         .route("/cards/batch-status", post(batch_update_card_status))
         .route("/cards/:id", get(get_card).delete(delete_card))
         .route("/cards/:id/disable", patch(disable_card))
@@ -109,6 +112,94 @@ async fn list_cards(
         "page": page,
         "page_size": page_size
     }))
+}
+
+async fn export_cards_csv(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<CardQuery>,
+) -> Result<Response<String>, StatusCode> {
+    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+
+    let mut cards: Vec<Card> = if claims.role == "admin" {
+        sqlx::query_as("SELECT * FROM cards ORDER BY created_at DESC")
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default()
+    } else {
+        let mut sql = "SELECT * FROM cards WHERE merchant_id = $1".to_string();
+        if q.app_id.is_some() { sql.push_str(" AND app_id = $2"); }
+        if q.app_id.is_some() {
+            sqlx::query_as(&format!("{} ORDER BY created_at DESC", sql))
+                .bind(merchant_id)
+                .bind(q.app_id.unwrap())
+                .fetch_all(&state.pool)
+                .await
+                .unwrap_or_default()
+        } else {
+            sqlx::query_as(&format!("{} ORDER BY created_at DESC", sql))
+                .bind(merchant_id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap_or_default()
+        }
+    };
+
+    // 按 status 过滤
+    if let Some(ref status) = q.status {
+        cards.retain(|c| &c.status == status);
+    }
+
+    // 解密所有卡密代码
+    for card in &mut cards {
+        if let Ok(plain) = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &card.code) {
+            card.code = plain;
+        }
+    }
+
+    // 构建 CSV
+    let mut csv = String::from("卡密代码,有效天数,设备上限,状态,创建时间,激活时间,过期时间,备注\n");
+    for c in &cards {
+        let status_label = match c.status.as_str() {
+            "unused" => "未使用",
+            "active" => "使用中",
+            "expired" => "已过期",
+            "disabled" => "已禁用",
+            _ => &c.status,
+        };
+        let activated = c.activated_at
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        let expires = c.expires_at
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        let note = c.note.as_deref().unwrap_or("").replace(',', "，");
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            c.code,
+            c.duration_days,
+            c.max_devices,
+            status_label,
+            c.created_at.format("%Y-%m-%d %H:%M"),
+            activated,
+            expires,
+            note,
+        ));
+    }
+
+    // 加 BOM 让 Excel 正确识别 UTF-8
+    let bom = "\u{feff}";
+    let body = format!("{}{}", bom, csv);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"cards.csv\"",
+        )
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn generate_cards(

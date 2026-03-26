@@ -144,6 +144,8 @@ export const appsApi = {
 export const cardsApi = {
   list: (params?: { app_id?: string; status?: string; page?: number; page_size?: number }) =>
     api.get('/cards', { params }),
+  exportCsv: (params?: { app_id?: string; status?: string }) =>
+    api.get('/cards/export', { params, responseType: 'blob' }),
   generate: (data: {
     app_id: string;
     count: number;
@@ -166,6 +168,7 @@ export const activationsApi = {
 // ─── Merchant ───────────────────────────────────────
 export const merchantApi = {
   getProfile: () => api.get('/merchant/profile'),
+  dashboardStats: (range?: 'week' | 'month' | 'year') => api.get('/merchant/dashboard-stats', { params: { range } }),
   changePassword: (data: { old_password: string; new_password: string }) =>
     api.post('/merchant/change-password', data),
   regenerateApiKey: () => api.post('/merchant/regenerate-apikey'),
@@ -211,3 +214,12 @@ export function getWsUrl(): string {
   const token = localStorage.getItem('token') ?? '';
   return `${ws}/api/ws/messages?token=${encodeURIComponent(token)}`;
 }
+
+// ─── Webhooks ─────────────────────────────────────────
+export const webhookApi = {
+  get: (appId: string) => api.get(`/webhooks/app/${appId}`),
+  upsert: (appId: string, data: { url: string; secret?: string; enabled?: boolean; events?: string[] }) =>
+    api.put(`/webhooks/app/${appId}`, data),
+  delete: (appId: string) => api.delete(`/webhooks/app/${appId}`),
+  list: () => api.get('/webhooks'),
+};

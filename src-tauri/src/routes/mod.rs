@@ -7,4 +7,5 @@ pub mod activations;
 pub mod public_api;
 pub mod plan_config;
 pub mod messages;
+pub mod webhooks;
 

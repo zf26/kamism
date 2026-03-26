@@ -562,22 +562,9 @@ CREATE TABLE activations (
 
 Copyright © 2026 KamiSM Contributors
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+This project is licensed under the **MIT License**.
 
-**允许（Permitted）：**
-- ✅ 个人自用、学习、研究
-- ✅ 修改源码并用于个人或内部项目
-- ✅ 在自己的软件中集成使用
-
-**要求（Required）：**
-- 📋 修改后的版本必须以 AGPL-3.0 开源
-- 📋 通过网络提供服务时，必须公开对应的完整源码
-- 📋 保留原始版权声明和许可证
-
-**禁止（Prohibited）：**
-- ❌ 将本软件闭源后作为商品出售或提供付费服务，而不公开修改后的源码
-
-完整协议文本见 [LICENSE](./LICENSE) 或 https://www.gnu.org/licenses/agpl-3.0.html
+完整协议文本见 [LICENSE](./LICENSE)。
 
 ---
 

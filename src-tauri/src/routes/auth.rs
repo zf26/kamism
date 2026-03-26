@@ -132,11 +132,23 @@ async fn register(
     if !body.email.contains('@') {
         return Json(json!({"success": false, "message": "邮箱格式不正确"}));
     }
+    if body.email.len() > 254 {
+        return Json(json!({"success": false, "message": "邮箱长度超限"}));
+    }
     if body.password.len() < 8 {
         return Json(json!({"success": false, "message": "密码至少8位"}));
     }
+    if body.password.len() > 128 {
+        return Json(json!({"success": false, "message": "密码长度超限"}));
+    }
     if body.username.len() < 3 {
         return Json(json!({"success": false, "message": "用户名至少3位"}));
+    }
+    if body.username.len() > 32 {
+        return Json(json!({"success": false, "message": "用户名最长32位"}));
+    }
+    if !body.username.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return Json(json!({"success": false, "message": "用户名只能包含字母、数字、下划线和连字符"}));
     }
     if body.code.len() != 6 || !body.code.chars().all(|c| c.is_ascii_digit()) {
         return Json(json!({"success": false, "message": "验证码格式错误"}));

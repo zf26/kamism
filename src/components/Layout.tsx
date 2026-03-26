@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../stores/auth';
+import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -36,6 +37,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, role, logout } = useAuthStore();
+  const { theme, toggle: toggleTheme } = useThemeStore();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [unread, setUnread] = useState(0);
   const [noticeQueue, setNoticeQueue] = useState<{id:string;title:string;content:string;created_at:string}[]>([]);
@@ -202,13 +204,24 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         </div>
-        <button
-          className="btn btn-ghost"
-          style={{ width: '100%', justifyContent: 'center', fontSize: 12 }}
-          onClick={handleLogout}
-        >
-          <LogOut size={13} /> 退出登录
-        </button>
+        <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+          <button
+            className="btn btn-ghost"
+            style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
+            onClick={toggleTheme}
+            title={theme === 'dark' ? '切换亮色' : '切换暗色'}
+          >
+            {theme === 'dark' ? <Sun size={13} /> : <Moon size={13} />}
+            {theme === 'dark' ? '亮色' : '暗色'}
+          </button>
+          <button
+            className="btn btn-ghost"
+            style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
+            onClick={handleLogout}
+          >
+            <LogOut size={13} /> 退出
+          </button>
+        </div>
       </div>
     </>
   );

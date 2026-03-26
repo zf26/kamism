@@ -1,6 +1,10 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import { useAuthStore } from './stores/auth';
+import { applyStoredTheme } from './stores/theme';
+
+// 立即同步主题，避免首屏闪烁
+applyStoredTheme();
 import Layout from './components/Layout';
 import ConfirmDialog from './components/ConfirmDialog';
 

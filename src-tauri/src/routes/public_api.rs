@@ -248,6 +248,20 @@ async fn activate(
 
     let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0));
 
+    // 异步触发 Webhook（activate 事件）
+    let pool_clone = state.pool.clone();
+    let app_id_clone = card.app_id;
+    let webhook_payload = serde_json::json!({
+        "card_code": body.card_code,
+        "device_id": body.device_id,
+        "device_name": body.device_name,
+        "expires_at": expires_at,
+        "remaining_days": remaining_days,
+    });
+    tokio::spawn(async move {
+        crate::routes::webhooks::fire_webhook(&pool_clone, app_id_clone, "activate", webhook_payload).await;
+    });
+
     Json(json!({
         "success": true,
         "message": "激活成功",
@@ -364,6 +378,19 @@ async fn verify(
             .fetch_one(&state.pool)
             .await
             .unwrap_or((0,));
+
+    // 异步触发 Webhook（verify 事件）
+    let pool_clone = state.pool.clone();
+    let app_id_clone = card.app_id;
+    let webhook_payload = serde_json::json!({
+        "card_code": body.card_code,
+        "device_id": body.device_id,
+        "expires_at": card.expires_at,
+        "remaining_days": remaining_days,
+    });
+    tokio::spawn(async move {
+        crate::routes::webhooks::fire_webhook(&pool_clone, app_id_clone, "verify", webhook_payload).await;
+    });
 
     Json(json!({
         "success": true,

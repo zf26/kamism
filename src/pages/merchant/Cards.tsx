@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { cardsApi, appsApi } from '../../lib/api';
-import { Plus, Ban, Trash2, RefreshCw, Copy, CheckCircle } from 'lucide-react';
+import { Plus, Ban, Trash2, RefreshCw, Copy, CheckCircle, Download } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useConfirm } from '../../stores/confirm';
 
@@ -29,6 +29,7 @@ export default function Cards() {
   const PAGE_SIZE_OPTIONS = [5, 10, 15, 20];
   const [showModal, setShowModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [form, setForm] = useState({ app_id: '', count: 10, duration_days: 30, max_devices: 1, note: '' });
   
   // 搜索过滤状态
@@ -103,6 +104,23 @@ export default function Cards() {
     finally { setSubmitting(false); }
   };
 
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const res = await cardsApi.exportCsv({
+        app_id: filterAppId || undefined,
+      });
+      const url = URL.createObjectURL(new Blob([res.data], { type: 'text/csv;charset=utf-8;' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `cards_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success('导出成功');
+    } catch { toast.error('导出失败'); }
+    finally { setExporting(false); }
+  };
+
   const handleDisable = async (id: string) => {
     try {
       const res = await cardsApi.disable(id);
@@ -149,6 +167,9 @@ export default function Cards() {
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={() => load()}><RefreshCw size={14} /> 刷新</button>
+          <button className="btn btn-ghost" onClick={handleExport} disabled={exporting}>
+            {exporting ? <span className="spinner" /> : <Download size={14} />} 导出 CSV
+          </button>
           <button className="btn btn-primary" onClick={() => setShowModal(true)}><Plus size={15} /> 生成卡密</button>
         </div>
       </div>

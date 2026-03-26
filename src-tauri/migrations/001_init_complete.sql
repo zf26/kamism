@@ -184,3 +184,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_expires_at  ON messages(expires_at) WHER
 CREATE INDEX IF NOT EXISTS idx_message_reads_merchant ON message_reads(merchant_id);
 CREATE INDEX IF NOT EXISTS idx_message_reads_message  ON message_reads(message_id);
 
+-- ============================================================================
+-- Webhook 配置表
+-- ============================================================================
+
+-- 每个应用可配置一个 Webhook URL，激活/验证成功时推送事件
+CREATE TABLE IF NOT EXISTS app_webhooks (
+    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    app_id      UUID        NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    merchant_id UUID        NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
+    url         TEXT        NOT NULL,
+    secret      VARCHAR(64) NOT NULL,          -- HMAC-SHA256 签名密钥
+    enabled     BOOLEAN     NOT NULL DEFAULT TRUE,
+    events      TEXT[]      NOT NULL DEFAULT ARRAY['activate', 'verify'],
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(app_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_webhooks_merchant ON app_webhooks(merchant_id);
+CREATE INDEX IF NOT EXISTS idx_app_webhooks_app     ON app_webhooks(app_id);
+

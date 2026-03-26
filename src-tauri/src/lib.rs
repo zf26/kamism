@@ -10,6 +10,7 @@ use std::env;
 use std::sync::Arc;
 use axum::http::Method;
 use tower_http::cors::{Any, CorsLayer};
+use axum::middleware as axum_middleware;
 use crate::middleware::auth::AppState;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -119,10 +120,22 @@ pub async fn start_server() -> anyhow::Result<()> {
         }
     });
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])
-        .allow_headers(Any);
+    // CORS：生产环境从环境变量读取允许的 origin，开发环境允许 Any
+    let allowed_origin = env::var("ALLOWED_ORIGIN").unwrap_or_default();
+    let cors = if allowed_origin.is_empty() {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])
+            .allow_headers(Any)
+    } else {
+        use axum::http::HeaderValue;
+        let origin = allowed_origin.parse::<HeaderValue>()
+            .unwrap_or_else(|_| HeaderValue::from_static("*"));
+        CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])
+            .allow_headers(Any)
+    };
 
     let app = axum::Router::new()
         .merge(routes::auth::auth_router(state.clone()))
@@ -136,6 +149,8 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::messages::messages_admin_router(state.clone()))
         .merge(routes::messages::messages_merchant_router(state.clone()))
         .merge(routes::messages::messages_ws_router())
+        .merge(routes::webhooks::webhooks_router(state.clone()))
+        .layer(axum_middleware::from_fn(middleware::security::security_headers))
         .layer(cors)
         .with_state(state);
 

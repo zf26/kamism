@@ -3,7 +3,7 @@ use crate::{
     utils::jwt::Claims,
 };
 use axum::{
-    extract::State,
+    extract::{Query, State},
     middleware,
     routing::{get, post},
     Extension, Json, Router,
@@ -19,9 +19,15 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+#[derive(Deserialize)]
+pub struct DashboardQuery {
+    pub range: Option<String>,
+}
+
 pub fn merchant_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/merchant/profile", get(get_profile))
+        .route("/merchant/dashboard-stats", get(dashboard_stats))
         .route("/merchant/change-password", post(change_password))
         .route("/merchant/regenerate-apikey", post(regenerate_api_key))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -50,6 +56,77 @@ async fn get_profile(
         }
         None => Json(json!({"success": false, "message": "用户不存在"})),
     }
+}
+
+async fn dashboard_stats(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<DashboardQuery>,
+) -> Json<Value> {
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效用户ID"})),
+    };
+
+    // 根据 range 参数决定时间区间和分组粒度
+    let (interval, trunc, label) = match q.range.as_deref().unwrap_or("week") {
+        "month" => ("3 months", "week", "month"),
+        "year"  => ("1 year",   "month", "year"),
+        _       => ("7 days",   "day",   "week"),  // 默认周
+    };
+    let _ = label;
+
+    // 1. 卡密使用率
+    let card_stats: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM cards WHERE merchant_id = $1 GROUP BY status",
+    )
+    .bind(merchant_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    // 2. 激活趋势（动态粒度）
+    let sql = format!(
+        "SELECT DATE_TRUNC('{trunc}', activated_at)::date AS day, COUNT(*) AS cnt
+         FROM activations
+         WHERE card_id IN (SELECT id FROM cards WHERE merchant_id = $1)
+           AND activated_at >= NOW() - INTERVAL '{interval}'
+         GROUP BY day
+         ORDER BY day",
+        trunc = trunc,
+        interval = interval,
+    );
+    let activation_trend: Vec<(chrono::NaiveDate, i64)> =
+        sqlx::query_as(&sql)
+            .bind(merchant_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default();
+
+    // 3. 设备分布
+    let device_dist: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT a.app_name, COUNT(act.id) AS device_cnt
+         FROM apps a
+         LEFT JOIN cards c ON c.app_id = a.id AND c.merchant_id = $1
+         LEFT JOIN activations act ON act.card_id = c.id
+         WHERE a.merchant_id = $1
+         GROUP BY a.app_name
+         ORDER BY device_cnt DESC
+         LIMIT 10",
+    )
+    .bind(merchant_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    Json(json!({
+        "success": true,
+        "data": {
+            "card_stats": card_stats.iter().map(|(s, c)| json!({"status": s, "count": c})).collect::<Vec<_>>(),
+            "activation_trend": activation_trend.iter().map(|(d, c)| json!({"date": d.to_string(), "count": c})).collect::<Vec<_>>(),
+            "device_dist": device_dist.iter().map(|(app, c)| json!({"app": app, "count": c})).collect::<Vec<_>>(),
+        }
+    }))
 }
 
 async fn change_password(

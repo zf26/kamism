@@ -1,6 +1,7 @@
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
-:root {
+/* ── 深色主题（默认）── */
+:root, [data-theme="dark"] {
   --bg: #0a0a0f;
   --bg-card: #111118;
   --bg-hover: #16161f;
@@ -15,6 +16,28 @@
   --text: #e8e8f0;
   --text-dim: #888899;
   --text-muted: #55556a;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'Syne', sans-serif;
+  --sidebar-w: 220px;
+  --header-h: 56px;
+}
+
+/* ── 亮色主题 ── */
+[data-theme="light"] {
+  --bg: #f4f4f8;
+  --bg-card: #ffffff;
+  --bg-hover: #eeeef5;
+  --border: #dddde8;
+  --border-light: #c8c8da;
+  --accent: #6355e0;
+  --accent-dim: #4d42c4;
+  --accent-glow: rgba(99, 85, 224, 0.12);
+  --success: #059669;
+  --danger: #dc2626;
+  --warning: #d97706;
+  --text: #18181f;
+  --text-dim: #4a4a5a;
+  --text-muted: #8888a0;
   --mono: 'JetBrains Mono', monospace;
   --sans: 'Syne', sans-serif;
   --sidebar-w: 220px;
