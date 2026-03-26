@@ -169,7 +169,7 @@ export default function MerchantMessages() {
       {/* 消息详情弹窗 */}
       {selected && (
         <div className="modal-overlay" onClick={() => setSelected(null)}>
-          <div className="modal" style={{ maxWidth: 560 }} onClick={(e) => e.stopPropagation()}>
+          <div className="modal" style={{ maxWidth: 680, width: '90vw' }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 16 }}>
               <h2 className="modal-title" style={{ margin: 0, fontSize: 17, flex: 1 }}>{selected.title}</h2>
               <button

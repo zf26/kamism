@@ -38,7 +38,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const { user, role, logout } = useAuthStore();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [unread, setUnread] = useState(0);
-  const [noticeQueue, setNoticeQueue] = useState<{id:string;title:string;content:string}[]>([]);
+  const [noticeQueue, setNoticeQueue] = useState<{id:string;title:string;content:string;created_at:string}[]>([]);
   const setLastEvent = useWsEventStore((s) => s.setLastEvent);
 
   // 商户端：拉取未读站内信数
@@ -49,21 +49,21 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       .catch(() => {});
   }, [role, location.pathname]);
 
-  // 商户端：登录后拉取最新公告，未在本次 session 展示过的弹出
+  // 商户端：登录后拉取最新公告，用 localStorage 永久记录已读，只弹未读过的
   useEffect(() => {
     if (role !== 'merchant') return;
     merchantMessagesApi.listNotices({ page: 1, page_size: 5 })
       .then((res) => {
         if (!res.data.success) return;
-        const shown: string[] = JSON.parse(sessionStorage.getItem('shown_notices') || '[]');
-        const pending = (res.data.data as {id:string;title:string;content:string}[])
+        const shown: string[] = JSON.parse(localStorage.getItem('shown_notices') || '[]');
+        const pending = (res.data.data as {id:string;title:string;content:string;created_at:string}[])
           .filter((n) => !shown.includes(n.id));
         if (pending.length > 0) setNoticeQueue(pending);
       })
       .catch(() => {});
   }, [role]);
 
-  // 商户端：WebSocket 收到新消息时更新未读数，并转发到事件总线
+  // 仅商户端建立 WebSocket 连接，管理员不需要
   useWs({
     onMessage: (evt) => {
       if (role !== 'merchant') return;
@@ -72,14 +72,16 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         setUnread((n) => n + 1);
       }
     },
+    // 管理员完全禁用 WS（-1 = 不建立初始连接）
+    reconnectInterval: role === 'merchant' ? 3000 : -1,
   });
 
-  // 确认当前公告已读，弹出下一条
+  // 确认当前公告已读（localStorage 永久记录），弹出下一条
   const handleNoticeConfirm = () => {
     const [current, ...rest] = noticeQueue;
     if (current) {
-      const shown: string[] = JSON.parse(sessionStorage.getItem('shown_notices') || '[]');
-      sessionStorage.setItem('shown_notices', JSON.stringify([...shown, current.id]));
+      const shown: string[] = JSON.parse(localStorage.getItem('shown_notices') || '[]');
+      localStorage.setItem('shown_notices', JSON.stringify([...shown, current.id]));
     }
     setNoticeQueue(rest);
   };
@@ -263,25 +265,28 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       {/* ── 公告弹窗（session 内每条只弹一次）── */}
       {noticeQueue.length > 0 && (
         <div className="modal-overlay" style={{ zIndex: 1050 }}>
-          <div className="modal" style={{ maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+          <div className="modal" style={{ maxWidth: 640, width: '90vw' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
               <div style={{
-                width: 36, height: 36, borderRadius: 10, flexShrink: 0,
+                width: 40, height: 40, borderRadius: 10, flexShrink: 0,
                 background: 'rgba(124,106,247,0.12)',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
               }}>
-                <Megaphone size={18} style={{ color: 'var(--accent)' }} />
+                <Megaphone size={20} style={{ color: 'var(--accent)' }} />
               </div>
-              <div>
-                <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.6px', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 2 }}>平台公告</div>
-                <h2 style={{ fontSize: 16, fontWeight: 800, margin: 0 }}>{noticeQueue[0].title}</h2>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.6px', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 3 }}>平台公告</div>
+                <h2 style={{ fontSize: 17, fontWeight: 800, margin: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{noticeQueue[0].title}</h2>
               </div>
             </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16, paddingLeft: 52 }}>
+              {new Date(noticeQueue[0].created_at).toLocaleString('zh-CN')}
+            </div>
             <div style={{
-              fontSize: 13, color: 'var(--text-dim)', lineHeight: 1.8,
+              fontSize: 14, color: 'var(--text-dim)', lineHeight: 1.9,
               whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-              marginBottom: 24, maxHeight: 260, overflowY: 'auto',
-              padding: '12px 14px',
+              marginBottom: 24, maxHeight: 360, overflowY: 'auto',
+              padding: '14px 16px',
               background: 'var(--bg)',
               borderRadius: 8,
               border: '1px solid var(--border)',
@@ -289,14 +294,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               {noticeQueue[0].content}
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              {noticeQueue.length > 1 && (
-                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>还有 {noticeQueue.length - 1} 条公告</span>
-              )}
-              <div style={{ marginLeft: 'auto' }}>
-                <button className="btn btn-primary" onClick={handleNoticeConfirm}>
-                  {noticeQueue.length > 1 ? '下一条' : '我已知晓'}
-                </button>
-              </div>
+              {noticeQueue.length > 1 ? (
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>还有 {noticeQueue.length - 1} 条公告未读</span>
+              ) : <span />}
+              <button className="btn btn-primary" onClick={handleNoticeConfirm}>
+                {noticeQueue.length > 1 ? '下一条 →' : '我已知晓'}
+              </button>
             </div>
           </div>
         </div>

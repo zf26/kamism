@@ -23,6 +23,9 @@ type WsOptions = {
 export function useWs(options: WsOptions = {}) {
   const { reconnectInterval = 3000 } = options;
 
+  // reconnectInterval < 0 表示完全禁用（不建立初始连接）
+  const disabled = reconnectInterval < 0;
+
   // 用 ref 存回调，避免因闭包引用变化触发重连
   const onMessageRef = useRef(options.onMessage);
   const onOpenRef    = useRef(options.onOpen);
@@ -75,6 +78,7 @@ export function useWs(options: WsOptions = {}) {
   }, []); // 空依赖：connect 永远稳定
 
   useEffect(() => {
+    if (disabled) return;
     unmountedRef.current = false;
     connect();
     return () => {
@@ -82,7 +86,7 @@ export function useWs(options: WsOptions = {}) {
       if (timerRef.current) clearTimeout(timerRef.current);
       wsRef.current?.close();
     };
-  }, [connect]); // connect 稳定，effect 只跑一次
+  }, [connect, disabled]); // connect 稳定，effect 只跑一次
 
   const send = useCallback((data: unknown) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
