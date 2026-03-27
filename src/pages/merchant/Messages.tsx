@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { merchantMessagesApi } from '../../lib/api';
 import { useWsEventStore } from '../../stores/wsEvent';
 import { Bell, Pin, RefreshCw } from 'lucide-react';
@@ -26,9 +26,12 @@ export default function MerchantMessages() {
   const [selected, setSelected] = useState<MsgItem | null>(null);
   const PAGE_SIZE = 15;
 
-  const load = useCallback((p = 1) => {
+  const prevTabRef = useRef(tab);
+
+  const load = (p: number, t: Tab) => {
     setLoading(true);
-    const req = tab === 'messages'
+    setItems([]);
+    const req = t === 'messages'
       ? merchantMessagesApi.listMessages({ page: p, page_size: PAGE_SIZE })
       : merchantMessagesApi.listNotices({ page: p, page_size: PAGE_SIZE });
     req
@@ -39,19 +42,28 @@ export default function MerchantMessages() {
         }
       })
       .finally(() => setLoading(false));
-  }, [tab]);
+  };
 
-  useEffect(() => { setPage(1); load(1); }, [tab]);
-  useEffect(() => { load(page); }, [page]);
+  // tab 变化时重置 page=1，page/tab 统一驱动加载，避免双重触发
+  useEffect(() => {
+    const isTabChange = prevTabRef.current !== tab;
+    prevTabRef.current = tab;
+    const p = isTabChange ? 1 : page;
+    if (isTabChange) setPage(1);
+    load(p, tab);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, tab]);
 
   // 订阅事件总线：收到新消息时刷新列表（WS 连接由 Layout 统一维护）
   const lastEvent = useWsEventStore((s) => s.lastEvent);
   useEffect(() => {
     if (lastEvent?.event === 'new_message') {
       toast(<span>📬 新消息：<b>{String(lastEvent.data?.title ?? '')}</b></span>, { duration: 5000 });
-      load(1);
+      // 直接调用 load 避免 page=1 时 setPage(1) 不触发 useEffect
       setPage(1);
+      load(1, tab);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastEvent]);
 
   const handleOpen = async (msg: MsgItem) => {
@@ -73,10 +85,12 @@ export default function MerchantMessages() {
       <div className="page-header">
         <div>
           <h1 className="page-title">消息中心</h1>
-          <p className="page-subtitle">共 {total} 条</p>
+          <p className="page-subtitle">
+            {loading ? <span className="skeleton" style={{ display: 'inline-block', width: 60, height: 13, borderRadius: 4, verticalAlign: 'middle' }} /> : `共 ${total} 条`}
+          </p>
         </div>
         <div className="page-header-actions">
-          <button className="btn btn-ghost" onClick={() => load(page)}><RefreshCw size={14} /> 刷新</button>
+          <button className="btn btn-ghost" onClick={() => load(page, tab)}><RefreshCw size={14} /> 刷新</button>
         </div>
       </div>
 
@@ -107,17 +121,36 @@ export default function MerchantMessages() {
       {/* 消息列表 */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {loading ? (
-          <div style={{ textAlign: 'center', padding: 60 }}><span className="spinner" /></div>
+          Array.from({ length: 6 }).map((_, i) => (
+            <div
+              key={i}
+              style={{
+                background: 'var(--bg-card)',
+                border: '1px solid var(--border)',
+                borderRadius: 10,
+                padding: '14px 18px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+              }}
+            >
+              <span className="skeleton" style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0 }} />
+              <span className="skeleton" style={{ flex: 1, height: 14 }} />
+              <span className="skeleton" style={{ width: 60, height: 12, flexShrink: 0 }} />
+            </div>
+          ))
         ) : items.length === 0 ? (
           <div className="empty-state">
             <div className="empty-state-icon"><Bell size={36} style={{ opacity: 0.3 }} /></div>
             <div className="empty-state-text">暂无{tab === 'messages' ? '站内信' : '公告'}</div>
           </div>
-        ) : items.map((m) => (
+        ) : items.map((m, idx) => (
           <div
             key={m.id}
+            className="data-enter"
             onClick={() => handleOpen(m)}
             style={{
+              animationDelay: `${idx * 35}ms`,
               background: 'var(--bg-card)',
               border: `1px solid ${selected?.id === m.id ? 'var(--accent)' : 'var(--border)'}`,
               borderRadius: 10,

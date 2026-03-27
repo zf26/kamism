@@ -146,6 +146,7 @@ button {
   -webkit-overflow-scrolling: touch;
   border-radius: 10px;
   border: 1px solid var(--border);
+  transition: opacity 0.2s ease;
 }
 table { width: 100%; border-collapse: collapse; }
 thead tr { background: var(--bg-hover); border-bottom: 1px solid var(--border); }
@@ -295,11 +296,49 @@ tbody tr:hover { background: var(--bg-hover); }
 .page-btn:hover  { background: var(--bg-hover); color: var(--text); }
 .page-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
-@keyframes fadeIn {
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.skeleton {
+  border-radius: 6px;
+  background: var(--bg-hover);
+  display: inline-block;
+  position: relative;
+  overflow: hidden;
+}
+/* 光波用伪元素实现，不依赖 background-position，不受父级 overflow 影响 */
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--border-light) 50%,
+    transparent 100%
+  );
+  animation: shimmer 1.4s infinite linear;
+}
+/* 骨架行：整行高度撑满一个 td */
+.skeleton-row td { padding: 14px 16px; }
+.skeleton-row td > .skeleton { height: 14px; border-radius: 4px; display: block; }
+
+/* 数据出现时的淡入动画，替代突兀跳出 */
+@keyframes fadeInData {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-.fade-in { animation: fadeIn 0.25s ease; }
+.data-enter {
+  opacity: 0;
+  animation: fadeInData 0.28s ease forwards;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.35s ease; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner {

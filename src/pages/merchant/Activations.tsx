@@ -27,20 +27,16 @@ export default function Activations() {
 
   const load = (p = page, ps = pageSize, code = searchCode) => {
     setLoading(true);
+    setList([]);
     activationsApi.list({ page: p, page_size: ps, card_code: code || undefined }).then(res => {
       if (res.data.success) { setList(res.data.data); setTotal(res.data.total); }
     }).finally(() => setLoading(false));
   };
 
-  const handlePageSize = (ps: number) => { setPageSize(ps); setPage(1); load(1, ps, searchCode); };
+  const handlePageSize = (ps: number) => { setPage(1); setPageSize(ps); };
 
-  useEffect(() => { load(1, pageSize, searchCode); }, []);
-  useEffect(() => { load(page, pageSize, searchCode); }, [page, pageSize]);
-
-  useEffect(() => {
-    setPage(1);
-    load(1, pageSize, searchCode);
-  }, [searchCode]);
+  // 统一用 page/pageSize/searchCode 变化驱动加载，避免挂载时重复触发
+  useEffect(() => { load(page, pageSize, searchCode); }, [page, pageSize, searchCode]);
 
   const confirm = useConfirm();
 
@@ -61,7 +57,9 @@ export default function Activations() {
       <div className="page-header">
         <div>
           <h1 className="page-title">激活记录</h1>
-          <p className="page-subtitle">共 {total} 条激活记录</p>
+          <p className="page-subtitle">
+            {loading ? <span className="skeleton" style={{ display: 'inline-block', width: 90, height: 13, borderRadius: 4, verticalAlign: 'middle' }} /> : `共 ${total} 条激活记录`}
+          </p>
         </div>
         <button className="btn btn-ghost" onClick={() => load()}><RefreshCw size={14} /> 刷新</button>
       </div>
@@ -96,11 +94,21 @@ export default function Activations() {
           </tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7} style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></td></tr>
+              Array.from({ length: pageSize }).map((_, i) => (
+                <tr key={i} className="skeleton-row">
+                  <td><span className="skeleton" style={{ width: '70%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '80%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '55%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '90px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '65%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '65%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '56px', height: '28px' }} /></td>
+                </tr>
+              ))
             ) : list.length === 0 ? (
               <tr><td colSpan={7}><div className="empty-state"><div className="empty-state-icon">📡</div><div className="empty-state-text">暂无激活记录</div></div></td></tr>
-            ) : list.map(a => (
-              <tr key={a.id}>
+            ) : list.map((a, idx) => (
+              <tr key={a.id} className="data-enter" style={{ animationDelay: `${idx * 25}ms` }}>
                 <td><span className="mono" style={{ fontSize: 12, color: 'var(--accent)', letterSpacing: '1px' }}>{a.card_code}</span></td>
                 <td><span className="mono" style={{ fontSize: 11, color: 'var(--text-dim)' }}>{a.device_id.slice(0, 20)}…</span></td>
                 <td>{a.device_name || '—'}</td>

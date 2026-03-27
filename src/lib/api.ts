@@ -1,14 +1,19 @@
-import axios from 'axios';
+import axios, { type InternalAxiosRequestConfig } from 'axios';
 
 // API 地址从环境变量读取
-// 开发环境：npm run tauri dev 时从 .env.development 读取
-// 生产环境：npm run tauri build 时从 .env.production 读取
-// 回退值：http://localhost:9527
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9527';
 export const api = axios.create({
   baseURL: BASE_URL,
   timeout: 15000,
 });
+
+// ── 请求去重：防止相同 GET 请求并发重复发送（例如切换页面时的竞态）──────────
+// key = method + url + params 序列化，value = AbortController
+const pendingRequests = new Map<string, AbortController>();
+
+function buildRequestKey(config: InternalAxiosRequestConfig): string {
+  return `${config.method?.toUpperCase()}:${config.url}:${JSON.stringify(config.params ?? {})}`;
+}
 
 // 保留函数签名兼容性，无需异步初始化
 export async function initApiUrl() {
@@ -25,7 +30,24 @@ const flushQueue = (token: string) => {
   refreshQueue = [];
 };
 
-// 请求拦截器：自动携带 token
+// ── 请求拦截器 ①：GET 去重 ──────────────────────────────────────────────────
+api.interceptors.request.use((config) => {
+  if (config.method?.toUpperCase() === 'GET') {
+    const key = buildRequestKey(config);
+    const existing = pendingRequests.get(key);
+    if (existing) {
+      // 取消上一个相同请求
+      existing.abort();
+      pendingRequests.delete(key);
+    }
+    const controller = new AbortController();
+    config.signal = controller.signal;
+    pendingRequests.set(key, controller);
+  }
+  return config;
+}, (error) => Promise.reject(error));
+
+// ── 请求拦截器 ②：自动携带 token ────────────────────────────────────────────
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) {
@@ -34,16 +56,34 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// 响应拦截器：401 时自动用 refresh_token 续期，无感刷新
+// ── 响应拦截器：清除 pending 记录 + 401 自动续期 ─────────────────────────────
 api.interceptors.response.use(
-  (res) => res,
+  (res) => {
+    // 请求完成，从 pending map 中移除
+    if (res.config.method?.toUpperCase() === 'GET') {
+      const key = buildRequestKey(res.config);
+      pendingRequests.delete(key);
+    }
+    return res;
+  },
   async (err) => {
+    // 忽略主动取消的请求（AbortController.abort() 触发）
+    if (axios.isCancel(err) || err.name === 'CanceledError') {
+      return Promise.reject(err);
+    }
+
     const original = err.config;
+
+    // 清除 pending 记录
+    if (original?.method?.toUpperCase() === 'GET') {
+      const key = buildRequestKey(original);
+      pendingRequests.delete(key);
+    }
+
     // 只处理 401，且不重试 refresh 接口本身，且没有重试过
-    if (err.response?.status === 401 && !original._retry && !original.url?.includes('/auth/refresh')) {
+    if (err.response?.status === 401 && !original?._retry && !original?.url?.includes('/auth/refresh')) {
       const refreshToken = localStorage.getItem('refreshToken');
       if (!refreshToken) {
-        // 没有 refresh token，直接跳登录
         logout();
         return Promise.reject(err);
       }
@@ -156,6 +196,8 @@ export const cardsApi = {
   disable: (id: string) => api.patch(`/cards/${id}/disable`),
   enable: (id: string) => api.patch(`/cards/${id}/enable`),
   delete: (id: string) => api.delete(`/cards/${id}`),
+  batchStatus: (ids: string[], action: 'disabled' | 'unused') =>
+    api.post('/cards/batch-status', { ids, action }),
 };
 
 // ─── Activations ────────────────────────────────────
@@ -168,7 +210,8 @@ export const activationsApi = {
 // ─── Merchant ───────────────────────────────────────
 export const merchantApi = {
   getProfile: () => api.get('/merchant/profile'),
-  dashboardStats: (range?: 'week' | 'month' | 'year') => api.get('/merchant/dashboard-stats', { params: { range } }),
+  dashboardStats: (range?: 'week' | 'month' | 'year') =>
+    api.get('/merchant/dashboard-stats', { params: { range } }),
   changePassword: (data: { old_password: string; new_password: string }) =>
     api.post('/merchant/change-password', data),
   regenerateApiKey: () => api.post('/merchant/regenerate-apikey'),

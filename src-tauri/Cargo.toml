@@ -28,7 +28,7 @@ tauri-plugin-shell = { version = "2", optional = true }
 axum = { version = "0.7", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-br", "limit"] }
 futures-util = { version = "0.3", features = ["sink"] }
 
 # 数据库

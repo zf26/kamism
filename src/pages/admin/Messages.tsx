@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { adminMessagesApi } from '../../lib/api';
 import { Plus, Trash2, RefreshCw, Pin } from 'lucide-react';
 import { useConfirm } from '../../stores/confirm';
@@ -49,6 +49,7 @@ export default function AdminMessages() {
 
   const load = (p = page) => {
     setLoading(true);
+    setMessages([]);
     adminMessagesApi
       .list({ page: p, page_size: PAGE_SIZE, msg_type: filterType || undefined })
       .then((res) => {
@@ -60,8 +61,17 @@ export default function AdminMessages() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { load(1); setPage(1); }, [filterType]);
-  useEffect(() => { load(page); }, [page]);
+  const prevFilterRef = useRef(filterType);
+
+  // 统一驱动加载：filterType 变化时重置 page=1 并加载，page 变化时直接加载
+  useEffect(() => {
+    const isFilterChange = prevFilterRef.current !== filterType;
+    prevFilterRef.current = filterType;
+    const p = isFilterChange ? 1 : page;
+    if (isFilterChange) setPage(1);
+    load(p);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, filterType]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -122,7 +132,9 @@ export default function AdminMessages() {
       <div className="page-header">
         <div>
           <h1 className="page-title">消息管理</h1>
-          <p className="page-subtitle">共 {total} 条消息</p>
+          <p className="page-subtitle">
+            {loading ? <span className="skeleton" style={{ display: 'inline-block', width: 80, height: 13, borderRadius: 4, verticalAlign: 'middle' }} /> : `共 ${total} 条消息`}
+          </p>
         </div>
         <div className="page-header-actions">
           <select
@@ -146,13 +158,23 @@ export default function AdminMessages() {
           </tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7} style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></td></tr>
+              Array.from({ length: PAGE_SIZE }).map((_, i) => (
+                <tr key={i} className="skeleton-row">
+                  <td><span className="skeleton" style={{ width: '48px', height: '22px', borderRadius: 999 }} /></td>
+                  <td><span className="skeleton" style={{ width: '70%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '40%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '30px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '30px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '55%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '72px', height: '28px' }} /></td>
+                </tr>
+              ))
             ) : messages.length === 0 ? (
               <tr><td colSpan={7}>
                 <div className="empty-state"><div className="empty-state-icon">📭</div><div className="empty-state-text">暂无消息</div></div>
               </td></tr>
-            ) : messages.map((m) => (
-              <tr key={m.id}>
+            ) : messages.map((m, idx) => (
+              <tr key={m.id} className="data-enter" style={{ animationDelay: `${idx * 25}ms` }}>
                 <td>
                   <span className={`badge ${m.msg_type === 'notice' ? 'badge-active' : 'badge-unused'}`}>
                     {typeLabel(m.msg_type)}

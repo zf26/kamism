@@ -77,6 +77,7 @@ export default function Merchants() {
 
   const load = (p = page, ps = pageSize, kw = search, pf = planFilter) => {
     setLoading(true);
+    setMerchants([]);
     adminApi.getMerchants({ page: p, page_size: ps, keyword: kw || undefined, plan: pf || undefined })
       .then(res => {
         if (res.data.success) {
@@ -89,13 +90,14 @@ export default function Merchants() {
   useEffect(() => {
     loadPlanConfigs();
     load(page, pageSize, search, planFilter);
-  }, [page, pageSize, planFilter]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, pageSize, search, planFilter]);
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
     setPage(1);
     setSearch(keyword);
-    load(1, pageSize, keyword, planFilter);
+    // page/search 变化由 useEffect 统一驱动，无需手动调用 load()
   };
 
   const handlePlanFilter = (pf: string) => {
@@ -104,8 +106,8 @@ export default function Merchants() {
   };
 
   const handlePageSize = (ps: number) => {
-    setPageSize(ps);
     setPage(1);
+    setPageSize(ps);
   };
 
   const toggleStatus = async (id: string, current: string) => {
@@ -201,7 +203,9 @@ export default function Merchants() {
       <div className="page-header">
         <div>
           <h1 className="page-title">商户管理</h1>
-          <p className="page-subtitle">共 {total} 个商户</p>
+          <p className="page-subtitle">
+            {loading ? <span className="skeleton" style={{ display: 'inline-block', width: 80, height: 13, borderRadius: 4, verticalAlign: 'middle' }} /> : `共 ${total} 个商户`}
+          </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <form onSubmit={handleSearch} style={{ display: 'flex', gap: 6 }}>
@@ -270,11 +274,22 @@ export default function Merchants() {
           </tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7} style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}><span className="spinner" /></td></tr>
+              Array.from({ length: pageSize }).map((_, i) => (
+                <tr key={i} className="skeleton-row">
+                  <td><span className="skeleton" style={{ width: '60%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '75%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '80px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '64px', height: '22px', borderRadius: 999 }} /></td>
+                  <td><span className="skeleton" style={{ width: '70px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '48px', height: '22px', borderRadius: 999 }} /></td>
+                  <td><span className="skeleton" style={{ width: '55%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '120px', height: '28px' }} /></td>
+                </tr>
+              ))
             ) : merchants.length === 0 ? (
               <tr><td colSpan={7}><div className="empty-state"><div className="empty-state-icon">👤</div><div className="empty-state-text">暂无商户</div></div></td></tr>
-            ) : merchants.map(m => (
-              <tr key={m.id}>
+            ) : merchants.map((m, idx) => (
+              <tr key={m.id} className="data-enter" style={{ animationDelay: `${idx * 25}ms` }}>
                 <td><span style={{ color: 'var(--text)', fontWeight: 600 }}>{m.username}</span></td>
                 <td>{m.email}</td>
                 <td><span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.5px' }}>{m.api_key.slice(0, 12)}…</span></td>

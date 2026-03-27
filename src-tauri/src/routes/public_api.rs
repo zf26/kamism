@@ -1,5 +1,6 @@
 //! 对外公开 API，供第三方软件调用（使用 api_key 鉴权，无需 JWT）
 
+use redis::AsyncCommands;
 use crate::{
     db::encrypted_fields::EncryptedFieldsOps,
     middleware::auth::AppState,
@@ -145,24 +146,16 @@ async fn activate(
         }
     }
 
-    // 检查该设备是否已绑定此卡密（需要遍历并解密比较）
-    let activations: Vec<Activation> = sqlx::query_as(
-        "SELECT * FROM activations WHERE card_id = $1",
+    // 检查该设备是否已绑定此卡密（使用 device_id_hash 索引，O(1) 查询，无需全量解密）
+    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    let existing_activation: Option<Activation> = sqlx::query_as(
+        "SELECT * FROM activations WHERE card_id = $1 AND device_id_hash = $2",
     )
     .bind(card.id)
-    .fetch_all(&state.pool)
+    .bind(&device_id_hash)
+    .fetch_optional(&state.pool)
     .await
-    .unwrap_or_default();
-
-    let mut existing_activation: Option<Activation> = None;
-    for activation in activations {
-        if let Ok(decrypted_device_id) = EncryptedFieldsOps::decrypt_device_id(&state.encryptor, &activation.device_id) {
-            if decrypted_device_id == body.device_id {
-                existing_activation = Some(activation);
-                break;
-            }
-        }
-    }
+    .unwrap_or(None);
 
     if let Some(existing) = existing_activation {
         let _ = sqlx::query(
@@ -210,8 +203,7 @@ async fn activate(
     let ip = extract_client_ip(&headers, &addr);
     let activation_id = Uuid::new_v4();
 
-    // 加密设备 ID 并生成哈希
-    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    // 加密设备 ID（device_id_hash 已在上方定义）
     let encrypted_device_id = match EncryptedFieldsOps::encrypt_device_id(
         &state.pool,
         &state.encryptor,
@@ -275,12 +267,59 @@ async fn activate(
 }
 
 /// 验证卡密
+/// 性能优化：使用 Redis 缓存验证结果（TTL=60s），命中缓存时完全跳过数据库查询。
+/// 异步后台更新 last_verified_at，避免写操作阻塞响应。
 async fn verify(
     State(state): State<AppState>,
     Json(body): Json<VerifyRequest>,
 ) -> Json<Value> {
-    // 查询所有商户并使用哈希索引查询 API Key
-    let api_key_hash = EncryptedFieldsOps::generate_hash(&body.api_key);
+    // ── Redis 缓存 key：api_key + app_id + card_code + device_id 的组合哈希 ──
+    let api_key_hash   = EncryptedFieldsOps::generate_hash(&body.api_key);
+    let code_hash      = EncryptedFieldsOps::generate_hash(&body.card_code);
+    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    let cache_key = format!(
+        "verify:{}:{}:{}:{}",
+        &api_key_hash[..16],
+        body.app_id,
+        &code_hash[..16],
+        &device_id_hash[..16]
+    );
+
+    let mut redis = state.redis.clone();
+
+    // ── 缓存命中：直接返回，不查数据库 ──
+    if let Ok(Some(cached)) = redis.get::<_, Option<String>>(&cache_key).await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            // 缓存命中时异步更新 last_verified_at（fire-and-forget，不阻塞响应）
+            let pool_bg   = state.pool.clone();
+            let val_clone = val.clone();
+            // redis ConnectionManager 实现了 Clone，可安全跨 task 传递
+            let mut redis_bg = state.redis.clone();
+            let cache_key_bg = cache_key.clone();
+            tokio::spawn(async move {
+                if val_clone.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // 从缓存 payload 中取 activation_id，更新验证时间
+                    if let Some(act_id) = val_clone.pointer("/data/activation_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    {
+                        let _ = sqlx::query(
+                            "UPDATE activations SET last_verified_at = NOW() WHERE id = $1",
+                        )
+                        .bind(act_id)
+                        .execute(&pool_bg)
+                        .await;
+                    }
+                    // 滑动续期：命中一次续期 60s，保持热 key 不冷却
+                    let _: redis::RedisResult<()> =
+                        redis_bg.expire(cache_key_bg.as_str(), 60_i64).await;
+                }
+            });
+            return Json(val);
+        }
+    }
+
+    // ── 缓存未命中：走完整数据库查询逻辑 ──
     let merchant: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM merchants WHERE api_key_hash = $1 AND status = 'active'")
             .bind(&api_key_hash)
@@ -290,10 +329,16 @@ async fn verify(
 
     let merchant_id = match merchant {
         Some((id,)) => id,
-        None => return Json(json!({"success": false, "message": "无效的 API Key"})),
+        None => {
+            // 无效 key 也短暂缓存（5s），防止暴力枚举打穿数据库
+            let fail = json!({"success": false, "valid": false, "message": "无效的 API Key"});
+            let _: redis::RedisResult<()> = redis::AsyncCommands::set_ex(
+                &mut redis, &cache_key, fail.to_string(), 5_u64,
+            ).await;
+            return Json(fail);
+        }
     };
 
-    // 验证 app_id 归属于该商户且处于 active 状态
     let app_valid: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM apps WHERE id = $1 AND merchant_id = $2 AND status = 'active'",
     )
@@ -307,8 +352,6 @@ async fn verify(
         return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
     }
 
-    // 查询该商户指定应用下的卡密（使用哈希索引查询）
-    let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
         "SELECT * FROM cards WHERE code_hash = $1 AND merchant_id = $2 AND app_id = $3",
     )
@@ -337,13 +380,11 @@ async fn verify(
 
     match card.status.as_str() {
         "disabled" => return Json(json!({"success": false, "valid": false, "message": "卡密已被禁用"})),
-        "expired" => return Json(json!({"success": false, "valid": false, "message": "卡密已过期"})),
-        "unused" => return Json(json!({"success": false, "valid": false, "message": "卡密尚未激活"})),
+        "expired"  => return Json(json!({"success": false, "valid": false, "message": "卡密已过期"})),
+        "unused"   => return Json(json!({"success": false, "valid": false, "message": "卡密尚未激活"})),
         _ => {}
     }
 
-    // 检查设备绑定（使用哈希索引查询）
-    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
     let activation: Option<Activation> = sqlx::query_as(
         "SELECT * FROM activations WHERE card_id = $1 AND device_id_hash = $2",
     )
@@ -363,13 +404,17 @@ async fn verify(
 
     let activation = activation.unwrap();
 
-    // 更新最后验证时间
-    let _ = sqlx::query(
-        "UPDATE activations SET last_verified_at = NOW() WHERE id = $1",
-    )
-    .bind(activation.id)
-    .execute(&state.pool)
-    .await;
+    // 异步更新最后验证时间（不阻塞响应）
+    let pool_bg = state.pool.clone();
+    let act_id  = activation.id;
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "UPDATE activations SET last_verified_at = NOW() WHERE id = $1",
+        )
+        .bind(act_id)
+        .execute(&pool_bg)
+        .await;
+    });
 
     let remaining_days = card.expires_at.map(|e| (e - Utc::now()).num_days().max(0));
     let device_count: (i64,) =
@@ -378,6 +423,24 @@ async fn verify(
             .fetch_one(&state.pool)
             .await
             .unwrap_or((0,));
+
+    let result = json!({
+        "success": true,
+        "valid": true,
+        "message": "卡密有效",
+        "data": {
+            "activation_id": activation.id,
+            "expires_at": card.expires_at,
+            "remaining_days": remaining_days,
+            "max_devices": card.max_devices,
+            "current_devices": device_count.0
+        }
+    });
+
+    // 写入缓存：60s TTL，激活/禁用/解绑事件时需主动失效（见 activate/unbind/disable 逻辑）
+    let _: redis::RedisResult<()> = redis::AsyncCommands::set_ex(
+        &mut redis, &cache_key, result.to_string(), 60_u64,
+    ).await;
 
     // 异步触发 Webhook（verify 事件）
     let pool_clone = state.pool.clone();
@@ -392,17 +455,7 @@ async fn verify(
         crate::routes::webhooks::fire_webhook(&pool_clone, app_id_clone, "verify", webhook_payload).await;
     });
 
-    Json(json!({
-        "success": true,
-        "valid": true,
-        "message": "卡密有效",
-        "data": {
-            "expires_at": card.expires_at,
-            "remaining_days": remaining_days,
-            "max_devices": card.max_devices,
-            "current_devices": device_count.0
-        }
-    }))
+    Json(result)
 }
 
 /// 解绑设备

@@ -39,6 +39,7 @@ export default function Cards() {
 
   const load = (p = page, ps = pageSize) => {
     setLoading(true);
+    setCards([]);
     cardsApi.list({ page: p, page_size: ps }).then(res => {
       if (res.data.success) { 
         let filtered = res.data.data;
@@ -69,21 +70,25 @@ export default function Cards() {
     }).finally(() => setLoading(false));
   };
 
-  const handlePageSize = (ps: number) => { setPageSize(ps); setPage(1); };
+  const handlePageSize = (ps: number) => {
+    // 批量更新，避免触发两次 useEffect
+    setPage(1);
+    setPageSize(ps);
+  };
   
   const getAppName = (appId: string) => {
     return apps.find(a => a.id === appId)?.app_name || '—';
   };
 
   useEffect(() => {
-    load(1, pageSize);
     appsApi.list().then(res => { if (res.data.success) setApps(res.data.data); });
   }, []);
 
-  useEffect(() => { load(page, pageSize); }, [page, pageSize]);
-  
-  // 搜索/过滤时重置到第一页
-  useEffect(() => { setPage(1); }, [searchCode, filterAppId, filterExpireDate]);
+  // 统一用 page/pageSize/过滤条件变化驱动加载
+  useEffect(() => {
+    load(page, pageSize);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, pageSize, searchCode, filterAppId, filterExpireDate]);
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -163,7 +168,9 @@ export default function Cards() {
       <div className="page-header">
         <div>
           <h1 className="page-title">卡密管理</h1>
-          <p className="page-subtitle">共 {total} 张卡密</p>
+          <p className="page-subtitle">
+            {loading ? <span className="skeleton" style={{ display: 'inline-block', width: 80, height: 13, borderRadius: 4, verticalAlign: 'middle' }} /> : `共 ${total} 张卡密`}
+          </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={() => load()}><RefreshCw size={14} /> 刷新</button>
@@ -228,11 +235,22 @@ export default function Cards() {
           </tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={8} style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></td></tr>
+              Array.from({ length: pageSize }).map((_, i) => (
+                <tr key={i} className="skeleton-row">
+                  <td><span className="skeleton" style={{ width: '72%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '55%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '40%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '40%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '52%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '60%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '45%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '64px', height: '28px' }} /></td>
+                </tr>
+              ))
             ) : cards.length === 0 ? (
               <tr><td colSpan={8}><div className="empty-state"><div className="empty-state-icon">🔑</div><div className="empty-state-text">暂无卡密，点击「生成卡密」</div></div></td></tr>
-            ) : cards.map(card => (
-              <tr key={card.id}>
+            ) : cards.map((card, idx) => (
+              <tr key={card.id} className="data-enter" style={{ animationDelay: `${idx * 30}ms` }}>
                 <td>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <span className="mono" style={{ fontSize: 12, color: 'var(--accent)', letterSpacing: '1px' }}>{card.code}</span>

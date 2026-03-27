@@ -33,6 +33,7 @@ export default function Apps() {
 
   const load = (p = page, ps = pageSize) => {
     setLoading(true);
+    setApps([]);
     appsApi.list({ page: p, page_size: ps }).then(res => {
       if (res.data.success) {
         setApps(res.data.data);
@@ -41,7 +42,7 @@ export default function Apps() {
     }).finally(() => setLoading(false));
   };
 
-  const handlePageSize = (ps: number) => { setPageSize(ps); setPage(1); };
+  const handlePageSize = (ps: number) => { setPage(1); setPageSize(ps); };
 
   useEffect(() => { load(page, pageSize); }, [page, pageSize]);
 
@@ -139,7 +140,9 @@ export default function Apps() {
       <div className="page-header">
         <div>
           <h1 className="page-title">我的应用</h1>
-          <p className="page-subtitle">共 {total} 个应用</p>
+          <p className="page-subtitle">
+            {loading ? <span className="skeleton" style={{ display: 'inline-block', width: 70, height: 13, borderRadius: 4, verticalAlign: 'middle' }} /> : `共 ${total} 个应用`}
+          </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <button className="btn btn-ghost" onClick={() => load(page)}><RefreshCw size={14} /> 刷新</button>
@@ -152,11 +155,20 @@ export default function Apps() {
           <thead><tr><th>应用名称</th><th>描述</th><th>ID</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={6} style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></td></tr>
+              Array.from({ length: pageSize }).map((_, i) => (
+                <tr key={i} className="skeleton-row">
+                  <td><span className="skeleton" style={{ width: '60%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '75%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '80px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '48px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '55%' }} /></td>
+                  <td><span className="skeleton" style={{ width: '72px', height: '28px' }} /></td>
+                </tr>
+              ))
             ) : apps.length === 0 ? (
               <tr><td colSpan={6}><div className="empty-state"><div className="empty-state-icon">📦</div><div className="empty-state-text">暂无应用，点击「新建应用」开始</div></div></td></tr>
-            ) : apps.map(app => (
-              <tr key={app.id}>
+            ) : apps.map((app, idx) => (
+              <tr key={app.id} className="data-enter" style={{ animationDelay: `${idx * 30}ms` }}>
                 <td><span style={{ color: 'var(--text)', fontWeight: 600 }}>{app.app_name}</span></td>
                 <td><span style={{ color: 'var(--text-muted)' }}>{app.description || '—'}</span></td>
                 <td>

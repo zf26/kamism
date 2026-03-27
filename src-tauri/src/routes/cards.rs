@@ -63,38 +63,64 @@ async fn list_cards(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
+    // 用窗口函数 COUNT(*) OVER() 合并为单次查询，避免两次往返
+    // 显式列举字段，避免 SELECT * 拉取无关列
+    const CARD_COLS: &str = "id, app_id, merchant_id, code_encrypted, duration_days, max_devices, status, note, created_at, activated_at, expires_at";
+
+    #[derive(sqlx::FromRow)]
+    struct CardWithTotal {
+        id: uuid::Uuid,
+        app_id: uuid::Uuid,
+        merchant_id: uuid::Uuid,
+        #[sqlx(rename = "code_encrypted")]
+        code: String,
+        duration_days: i32,
+        max_devices: i32,
+        status: String,
+        note: Option<String>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        activated_at: Option<chrono::DateTime<chrono::Utc>>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        total_count: i64,
+    }
+
     let (mut cards, total): (Vec<Card>, i64) = if claims.role == "admin" {
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cards")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or((0,));
-        let cards: Vec<Card> = sqlx::query_as(
-            "SELECT * FROM cards ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-        )
+        let rows: Vec<CardWithTotal> = sqlx::query_as(&format!(
+            "SELECT {}, COUNT(*) OVER() AS total_count FROM cards ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            CARD_COLS
+        ))
         .bind(page_size)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
         .unwrap_or_default();
-        (cards, total.0)
+        let total = rows.first().map(|r| r.total_count).unwrap_or(0);
+        let cards = rows.into_iter().map(|r| Card {
+            id: r.id, app_id: r.app_id, merchant_id: r.merchant_id,
+            code: r.code, duration_days: r.duration_days, max_devices: r.max_devices,
+            status: r.status, note: r.note, created_at: r.created_at,
+            activated_at: r.activated_at, expires_at: r.expires_at,
+        }).collect();
+        (cards, total)
     } else {
-        let total: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM cards WHERE merchant_id = $1",
-        )
-        .bind(merchant_id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or((0,));
-        let cards: Vec<Card> = sqlx::query_as(
-            "SELECT * FROM cards WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-        )
+        let rows: Vec<CardWithTotal> = sqlx::query_as(&format!(
+            "SELECT {}, COUNT(*) OVER() AS total_count FROM cards WHERE merchant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            CARD_COLS
+        ))
         .bind(merchant_id)
         .bind(page_size)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
         .unwrap_or_default();
-        (cards, total.0)
+        let total = rows.first().map(|r| r.total_count).unwrap_or(0);
+        let cards = rows.into_iter().map(|r| Card {
+            id: r.id, app_id: r.app_id, merchant_id: r.merchant_id,
+            code: r.code, duration_days: r.duration_days, max_devices: r.max_devices,
+            status: r.status, note: r.note, created_at: r.created_at,
+            activated_at: r.activated_at, expires_at: r.expires_at,
+        }).collect();
+        (cards, total)
     };
 
     // 解密所有卡密代码

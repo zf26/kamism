@@ -10,6 +10,8 @@ use std::env;
 use std::sync::Arc;
 use axum::http::Method;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use axum::middleware as axum_middleware;
 use crate::middleware::auth::AppState;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -151,6 +153,12 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::messages::messages_ws_router())
         .merge(routes::webhooks::webhooks_router(state.clone()))
         .layer(axum_middleware::from_fn(middleware::security::security_headers))
+        // 响应压缩：gzip / brotli，自动根据客户端 Accept-Encoding 协商
+        // 对 JSON 响应压缩率通常 60-80%，显著降低带宽占用和客户端解析时间
+        .layer(CompressionLayer::new())
+        // 请求体大小限制：防止超大 payload 耗尽内存/带宽（DoS 防护）
+        // 大多数 API 请求远不需要 2MB，批量生成卡密最大约 ~4KB
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)) // 2MB
         .layer(cors)
         .with_state(state);
 

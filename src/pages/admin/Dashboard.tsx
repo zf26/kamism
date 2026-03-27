@@ -12,11 +12,12 @@ interface Stats {
 
 export default function AdminDashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     adminApi.getStats().then(res => {
       if (res.data.success) setStats(res.data.data);
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => setLoading(false));
   }, []);
 
   const statCards = [
@@ -43,7 +44,11 @@ export default function AdminDashboard() {
               <span className="stat-label">{card.label}</span>
               <span style={{ color: card.color, opacity: 0.8 }}>{card.icon}</span>
             </div>
-            <div className="stat-value" style={{ color: card.color }}>{String(card.value)}</div>
+            {loading ? (
+              <span className="skeleton" style={{ display: 'block', width: '60%', height: 32, borderRadius: 6 }} />
+            ) : (
+              <div className="stat-value data-enter" style={{ color: card.color }}>{String(card.value)}</div>
+            )}
           </div>
         ))}
       </div>
