@@ -139,7 +139,10 @@ pub async fn start_server() -> anyhow::Result<()> {
             .allow_headers(Any)
     };
 
+    routes::health::init_start_time();
+
     let app = axum::Router::new()
+        .merge(routes::health::health_router())
         .merge(routes::auth::auth_router(state.clone()))
         .merge(routes::admin::admin_router_with_state(state.clone()))
         .merge(routes::merchant::merchant_router(state.clone()))
@@ -152,6 +155,8 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::messages::messages_merchant_router(state.clone()))
         .merge(routes::messages::messages_ws_router())
         .merge(routes::webhooks::webhooks_router(state.clone()))
+        .merge(routes::blacklist::blacklist_router(state.clone()))
+        .merge(routes::agent::agent_router(state.clone()))
         .layer(axum_middleware::from_fn(middleware::security::security_headers))
         // 响应压缩：gzip / brotli，自动根据客户端 Accept-Encoding 协商
         // 对 JSON 响应压缩率通常 60-80%，显著降低带宽占用和客户端解析时间

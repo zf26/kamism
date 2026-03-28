@@ -65,10 +65,15 @@ fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
 }
 
 pub fn public_api_router(state: AppState) -> Router<AppState> {
-    use crate::middleware::rate_limit::api_rate_limit;
+    use crate::middleware::rate_limit::{api_rate_limit, activate_rate_limit};
     use axum::middleware;
     Router::new()
-        .route("/v1/activate", post(activate))
+        // /v1/activate 叠加激活专用限流（更严格，20次/分钟）
+        .route("/v1/activate",
+            post(activate).route_layer(
+                middleware::from_fn_with_state(state.clone(), activate_rate_limit)
+            )
+        )
         .route("/v1/verify", post(verify))
         .route("/v1/unbind", post(unbind))
         .route_layer(middleware::from_fn_with_state(state, api_rate_limit))
@@ -113,6 +118,107 @@ async fn activate(
         return Json(json!({"success": false, "message": "应用不存在或已禁用"}));
     }
 
+    let ip = extract_client_ip(&headers, &addr);
+
+    // ── IP 黑名单检查（全局 + 商户级）──────────────────────────────────────
+    let ip_blocked: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM ip_blacklist
+         WHERE ip = $1 AND (merchant_id IS NULL OR merchant_id = $2)
+         LIMIT 1"
+    )
+    .bind(&ip)
+    .bind(merchant_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    if ip_blocked.is_some() {
+        return Json(json!({"success": false, "message": "当前 IP 已被限制激活"}));
+    }
+
+    // ── 设备黑名单检查（全局 + 商户级）────────────────────────────────────
+    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    let device_blocked: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM device_blacklist
+         WHERE device_id_hash = $1 AND (merchant_id IS NULL OR merchant_id = $2)
+         LIMIT 1"
+    )
+    .bind(&device_id_hash)
+    .bind(merchant_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    if device_blocked.is_some() {
+        return Json(json!({"success": false, "message": "当前设备已被限制激活"}));
+    }
+
+    // ── 异常检测：同一设备激活多张卡 ───────────────────────────────────────
+    // 同一 device_id_hash 在该商户下绑定了超过 3 张不同卡密，视为异常
+    let device_card_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(DISTINCT a.card_id) FROM activations a
+         JOIN cards c ON c.id = a.card_id
+         WHERE a.device_id_hash = $1 AND c.merchant_id = $2"
+    )
+    .bind(&device_id_hash)
+    .bind(merchant_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((0,));
+
+    if device_card_count.0 >= 3 {
+        let device_hint = if body.device_id.len() >= 4 {
+            format!("{}****", &body.device_id[..4])
+        } else {
+            "****".to_string()
+        };
+        let pool_alert = state.pool.clone();
+        let mid = merchant_id;
+        let hint = device_hint.clone();
+        let ip_clone = ip.clone();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                "INSERT INTO activation_alerts
+                 (merchant_id, alert_type, device_hint, ip_address, detail)
+                 VALUES ($1, 'device_multi_card', $2, $3, $4)"
+            )
+            .bind(mid)
+            .bind(&hint)
+            .bind(&ip_clone)
+            .bind(format!("设备 {} 已激活 {} 张卡密", hint, device_card_count.0 + 1))
+            .execute(&pool_alert)
+            .await;
+        });
+    }
+
+    // ── 异常检测：同 IP 短时间大量激活（超过阈值写告警）──────────────────
+    // Redis 限流已拦截超频请求，此处记录接近阈值的行为（15次/分钟）
+    {
+        let mut redis = state.redis.clone();
+        let rl_key = format!("rl:activate:{}", ip);
+        let count: i64 = redis::AsyncCommands::get(&mut redis, &rl_key)
+            .await
+            .unwrap_or(0i64);
+        if count >= 15 {
+            let pool_alert = state.pool.clone();
+            let mid = merchant_id;
+            let ip_clone = ip.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "INSERT INTO activation_alerts
+                     (merchant_id, alert_type, ip_address, detail)
+                     VALUES ($1, 'ip_abuse', $2, $3)
+                     ON CONFLICT DO NOTHING"
+                )
+                .bind(mid)
+                .bind(&ip_clone)
+                .bind(format!("IP {} 本分钟已激活 {} 次", ip_clone, count))
+                .execute(&pool_alert)
+                .await;
+            });
+        }
+    }
+
     // 查询该商户指定应用下的卡密（使用哈希索引查询）
     let code_hash = EncryptedFieldsOps::generate_hash(&body.card_code);
     let card: Option<Card> = sqlx::query_as(
@@ -147,7 +253,6 @@ async fn activate(
     }
 
     // 检查该设备是否已绑定此卡密（使用 device_id_hash 索引，O(1) 查询，无需全量解密）
-    let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
     let existing_activation: Option<Activation> = sqlx::query_as(
         "SELECT * FROM activations WHERE card_id = $1 AND device_id_hash = $2",
     )
@@ -200,7 +305,6 @@ async fn activate(
         card.expires_at
     };
 
-    let ip = extract_client_ip(&headers, &addr);
     let activation_id = Uuid::new_v4();
 
     // 加密设备 ID（device_id_hash 已在上方定义）
@@ -252,6 +356,19 @@ async fn activate(
     });
     tokio::spawn(async move {
         crate::routes::webhooks::fire_webhook(&pool_clone, app_id_clone, "activate", webhook_payload).await;
+    });
+
+    // 异步写分润记录（代理体系）
+    let pool_commission = state.pool.clone();
+    let mid_commission = merchant_id;
+    let card_id_commission = card.id;
+    tokio::spawn(async move {
+        crate::routes::agent::record_commission(
+            &pool_commission,
+            mid_commission,
+            card_id_commission,
+            activation_id,
+        ).await;
     });
 
     Json(json!({

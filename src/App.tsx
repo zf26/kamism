@@ -23,6 +23,8 @@ const Cards             = lazy(() => import('./pages/merchant/Cards'));
 const Activations       = lazy(() => import('./pages/merchant/Activations'));
 const Settings          = lazy(() => import('./pages/merchant/Settings'));
 const MerchantMessages  = lazy(() => import('./pages/merchant/Messages'));
+const Blacklist         = lazy(() => import('./pages/merchant/Blacklist'));
+const Agents            = lazy(() => import('./pages/merchant/Agents'));
 
 const PageFallback = () => (
   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--bg)' }}>
@@ -83,6 +85,8 @@ function AppRoutes() {
           <Route path="/activations" element={<RequireAuth role="merchant"><Layout><Activations       key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/settings"    element={<RequireAuth role="merchant"><Layout><Settings          key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/messages"    element={<RequireAuth role="merchant"><Layout><MerchantMessages  key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/blacklist"   element={<RequireAuth role="merchant"><Layout><Blacklist          key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/agents"      element={<RequireAuth role="merchant"><Layout><Agents             key={pageKey} /></Layout></RequireAuth>} />
 
           {/* Default */}
           <Route path="/"  element={<Navigate to={role === 'admin' ? '/admin/dashboard' : role === 'merchant' ? '/dashboard' : '/login'} replace />} />

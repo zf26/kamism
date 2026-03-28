@@ -186,18 +186,24 @@ export const cardsApi = {
     api.get('/cards', { params }),
   exportCsv: (params?: { app_id?: string; status?: string }) =>
     api.get('/cards/export', { params, responseType: 'blob' }),
+  disable: (id: string) => api.patch(`/cards/${id}/disable`),
+  enable: (id: string) => api.patch(`/cards/${id}/enable`),
+  delete: (id: string) => api.delete(`/cards/${id}`),
+  batchStatus: (ids: string[], action: 'disabled' | 'unused') =>
+    api.post('/cards/batch-status', { ids, action }),
+  batchExtend: (ids: string[], days: number) =>
+    api.post('/cards/batch-extend', { ids, days }),
+  stats: () => api.get('/cards/stats'),
   generate: (data: {
     app_id: string;
     count: number;
     duration_days: number;
     max_devices: number;
     note?: string;
+    prefix?: string;
+    segment_count?: number;
+    segment_len?: number;
   }) => api.post('/cards', data),
-  disable: (id: string) => api.patch(`/cards/${id}/disable`),
-  enable: (id: string) => api.patch(`/cards/${id}/enable`),
-  delete: (id: string) => api.delete(`/cards/${id}`),
-  batchStatus: (ids: string[], action: 'disabled' | 'unused') =>
-    api.post('/cards/batch-status', { ids, action }),
 };
 
 // ─── Activations ────────────────────────────────────
@@ -220,7 +226,7 @@ export const merchantApi = {
 // ─── Messages (Admin) ───────────────────────────────
 export const adminMessagesApi = {
   list: (params?: { page?: number; page_size?: number; msg_type?: string }) =>
-    api.get('/api/admin/messages', { params }),
+    api.get('/admin/messages', { params }),
   send: (data: {
     msg_type: string;
     title: string;
@@ -230,24 +236,24 @@ export const adminMessagesApi = {
     target_email?: string;
     pinned?: boolean;
     expires_at?: string;
-  }) => api.post('/api/admin/messages', data),
+  }) => api.post('/admin/messages', data),
   update: (id: string, data: {
     title?: string;
     content?: string;
     pinned?: boolean;
     expires_at?: string;
-  }) => api.patch(`/api/admin/messages/${id}`, data),
-  delete: (id: string) => api.delete(`/api/admin/messages/${id}`),
+  }) => api.patch(`/admin/messages/${id}`, data),
+  delete: (id: string) => api.delete(`/admin/messages/${id}`),
 };
 
 // ─── Messages (Merchant) ────────────────────────────
 export const merchantMessagesApi = {
   listNotices: (params?: { page?: number; page_size?: number }) =>
-    api.get('/api/merchant/notices', { params }),
+    api.get('/merchant/notices', { params }),
   listMessages: (params?: { page?: number; page_size?: number }) =>
-    api.get('/api/merchant/messages', { params }),
-  unreadCount: () => api.get('/api/merchant/messages/unread_count'),
-  markRead: (id: string) => api.post(`/api/merchant/messages/${id}/read`),
+    api.get('/merchant/messages', { params }),
+  unreadCount: () => api.get('/merchant/messages/unread_count'),
+  markRead: (id: string) => api.post(`/merchant/messages/${id}/read`),
 };
 
 // ─── WebSocket URL helper ────────────────────────────
@@ -255,8 +261,63 @@ export function getWsUrl(): string {
   const base = (import.meta.env.VITE_API_URL || 'http://localhost:9527') as string;
   const ws = base.replace(/^http/, 'ws');
   const token = localStorage.getItem('token') ?? '';
-  return `${ws}/api/ws/messages?token=${encodeURIComponent(token)}`;
+  return `${ws}/ws/messages?token=${encodeURIComponent(token)}`;
 }
+
+// ─── Health ──────────────────────────────────────────
+export const healthApi = {
+  check: () => api.get('/health'),
+};
+
+// ─── Agent ────────────────────────────────────────────
+export const agentApi = {
+  // 我作为上级
+  createInvite: (data: { quota_total?: number; commission_rate?: number; note?: string }) =>
+    api.post('/agent/invite', data),
+  listAgents: (params?: { page?: number; page_size?: number }) =>
+    api.get('/agent/list', { params }),
+  updateQuota: (id: string, delta: number, reason?: string) =>
+    api.patch(`/agent/${id}/quota`, { delta, reason }),
+  updateCommission: (id: string, commission_rate: number) =>
+    api.patch(`/agent/${id}/commission`, { commission_rate }),
+  updateStatus: (id: string, status: 'active' | 'disabled') =>
+    api.patch(`/agent/${id}/status`, { status }),
+  removeAgent: (id: string) =>
+    api.delete(`/agent/${id}`),
+  listCommissions: (params?: { page?: number; page_size?: number }) =>
+    api.get('/agent/commissions', { params }),
+  // 我作为代理
+  myRelation: () => api.get('/agent/my'),
+  myCommissions: (params?: { page?: number; page_size?: number }) =>
+    api.get('/agent/my/commissions', { params }),
+  joinByInvite: (code: string) =>
+    api.post(`/agent/join/${code}`),
+};
+
+// ─── Blacklist ────────────────────────────────────────
+export const blacklistApi = {
+  // IP 黑名单
+  listIps: (params?: { page?: number; page_size?: number }) =>
+    api.get('/blacklist/ips', { params }),
+  addIp: (ip: string, reason?: string) =>
+    api.post('/blacklist/ips', { ip, reason }),
+  removeIp: (id: string) =>
+    api.delete(`/blacklist/ips/${id}`),
+  // 设备黑名单
+  listDevices: (params?: { page?: number; page_size?: number }) =>
+    api.get('/blacklist/devices', { params }),
+  addDevice: (device_id: string, reason?: string) =>
+    api.post('/blacklist/devices', { device_id, reason }),
+  removeDevice: (id: string) =>
+    api.delete(`/blacklist/devices/${id}`),
+  // 异常告警
+  listAlerts: (params?: { page?: number; page_size?: number }) =>
+    api.get('/blacklist/alerts', { params }),
+  unreadAlertCount: () =>
+    api.get('/blacklist/alerts/unread_count'),
+  markAlertRead: (id: string) =>
+    api.post(`/blacklist/alerts/${id}/read`),
+};
 
 // ─── Webhooks ─────────────────────────────────────────
 export const webhookApi = {

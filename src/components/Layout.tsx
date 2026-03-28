@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -30,6 +30,8 @@ const merchantNav: NavItem[] = [
   { label: '卡密管理', path: '/cards', icon: <Key size={16} /> },
   { label: '激活记录', path: '/activations', icon: <Activity size={16} /> },
   { label: '消息中心', path: '/messages', icon: <Bell size={16} /> },
+  { label: '风控管理', path: '/blacklist', icon: <ShieldAlert size={16} /> },
+  { label: '代理管理', path: '/agents',    icon: <Network size={16} /> },
   { label: '账号设置', path: '/settings', icon: <Settings size={16} /> },
 ];
 

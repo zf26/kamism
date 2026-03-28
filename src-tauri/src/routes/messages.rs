@@ -1,17 +1,17 @@
 //! 站内信 / 公告路由
 //!
 //! 管理员接口（需 admin_only）：
-//!   POST   /api/admin/messages           — 发送公告或站内信
-//!   GET    /api/admin/messages           — 查询已发消息列表
-//!   PATCH  /api/admin/messages/:id       — 编辑消息（置顶/内容）
-//!   DELETE /api/admin/messages/:id       — 删除消息
+//!   POST   /admin/messages           — 发送公告或站内信
+//!   GET    /admin/messages           — 查询已发消息列表
+//!   PATCH  /admin/messages/:id       — 编辑消息（置顶/内容）
+//!   DELETE /admin/messages/:id       — 删除消息
 //!
 //! 商户接口（需 auth_middleware）：
-//!   GET    /api/merchant/notices          — 公告列表
-//!   GET    /api/merchant/messages         — 站内信列表
-//!   GET    /api/merchant/messages/unread_count — 未读数
-//!   POST   /api/merchant/messages/:id/read    — 标记已读
-//!   GET    /api/ws/messages               — WebSocket 升级
+//!   GET     /merchant/notices          — 公告列表
+//!   GET     /merchant/messages         — 站内信列表
+//!   GET     /merchant/messages/unread_count — 未读数
+//!   POST    /merchant/messages/:id/read    — 标记已读
+//!   GET     /ws/messages               — WebSocket 升级
 
 use crate::{
     middleware::auth::{admin_only, auth_middleware, AppState},
@@ -37,25 +37,25 @@ use uuid::Uuid;
 
 pub fn messages_admin_router(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/api/admin/messages", post(admin_send_message))
-        .route("/api/admin/messages", get(admin_list_messages))
-        .route("/api/admin/messages/:id", patch(admin_update_message))
-        .route("/api/admin/messages/:id", delete(admin_delete_message))
+        .route("/admin/messages", post(admin_send_message))
+        .route("/admin/messages", get(admin_list_messages))
+        .route("/admin/messages/:id", patch(admin_update_message))
+        .route("/admin/messages/:id", delete(admin_delete_message))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
 pub fn messages_merchant_router(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/api/merchant/notices", get(merchant_list_notices))
-        .route("/api/merchant/messages", get(merchant_list_messages))
-        .route("/api/merchant/messages/unread_count", get(merchant_unread_count))
-        .route("/api/merchant/messages/:id/read", post(merchant_mark_read))
+        .route("/merchant/notices", get(merchant_list_notices))
+        .route("/merchant/messages", get(merchant_list_messages))
+        .route("/merchant/messages/unread_count", get(merchant_unread_count))
+        .route("/merchant/messages/:id/read", post(merchant_mark_read))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
 pub fn messages_ws_router() -> Router<AppState> {
-    Router::new().route("/api/ws/messages", get(ws_handler))
+    Router::new().route("/ws/messages", get(ws_handler))
 }
 
 // ── 请求/响应结构 ─────────────────────────────────────────────────────────────
@@ -547,7 +547,7 @@ async fn merchant_mark_read(
 
 // ── WebSocket 升级端点 ────────────────────────────────────────────────────────
 //
-// 连接方式：ws://host/api/ws/messages?token=<JWT>
+// 连接方式：ws://host /ws/messages?token=<JWT>
 // 前端在 query string 传入 access token，后端验证后注册连接
 
 async fn ws_handler(

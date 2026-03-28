@@ -38,6 +38,19 @@ pub async fn api_rate_limit(
     rate_limit_check(state.redis.clone(), &key, 60, 60, req, next).await
 }
 
+/// 激活专用限流：同一 IP 每分钟最多 20 次激活请求（防黄牛批量激活）
+/// 比通用 api_rate_limit 更严格，单独作用于 /v1/activate
+pub async fn activate_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip = addr.ip().to_string();
+    let key = format!("rl:activate:{}", ip);
+    rate_limit_check(state.redis.clone(), &key, 20, 60, req, next).await
+}
+
 /// 通用限流实现
 /// - key: Redis key
 /// - max: 窗口内最大请求数
