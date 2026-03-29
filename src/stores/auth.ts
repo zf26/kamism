@@ -6,6 +6,8 @@ export interface User {
   email: string;
   api_key?: string;
   status?: string;
+  plan?: string;
+  plan_expires_at?: string | null;
   email_verified?: boolean;
   created_at?: string;
 }

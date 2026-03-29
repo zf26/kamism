@@ -5,6 +5,22 @@ import { Copy, RefreshCw, Lock, Key } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useConfirm } from '../../stores/confirm';
 
+function getPlanLabel(plan?: string) {
+  return plan === 'pro' ? '专业版' : '免费版';
+}
+
+function getPlanExpiry(plan?: string, expiresAt?: string | null): string | null {
+  if (plan !== 'pro' || !expiresAt) return null;
+  const exp = new Date(expiresAt);
+  const now = new Date();
+  const diffMs = exp.getTime() - now.getTime();
+  if (diffMs <= 0) return '已过期';
+  const days = Math.floor(diffMs / 86400000);
+  if (days > 0) return `剩余 ${days} 天（${exp.toLocaleDateString('zh-CN')} 到期）`;
+  const hours = Math.floor(diffMs / 3600000);
+  return `剩余 ${hours} 小时`;
+}
+
 export default function Settings() {
   const { user, setAuth, role } = useAuthStore();
   const [pwForm, setPwForm] = useState({ old_password: '', new_password: '', confirm: '' });
@@ -74,6 +90,34 @@ export default function Settings() {
                 <span style={{ color: 'var(--text)', fontWeight: 500 }}>{item.value}</span>
               </div>
             ))}
+            {/* 套餐信息 */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+              <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>当前套餐</span>
+              <span style={{
+                fontSize: 12, fontWeight: 700, padding: '2px 8px', borderRadius: 5,
+                background: user?.plan === 'pro' ? 'linear-gradient(135deg,#f59e0b,#d97706)' : 'var(--bg-hover)',
+                color: user?.plan === 'pro' ? '#fff' : 'var(--text-muted)',
+                border: user?.plan === 'pro' ? 'none' : '1px solid var(--border)',
+              }}>
+                {getPlanLabel(user?.plan)}
+              </span>
+            </div>
+            {user?.plan === 'pro' && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: '1px solid var(--border)' }}>
+                <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>到期时间</span>
+                <span style={{
+                  fontSize: 13, fontWeight: 500,
+                  color: (() => {
+                    const exp = user?.plan_expires_at ? new Date(user.plan_expires_at) : null;
+                    if (!exp) return 'var(--text-muted)';
+                    const days = Math.floor((exp.getTime() - Date.now()) / 86400000);
+                    return days <= 7 ? '#ef4444' : days <= 30 ? '#f59e0b' : 'var(--text)';
+                  })()
+                }}>
+                  {getPlanExpiry(user?.plan, user?.plan_expires_at)}
+                </span>
+              </div>
+            )}
           </div>
         </div>
 

@@ -25,6 +25,7 @@ const Settings          = lazy(() => import('./pages/merchant/Settings'));
 const MerchantMessages  = lazy(() => import('./pages/merchant/Messages'));
 const Blacklist         = lazy(() => import('./pages/merchant/Blacklist'));
 const Agents            = lazy(() => import('./pages/merchant/Agents'));
+const ApiDocs           = lazy(() => import('./pages/merchant/ApiDocs'));
 
 const PageFallback = () => (
   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--bg)' }}>
@@ -87,6 +88,7 @@ function AppRoutes() {
           <Route path="/messages"    element={<RequireAuth role="merchant"><Layout><MerchantMessages  key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/blacklist"   element={<RequireAuth role="merchant"><Layout><Blacklist          key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/agents"      element={<RequireAuth role="merchant"><Layout><Agents             key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/api-docs"    element={<RequireAuth role="merchant"><Layout><ApiDocs            key={pageKey} /></Layout></RequireAuth>} />
 
           {/* Default */}
           <Route path="/"  element={<Navigate to={role === 'admin' ? '/admin/dashboard' : role === 'merchant' ? '/dashboard' : '/login'} replace />} />

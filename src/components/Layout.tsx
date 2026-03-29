@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -32,6 +32,7 @@ const merchantNav: NavItem[] = [
   { label: '消息中心', path: '/messages', icon: <Bell size={16} /> },
   { label: '风控管理', path: '/blacklist', icon: <ShieldAlert size={16} /> },
   { label: '代理管理', path: '/agents',    icon: <Network size={16} /> },
+  { label: 'API 文档',  path: '/api-docs',  icon: <BookOpen size={16} /> },
   { label: '账号设置', path: '/settings', icon: <Settings size={16} /> },
 ];
 
@@ -200,9 +201,24 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {user?.username}
             </div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 3 }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
               {role === 'admin' && <Shield size={10} />}
               {role === 'admin' ? '管理员' : '商户'}
+              {role === 'merchant' && (
+                <span style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: '1px 5px',
+                  borderRadius: 4,
+                  letterSpacing: '0.3px',
+                  background: user?.plan === 'pro' ? 'linear-gradient(135deg,#f59e0b,#d97706)' : 'var(--bg-hover)',
+                  color: user?.plan === 'pro' ? '#fff' : 'var(--text-muted)',
+                  border: user?.plan === 'pro' ? 'none' : '1px solid var(--border)',
+                  lineHeight: '16px',
+                }}>
+                  {user?.plan === 'pro' ? '⚡ 专业版' : '免费版'}
+                </span>
+              )}
             </div>
           </div>
         </div>
