@@ -404,18 +404,54 @@ async fn verify(
 
     let mut redis = state.redis.clone();
 
-    // ── 缓存命中：直接返回，不查数据库 ──
+    // ── 缓存命中：先实时校验卡密状态，再返回缓存结果 ──
+    // 注意：缓存只缓存「当时验证成功」的结果，但卡密可能在缓存期间被禁用/过期，
+    // 因此命中缓存时必须额外做一次轻量 DB 状态查询（走主键索引，开销极小）。
     if let Ok(Some(cached)) = redis.get::<_, Option<String>>(&cache_key).await {
         if let Ok(val) = serde_json::from_str::<Value>(&cached) {
-            // 缓存命中时异步更新 last_verified_at（fire-and-forget，不阻塞响应）
+            // 取缓存中的 card_id，查实时状态
+            let cached_card_id = val.pointer("/data/card_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+            if let Some(cid) = cached_card_id {
+                let live_status: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> =
+                    sqlx::query_as("SELECT status, expires_at FROM cards WHERE id = $1")
+                        .bind(cid)
+                        .fetch_optional(&state.pool)
+                        .await
+                        .unwrap_or(None);
+
+                match live_status {
+                    None => {
+                        // 卡密已被删除，失效缓存
+                        let _: redis::RedisResult<()> = redis.del(&cache_key).await;
+                        return Json(json!({"success": false, "valid": false, "message": "卡密不存在"}));
+                    }
+                    Some((status, expires_at)) => {
+                        // 检查禁用
+                        if status == "disabled" {
+                            let _: redis::RedisResult<()> = redis.del(&cache_key).await;
+                            return Json(json!({"success": false, "valid": false, "message": "卡密已被禁用"}));
+                        }
+                        // 检查过期
+                        if let Some(exp) = expires_at {
+                            if chrono::Utc::now() > exp {
+                                let _: redis::RedisResult<()> = redis.del(&cache_key).await;
+                                return Json(json!({"success": false, "valid": false, "message": "卡密已过期"}));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 状态正常，使用缓存结果并异步更新 last_verified_at
             let pool_bg   = state.pool.clone();
             let val_clone = val.clone();
-            // redis ConnectionManager 实现了 Clone，可安全跨 task 传递
             let mut redis_bg = state.redis.clone();
             let cache_key_bg = cache_key.clone();
             tokio::spawn(async move {
                 if val_clone.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    // 从缓存 payload 中取 activation_id，更新验证时间
                     if let Some(act_id) = val_clone.pointer("/data/activation_id")
                         .and_then(|v| v.as_str())
                         .and_then(|s| uuid::Uuid::parse_str(s).ok())
@@ -427,7 +463,6 @@ async fn verify(
                         .execute(&pool_bg)
                         .await;
                     }
-                    // 滑动续期：命中一次续期 60s，保持热 key 不冷却
                     let _: redis::RedisResult<()> =
                         redis_bg.expire(cache_key_bg.as_str(), 60_i64).await;
                 }
@@ -547,6 +582,7 @@ async fn verify(
         "message": "卡密有效",
         "data": {
             "activation_id": activation.id,
+            "card_id": card.id,
             "expires_at": card.expires_at,
             "remaining_days": remaining_days,
             "max_devices": card.max_devices,
