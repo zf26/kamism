@@ -155,6 +155,10 @@ export const adminApi = {
   getStats: () => api.get('/admin/stats'),
   getMerchants: (params?: { page?: number; page_size?: number; keyword?: string; plan?: string }) =>
     api.get('/admin/merchants', { params }),
+  createMerchant: (data: { username: string; email: string; password: string }) =>
+    api.post('/admin/merchants', data),
+  deleteMerchant: (id: string) =>
+    api.delete(`/admin/merchants/${id}`),
   updateMerchantStatus: (id: string, status: string) =>
     api.patch(`/admin/merchants/${id}/status`, { status }),
   updateMerchantPlan: (id: string, plan: 'free' | 'pro', expires_days?: number) =>
@@ -167,6 +171,9 @@ export const adminApi = {
     max_devices?: number;
     max_gen_once?: number;
   }) => api.patch(`/admin/plan-configs/${id}`, data),
+  // 管理员 API Key 管理
+  getApiKey: () => api.get('/admin/api-key'),
+  regenerateApiKey: () => api.post('/admin/api-key/regenerate'),
 };
 
 // ─── Apps ───────────────────────────────────────────
@@ -326,4 +333,14 @@ export const webhookApi = {
     api.put(`/webhooks/app/${appId}`, data),
   delete: (appId: string) => api.delete(`/webhooks/app/${appId}`),
   list: () => api.get('/webhooks'),
+};
+
+// ─── Payments ─────────────────────────────────────────
+export const paymentsApi = {
+  create: (data: { pay_type: string; plan: string; expires_days?: number }) =>
+    api.post('/pay/auth/create', data),
+  list: (params?: { page?: number; page_size?: number }) =>
+    api.get('/pay/auth/orders', { params }),
+  getStatus: (orderId: string) =>
+    api.get('/pay/auth/status', { params: { order_id: orderId } }),
 };

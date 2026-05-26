@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { adminApi } from '../../lib/api';
-import { CheckCircle, XCircle, RefreshCw, Search, Crown, Gift, Clock } from 'lucide-react';
+import { CheckCircle, XCircle, RefreshCw, Search, Crown, Gift, Clock, UserPlus, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface Merchant {
@@ -13,6 +13,7 @@ interface Merchant {
   plan_expires_at: string | null;
   email_verified: boolean;
   created_at: string;
+  created_by_admin: boolean;
 }
 
 interface PlanConfig {
@@ -24,9 +25,21 @@ interface PlanConfig {
   max_gen_once: number;
 }
 
-// 升级弹窗状态
 interface UpgradeModal {
   merchantId: string;
+  username: string;
+}
+
+// 创建商户弹窗
+interface CreateModal {
+  username: string;
+  email: string;
+  password: string;
+}
+
+// 删除确认弹窗
+interface DeleteConfirm {
+  id: string;
   username: string;
 }
 
@@ -51,6 +64,20 @@ function formatExpiry(expiresAt: string | null, plan: string) {
   );
 }
 
+function inputStyle(): React.CSSProperties {
+  return {
+    width: '100%',
+    padding: '8px 12px',
+    borderRadius: 8,
+    border: '1px solid var(--border)',
+    background: 'var(--bg)',
+    color: 'var(--text)',
+    fontSize: 13,
+    outline: 'none',
+    boxSizing: 'border-box',
+  };
+}
+
 export default function Merchants() {
   const [merchants, setMerchants] = useState<Merchant[]>([]);
   const [planConfigs, setPlanConfigs] = useState<Record<string, PlanConfig>>({});
@@ -64,6 +91,16 @@ export default function Merchants() {
   const [planLoading, setPlanLoading] = useState<string | null>(null);
   const [upgradeModal, setUpgradeModal] = useState<UpgradeModal | null>(null);
   const [expiresDays, setExpiresDays] = useState<string>('30');
+
+  // 创建商户弹窗
+  const [showCreate, setShowCreate] = useState(false);
+  const [create, setCreate] = useState<CreateModal>({ username: '', email: '', password: '' });
+  const [createSubmitting, setCreateSubmitting] = useState(false);
+  const [createResult, setCreateResult] = useState<{ username: string; api_key: string } | null>(null);
+
+  // 删除确认弹窗
+  const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirm | null>(null);
+  const [deleteSubmitting, setDeleteSubmitting] = useState(false);
 
   const loadPlanConfigs = () => {
     adminApi.getPlanConfigs().then(res => {
@@ -97,7 +134,6 @@ export default function Merchants() {
     e.preventDefault();
     setPage(1);
     setSearch(keyword);
-    // page/search 变化由 useEffect 统一驱动，无需手动调用 load()
   };
 
   const handlePlanFilter = (pf: string) => {
@@ -126,14 +162,12 @@ export default function Merchants() {
   };
 
   const togglePlan = async (id: string, current: string) => {
-    // 降为免费版直接操作，升级专业版弹窗输入天数
     if (current !== 'pro') {
       const m = merchants.find(m => m.id === id);
       setUpgradeModal({ merchantId: id, username: m?.username ?? '' });
       setExpiresDays('30');
       return;
     }
-    // 降为免费
     setPlanLoading(id);
     try {
       const res = await adminApi.updateMerchantPlan(id, 'free');
@@ -164,42 +198,160 @@ export default function Merchants() {
     finally { setPlanLoading(null); }
   };
 
+  // 创建商户
+  const handleCreate = async () => {
+    if (!create.username.trim()) { toast.error('请输入用户名'); return; }
+    if (!create.email.trim() || !create.email.includes('@')) { toast.error('请输入有效邮箱'); return; }
+    if (create.password.length < 6) { toast.error('密码至少 6 位'); return; }
+    setCreateSubmitting(true);
+    try {
+      const res = await adminApi.createMerchant({ username: create.username, email: create.email, password: create.password });
+      if (res.data.success) {
+        setCreateResult(res.data.data);
+        toast.success('商户创建成功');
+        load();
+      } else {
+        toast.error(res.data.message ?? '创建失败');
+      }
+    } catch { toast.error('创建失败'); }
+    finally { setCreateSubmitting(false); }
+  };
+
+  const handleDelete = async () => {
+    if (!deleteConfirm) return;
+    setDeleteSubmitting(true);
+    try {
+      const res = await adminApi.deleteMerchant(deleteConfirm.id);
+      if (res.data.success) {
+        toast.success('商户已删除');
+        setDeleteConfirm(null);
+        load();
+      } else {
+        toast.error(res.data.message ?? '删除失败');
+      }
+    } catch { toast.error('删除失败'); }
+    finally { setDeleteSubmitting(false); }
+  };
+
   const totalPages = Math.ceil(total / pageSize);
+
+  const modalOverlay: React.CSSProperties = {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+  };
+  const modalBox: React.CSSProperties = {
+    background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12,
+    padding: 28, width: 400, display: 'flex', flexDirection: 'column', gap: 16,
+  };
+  const labelStyle: React.CSSProperties = { fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 6 };
+  const fieldGap: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 12 };
 
   return (
     <div className="fade-in">
+
       {/* 升级专业版弹窗 */}
       {upgradeModal && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12, padding: 28, width: 360, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={modalOverlay}>
+          <div style={modalBox}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <Crown size={18} color="#a78bfa" />
               <h3 style={{ fontWeight: 700, fontSize: 16 }}>升级专业版</h3>
             </div>
-            <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>为商户 <strong style={{ color: 'var(--text)' }}>{upgradeModal.username}</strong> 设置专业版有效期</p>
+            <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>
+              为商户 <strong style={{ color: 'var(--text)' }}>{upgradeModal.username}</strong> 设置专业版有效期
+            </p>
             <div>
-              <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>
-                有效天数（留空为永久）
-              </label>
-              <input
-                type="number"
-                min={1}
-                value={expiresDays}
-                onChange={e => setExpiresDays(e.target.value)}
-                placeholder="例如：30"
-                style={{ width: '100%' }}
-                autoFocus
-              />
+              <label style={labelStyle}>有效天数（留空为永久）</label>
+              <input type="number" min={1} value={expiresDays}
+                onChange={e => setExpiresDays(e.target.value)} placeholder="例如：30" style={inputStyle()} autoFocus />
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button className="btn btn-ghost" onClick={() => setUpgradeModal(null)}>取消</button>
-              <button className="btn btn-primary" onClick={confirmUpgrade}>
-                <Crown size={13} /> 确认升级
+              <button className="btn btn-primary" onClick={confirmUpgrade}><Crown size={13} /> 确认升级</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 创建商户弹窗 */}
+      {showCreate && (
+        <div style={modalOverlay} onClick={() => !createSubmitting && !createResult && setShowCreate(false)}>
+          <div style={modalBox} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <UserPlus size={18} color="#a78bfa" />
+              <h3 style={{ fontWeight: 700, fontSize: 16 }}>创建商户</h3>
+            </div>
+
+            {createResult ? (
+              <>
+                <div style={{ padding: '12px 16px', borderRadius: 8, background: 'rgba(34,197,94,0.1)', border: '1px solid rgba(34,197,94,0.3)', fontSize: 13 }}>
+                  <p style={{ color: 'var(--text)', fontWeight: 600, marginBottom: 8 }}>商户创建成功</p>
+                  <p style={{ color: 'var(--text-muted)', fontSize: 12 }}>请告知商户妥善保管以下信息：</p>
+                  <div style={{ marginTop: 10, background: 'var(--bg)', borderRadius: 6, padding: '8px 12px' }}>
+                    <p style={{ color: 'var(--text-muted)', fontSize: 12 }}>用户名：<strong style={{ color: 'var(--text)' }}>{createResult.username}</strong></p>
+                    <p style={{ color: 'var(--text-muted)', fontSize: 12 }}>API Key：<code style={{ color: 'var(--accent)', fontSize: 12 }}>{createResult.api_key}</code></p>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                  <button className="btn btn-ghost" onClick={() => { setShowCreate(false); setCreateResult(null); setCreate({ username: '', email: '', password: '' }); }}>关闭</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={fieldGap}>
+                  <div>
+                    <label style={labelStyle}>用户名</label>
+                    <input value={create.username} onChange={e => setCreate(c => ({ ...c, username: e.target.value }))} placeholder="唯一用户名" style={inputStyle()} disabled={createSubmitting} />
+                  </div>
+                  <div>
+                    <label style={labelStyle}>邮箱</label>
+                    <input type="email" value={create.email} onChange={e => setCreate(c => ({ ...c, email: e.target.value }))} placeholder="商户登录邮箱" style={inputStyle()} disabled={createSubmitting} />
+                  </div>
+                  <div>
+                    <label style={labelStyle}>登录密码</label>
+                    <input type="password" value={create.password} onChange={e => setCreate(c => ({ ...c, password: e.target.value }))} placeholder="至少 6 位" style={inputStyle()} disabled={createSubmitting} />
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                  <button className="btn btn-ghost" onClick={() => setShowCreate(false)} disabled={createSubmitting}>取消</button>
+                  <button className="btn btn-primary" onClick={handleCreate} disabled={createSubmitting}>
+                    {createSubmitting ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <UserPlus size={13} />}
+                    {createSubmitting ? '创建中…' : '创建'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 删除确认弹窗 */}
+      {deleteConfirm && (
+        <div style={modalOverlay} onClick={() => !deleteSubmitting && setDeleteConfirm(null)}>
+          <div style={{ ...modalBox, width: 380 }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Trash2 size={18} color="#ef4444" />
+              <h3 style={{ fontWeight: 700, fontSize: 16 }}>确认删除</h3>
+            </div>
+            <div style={{ padding: '12px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.25)' }}>
+              <p style={{ fontSize: 13, color: 'var(--text)' }}>
+                确定删除商户 <strong>{deleteConfirm.username}</strong> 吗？
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 6 }}>
+                删除后，其所有应用、卡密、激活记录将被 <strong style={{ color: '#ef4444' }}>永久清理</strong>，此操作不可恢复。
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button className="btn btn-ghost" onClick={() => setDeleteConfirm(null)} disabled={deleteSubmitting}>取消</button>
+              <button className="btn btn-danger" onClick={handleDelete} disabled={deleteSubmitting} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                {deleteSubmitting ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <Trash2 size={13} />}
+                {deleteSubmitting ? '删除中…' : '确认删除'}
               </button>
             </div>
           </div>
         </div>
       )}
+
       <div className="page-header">
         <div>
           <h1 className="page-title">商户管理</h1>
@@ -211,16 +363,14 @@ export default function Merchants() {
           <form onSubmit={handleSearch} style={{ display: 'flex', gap: 6 }}>
             <div style={{ position: 'relative' }}>
               <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-              <input
-                value={keyword}
-                onChange={e => setKeyword(e.target.value)}
-                placeholder="搜索用户名/邮箱"
-                style={{ paddingLeft: 32, width: 200 }}
-              />
+              <input value={keyword} onChange={e => setKeyword(e.target.value)} placeholder="搜索用户名/邮箱" style={{ paddingLeft: 32, width: 200 }} />
             </div>
             <button type="submit" className="btn btn-ghost"><Search size={14} /></button>
           </form>
           <button className="btn btn-ghost" onClick={() => load()}><RefreshCw size={14} /> 刷新</button>
+          <button className="btn btn-primary" onClick={() => { setShowCreate(true); setCreateResult(null); setCreate({ username: '', email: '', password: '' }); }} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <UserPlus size={14} /> 创建商户
+          </button>
         </div>
       </div>
 
@@ -257,12 +407,8 @@ export default function Merchants() {
             fontSize: 13,
           }}>
             {config.plan === 'pro' ? <Crown size={14} color="#a78bfa" /> : <Gift size={14} color="var(--text-muted)" />}
-            <span style={{ fontWeight: 600, color: config.plan === 'pro' ? '#a78bfa' : 'var(--text)' }}>
-              {config.label}
-            </span>
-            <span style={{ color: 'var(--text-muted)' }}>
-              应用 {displayVal(config.max_apps)} · 卡密 {displayVal(config.max_cards)} · 设备 {displayVal(config.max_devices)}/张
-            </span>
+            <span style={{ fontWeight: 600, color: config.plan === 'pro' ? '#a78bfa' : 'var(--text)' }}>{config.label}</span>
+            <span style={{ color: 'var(--text-muted)' }}>应用 {displayVal(config.max_apps)} · 卡密 {displayVal(config.max_cards)} · 设备 {displayVal(config.max_devices)}/张</span>
           </div>
         ))}
       </div>
@@ -283,14 +429,21 @@ export default function Merchants() {
                   <td><span className="skeleton" style={{ width: '70px' }} /></td>
                   <td><span className="skeleton" style={{ width: '48px', height: '22px', borderRadius: 999 }} /></td>
                   <td><span className="skeleton" style={{ width: '55%' }} /></td>
-                  <td><span className="skeleton" style={{ width: '120px', height: '28px' }} /></td>
+                  <td><span className="skeleton" style={{ width: '140px', height: '28px' }} /></td>
                 </tr>
               ))
             ) : merchants.length === 0 ? (
-              <tr><td colSpan={7}><div className="empty-state"><div className="empty-state-icon">👤</div><div className="empty-state-text">暂无商户</div></div></td></tr>
+              <tr><td colSpan={8}><div className="empty-state"><div className="empty-state-icon">👤</div><div className="empty-state-text">暂无商户</div></div></td></tr>
             ) : merchants.map((m, idx) => (
               <tr key={m.id} className="data-enter" style={{ animationDelay: `${idx * 25}ms` }}>
-                <td><span style={{ color: 'var(--text)', fontWeight: 600 }}>{m.username}</span></td>
+                <td>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ color: 'var(--text)', fontWeight: 600 }}>{m.username}</span>
+                    {m.created_by_admin && (
+                      <span title="管理员创建" style={{ fontSize: 10, padding: '1px 5px', borderRadius: 4, background: 'rgba(124,106,247,0.15)', color: 'var(--primary-light)', border: '1px solid rgba(124,106,247,0.3)' }}>后台</span>
+                    )}
+                  </div>
+                </td>
                 <td>{m.email}</td>
                 <td><span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)', letterSpacing: '0.5px' }}>{m.api_key.slice(0, 12)}…</span></td>
                 <td>
@@ -308,7 +461,7 @@ export default function Merchants() {
                 <td><span className={`badge badge-${m.status}`}>{m.status === 'active' ? '正常' : '禁用'}</span></td>
                 <td>{new Date(m.created_at).toLocaleDateString('zh-CN')}</td>
                 <td>
-                  <div style={{ display: 'flex', gap: 6 }}>
+                  <div style={{ display: 'flex', gap: 4 }}>
                     <button
                       className={`btn btn-sm ${m.plan === 'pro' ? 'btn-ghost' : 'btn-primary'}`}
                       onClick={() => togglePlan(m.id, m.plan)}
@@ -329,6 +482,16 @@ export default function Merchants() {
                     >
                       {m.status === 'active' ? <><XCircle size={12} /> 禁用</> : <><CheckCircle size={12} /> 启用</>}
                     </button>
+                    {m.created_by_admin && (
+                      <button
+                        className="btn btn-sm btn-danger"
+                        onClick={() => setDeleteConfirm({ id: m.id, username: m.username })}
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                        title="删除商户"
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    )}
                   </div>
                 </td>
               </tr>
@@ -347,11 +510,7 @@ export default function Merchants() {
         <button className="page-btn" onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages || totalPages === 0}>›</button>
         <span style={{ color: 'var(--text-muted)', fontSize: 12, margin: '0 4px' }}>每页</span>
         {PAGE_SIZE_OPTIONS.map(s => (
-          <button
-            key={s}
-            className={`page-btn ${s === pageSize ? 'active' : ''}`}
-            onClick={() => handlePageSize(s)}
-          >{s}</button>
+          <button key={s} className={`page-btn ${s === pageSize ? 'active' : ''}`} onClick={() => handlePageSize(s)}>{s}</button>
         ))}
       </div>
     </div>

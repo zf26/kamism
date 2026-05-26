@@ -1,6 +1,6 @@
 [package]
 name = "kamism"
-version = "0.1.0"
+version = "0.1.2"
 description = "KamiSM - 卡密管理系统"
 authors = ["zf26"]
 edition = "2021"
@@ -25,7 +25,7 @@ tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-shell = { version = "2", optional = true }
 
 # Web 框架
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-br", "limit"] }
@@ -74,3 +74,6 @@ base64 = "0.22"
 
 # HTTP 客户端（Webhook 推送）
 reqwest = { version = "0.12", features = ["json"] }
+# 支付签名
+md5 = "0.7"
+bytes = "1"

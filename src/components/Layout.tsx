@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -15,9 +15,10 @@ interface NavItem {
   label: string;
   path: string;
   icon: React.ReactNode;
+  badge?: number;
 }
 
-const adminNav: NavItem[] = [
+const adminPlatformNav: NavItem[] = [
   { label: '总览', path: '/admin/dashboard', icon: <LayoutDashboard size={16} /> },
   { label: '商户管理', path: '/admin/merchants', icon: <Users size={16} /> },
   { label: '套餐配置', path: '/admin/plan-configs', icon: <Settings size={16} /> },
@@ -29,6 +30,7 @@ const merchantNav: NavItem[] = [
   { label: '我的应用', path: '/apps', icon: <Package size={16} /> },
   { label: '卡密管理', path: '/cards', icon: <Key size={16} /> },
   { label: '激活记录', path: '/activations', icon: <Activity size={16} /> },
+  { label: '升级续费', path: '/upgrade', icon: <CreditCard size={16} /> },
   { label: '消息中心', path: '/messages', icon: <Bell size={16} /> },
   { label: '风控管理', path: '/blacklist', icon: <ShieldAlert size={16} /> },
   { label: '代理管理', path: '/agents',    icon: <Network size={16} /> },
@@ -91,7 +93,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     setNoticeQueue(rest);
   };
 
-  const navItems = role === 'admin' ? adminNav : merchantNav;
+  const navItems = role === 'admin' ? adminPlatformNav : merchantNav;
 
   const handleLogout = () => {
     logout();
@@ -137,7 +139,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       </div>
 
       {/* Nav */}
-      <nav style={{ flex: 1, padding: '0 12px' }}>
+      <nav style={{ flex: 1, padding: '0 12px', overflowY: 'auto' }}>
         {navItems.map((item) => {
           const active = location.pathname === item.path;
           return (
@@ -145,21 +147,13 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               key={item.path}
               onClick={() => handleNav(item.path)}
               style={{
-                width: '100%',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 10,
-                padding: '10px 12px',
-                borderRadius: 8,
-                marginBottom: 2,
+                width: '100%', display: 'flex', alignItems: 'center', gap: 10,
+                padding: '10px 12px', borderRadius: 8, marginBottom: 2,
                 background: active ? 'var(--accent-glow)' : 'transparent',
                 color: active ? 'var(--accent)' : 'var(--text-dim)',
-                fontWeight: active ? 700 : 500,
-                fontSize: 13,
+                fontWeight: active ? 700 : 500, fontSize: 13,
                 border: active ? '1px solid rgba(124,106,247,0.2)' : '1px solid transparent',
-                textAlign: 'left',
-                cursor: 'pointer',
-                transition: 'all 0.15s',
+                textAlign: 'left', cursor: 'pointer', transition: 'all 0.15s',
               }}
               onMouseEnter={e => { if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-hover)'; }}
               onMouseLeave={e => { if (!active) (e.currentTarget as HTMLButtonElement).style.background = 'transparent'; }}
@@ -168,15 +162,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               <span style={{ flex: 1 }}>{item.label}</span>
               {item.path === '/messages' && unread > 0 && (
                 <span style={{
-                  background: 'var(--accent)',
-                  color: '#fff',
-                  borderRadius: 10,
-                  fontSize: 10,
-                  fontWeight: 700,
-                  padding: '1px 6px',
-                  minWidth: 18,
-                  textAlign: 'center',
-                  lineHeight: '16px',
+                  background: 'var(--accent)', color: '#fff', borderRadius: 10,
+                  fontSize: 10, fontWeight: 700, padding: '1px 6px',
+                  minWidth: 18, textAlign: 'center', lineHeight: '16px',
                 }}>
                   {unread > 99 ? '99+' : unread}
                 </span>

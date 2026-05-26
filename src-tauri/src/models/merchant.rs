@@ -18,6 +18,7 @@ pub struct Merchant {
     pub verify_token: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub created_by_admin: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +32,7 @@ pub struct MerchantPublic {
     pub plan_expires_at: Option<DateTime<Utc>>,
     pub email_verified: bool,
     pub created_at: DateTime<Utc>,
+    pub created_by_admin: bool,
 }
 
 impl From<Merchant> for MerchantPublic {
@@ -45,6 +47,7 @@ impl From<Merchant> for MerchantPublic {
             plan_expires_at: m.plan_expires_at,
             email_verified: m.email_verified,
             created_at: m.created_at,
+            created_by_admin: m.created_by_admin,
         }
     }
 }

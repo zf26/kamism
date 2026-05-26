@@ -47,14 +47,17 @@ pub async fn auth_middleware(
 
     match verify_token(token, &state.jwt_secret) {
         Ok(claims) => {
-            req.extensions_mut().insert(claims);
-            next.run(req).await
+            req.extensions_mut().insert(claims.clone());
+            let resp = next.run(req).await;
+            resp
         }
-        Err(_) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"success": false, "message": "令牌无效或已过期"})),
-        )
-            .into_response(),
+        Err(_e) => {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"success": false, "message": "令牌无效或已过期"})),
+            )
+                .into_response()
+        }
     }
 }
 

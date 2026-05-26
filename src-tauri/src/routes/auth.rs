@@ -280,6 +280,16 @@ async fn login(
             Ok(t) => t,
             Err(_) => return Json(json!({"success": false, "message": "生成令牌失败"})),
         };
+        // 获取管理员的 API Key（如果没有则自动生成）
+        let mut api_key = admin.api_key.unwrap_or_default();
+        if api_key.is_empty() {
+            api_key = generate_api_key();
+            let _ = sqlx::query("UPDATE admins SET api_key = $1, updated_at = NOW() WHERE id = $2")
+                .bind(&api_key)
+                .bind(admin.id)
+                .execute(&state.pool)
+                .await;
+        }
         return Json(json!({
             "success": true,
             "token": token,
@@ -288,7 +298,8 @@ async fn login(
             "user": {
                 "id": admin.id,
                 "username": admin.username,
-                "email": admin.email
+                "email": admin.email,
+                "api_key": api_key
             }
         }));
     }

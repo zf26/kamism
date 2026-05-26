@@ -14,6 +14,7 @@ applyStoredTheme();
 
 // 其余页面懒加载
 const AdminDashboard    = lazy(() => import('./pages/admin/Dashboard'));
+const AdminApiDocs      = lazy(() => import('./pages/admin/ApiDocs'));
 const Merchants         = lazy(() => import('./pages/admin/Merchants'));
 const PlanConfigs       = lazy(() => import('./pages/admin/PlanConfigs'));
 const AdminMessages     = lazy(() => import('./pages/admin/Messages'));
@@ -26,6 +27,7 @@ const MerchantMessages  = lazy(() => import('./pages/merchant/Messages'));
 const Blacklist         = lazy(() => import('./pages/merchant/Blacklist'));
 const Agents            = lazy(() => import('./pages/merchant/Agents'));
 const ApiDocs           = lazy(() => import('./pages/merchant/ApiDocs'));
+const Upgrade           = lazy(() => import('./pages/merchant/Upgrade'));
 
 const PageFallback = () => (
   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--bg)' }}>
@@ -75,6 +77,7 @@ function AppRoutes() {
 
           {/* Admin */}
           <Route path="/admin/dashboard"    element={<RequireAuth role="admin"><Layout><AdminDashboard    key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/admin/api-docs"     element={<RequireAuth role="admin"><Layout><AdminApiDocs      key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/merchants"    element={<RequireAuth role="admin"><Layout><Merchants         key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/plan-configs" element={<RequireAuth role="admin"><Layout><PlanConfigs       key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/messages"     element={<RequireAuth role="admin"><Layout><AdminMessages     key={pageKey} /></Layout></RequireAuth>} />
@@ -89,6 +92,7 @@ function AppRoutes() {
           <Route path="/blacklist"   element={<RequireAuth role="merchant"><Layout><Blacklist          key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/agents"      element={<RequireAuth role="merchant"><Layout><Agents             key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/api-docs"    element={<RequireAuth role="merchant"><Layout><ApiDocs            key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/upgrade"     element={<RequireAuth role="merchant"><Layout><Upgrade            key={pageKey} /></Layout></RequireAuth>} />
 
           {/* Default */}
           <Route path="/"  element={<Navigate to={role === 'admin' ? '/admin/dashboard' : role === 'merchant' ? '/dashboard' : '/login'} replace />} />

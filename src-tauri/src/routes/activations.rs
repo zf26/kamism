@@ -28,7 +28,6 @@ pub struct ActivationWithCode {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub struct ActivationQuery {
     pub card_code: Option<String>,
     pub page: Option<i64>,
@@ -42,92 +41,65 @@ pub fn activations_router(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
+fn merchant_id_from_claims(claims: &Claims) -> Result<Uuid, Json<Value>> {
+    Uuid::parse_str(&claims.sub)
+        .map_err(|_| Json(json!({"success": false, "message": "无效用户ID"})))
+}
+
 async fn list_activations(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<ActivationQuery>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match merchant_id_from_claims(&claims) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
     let card_code_filter = q.card_code.as_deref().unwrap_or("").trim().to_lowercase();
-    let has_filter = !card_code_filter.is_empty();
 
-    // 查询激活记录（包含加密的code和device_id）
-    let raw_activations: Vec<(Uuid, Uuid, String, Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)> = if claims.role == "admin" {
-        sqlx::query_as(
-            r#"SELECT a.id, a.card_id, c.code_encrypted, a.app_id, a.device_id_encrypted,
-                      a.device_name, a.ip_address, a.activated_at, a.last_verified_at
-               FROM activations a
-               JOIN cards c ON c.id = a.card_id
-               ORDER BY a.activated_at DESC LIMIT $1 OFFSET $2"#,
-        )
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default()
-    } else {
-        sqlx::query_as(
-            r#"SELECT a.id, a.card_id, c.code_encrypted, a.app_id, a.device_id_encrypted,
-                      a.device_name, a.ip_address, a.activated_at, a.last_verified_at
-               FROM activations a
-               JOIN cards c ON c.id = a.card_id
-               WHERE c.merchant_id = $1
-               ORDER BY a.activated_at DESC
-               LIMIT $2 OFFSET $3"#,
-        )
-        .bind(merchant_id)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default()
-    };
+    let raw_activations: Vec<(Uuid, Uuid, String, Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        r#"SELECT a.id, a.card_id, c.code_encrypted, a.app_id, a.device_id_encrypted,
+                  a.device_name, a.ip_address, a.activated_at, a.last_verified_at
+           FROM activations a
+           JOIN cards c ON c.id = a.card_id
+           WHERE c.merchant_id = $1
+           ORDER BY a.activated_at DESC
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(merchant_id)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
 
-    // 解密所有记录
     let mut activations = Vec::new();
     for (id, card_id, encrypted_code, app_id, encrypted_device_id, device_name, ip_address, activated_at, last_verified_at) in raw_activations {
         let card_code = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &encrypted_code)
             .unwrap_or_else(|_| "[解密失败]".to_string());
-        
         let device_id = EncryptedFieldsOps::decrypt_device_id(&state.encryptor, &encrypted_device_id)
             .unwrap_or_else(|_| "[解密失败]".to_string());
 
-        // 如果有过滤条件，检查是否匹配
-        if has_filter && !card_code.to_lowercase().contains(&card_code_filter) {
+        if !card_code_filter.is_empty() && !card_code.to_lowercase().contains(&card_code_filter) {
             continue;
         }
 
         activations.push(ActivationWithCode {
-            id,
-            card_id,
-            card_code,
-            app_id,
-            device_id,
-            device_name,
-            ip_address,
-            activated_at,
-            last_verified_at,
+            id, card_id, card_code, app_id, device_id,
+            device_name, ip_address, activated_at, last_verified_at,
         });
     }
 
-    // 计算总数
-    let total: (i64,) = if claims.role == "admin" {
-        sqlx::query_as("SELECT COUNT(*) FROM activations")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or((0,))
-    } else {
-        sqlx::query_as(
-            "SELECT COUNT(*) FROM activations a JOIN cards c ON c.id = a.card_id WHERE c.merchant_id = $1",
-        )
-        .bind(merchant_id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or((0,))
-    };
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM activations a JOIN cards c ON c.id = a.card_id WHERE c.merchant_id = $1",
+    )
+    .bind(merchant_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((0,));
 
     Json(json!({
         "success": true,
@@ -139,26 +111,25 @@ async fn list_activations(
 }
 
 #[derive(sqlx::FromRow)]
-struct ActivationCardId {
-    card_id: Uuid,
-}
+struct ActivationCardId { card_id: Uuid }
 
 async fn unbind_device(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match merchant_id_from_claims(&claims) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
 
-    // 解绑设备后，检查该卡密是否还有其他激活记录，若无则恢复为 unused
     let activation: Option<ActivationCardId> = sqlx::query_as(
         r#"SELECT a.card_id FROM activations a
            JOIN cards c ON c.id = a.card_id
-           WHERE a.id = $1 AND (c.merchant_id = $2 OR $3 = 'admin')"#,
+           WHERE a.id = $1 AND c.merchant_id = $2"#,
     )
     .bind(id)
     .bind(merchant_id)
-    .bind(&claims.role)
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
@@ -173,7 +144,6 @@ async fn unbind_device(
         .execute(&state.pool)
         .await;
 
-    // 检查该卡密剩余激活数
     let remaining: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM activations WHERE card_id = $1")
             .bind(activation.card_id)
@@ -192,4 +162,3 @@ async fn unbind_device(
 
     Json(json!({"success": true, "message": "设备已解绑"}))
 }
-

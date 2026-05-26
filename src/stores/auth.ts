@@ -18,6 +18,7 @@ interface AuthState {
   role: 'admin' | 'merchant' | null;
   user: User | null;
   setAuth: (token: string, refreshToken: string, role: 'admin' | 'merchant', user: User) => void;
+  updateUser: (user: Partial<User>) => void;
   updateToken: (token: string, refreshToken: string) => void;
   logout: () => void;
   isAuthenticated: () => boolean;
@@ -42,6 +43,13 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     localStorage.setItem('role', role);
     localStorage.setItem('user', JSON.stringify(user));
     set({ token, refreshToken, role, user });
+  },
+
+  updateUser: (user: Partial<User>) => {
+    const existing = get().user;
+    const merged: User = existing ? { ...existing, ...user } : user as User;
+    localStorage.setItem('user', JSON.stringify(merged));
+    set({ user: merged });
   },
 
   updateToken: (token, refreshToken) => {

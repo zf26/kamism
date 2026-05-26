@@ -2,13 +2,13 @@ use crate::{
     db::encrypted_fields::EncryptedFieldsOps,
     middleware::auth::{admin_only, auth_middleware, AppState},
     models::merchant::MerchantPublic,
-    utils::mq,
+    utils::{card_gen::generate_api_key, mq, jwt::Claims},
 };
 use axum::{
     extract::{Path, Query, State},
     middleware,
-    routing::{get, patch},
-    Json, Router,
+    routing::{delete, get, patch, post},
+    Extension, Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,10 +24,14 @@ pub struct MerchantQuery {
 
 pub fn admin_router_with_state(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/admin/merchants", get(list_merchants))
+        .route("/admin/merchants", get(list_merchants).post(create_merchant))
+        .route("/admin/merchants/:id", delete(delete_merchant))
         .route("/admin/merchants/:id/status", patch(update_merchant_status))
         .route("/admin/merchants/:id/plan", patch(update_merchant_plan))
         .route("/admin/stats", get(get_stats))
+        // 管理员商户功能：API Key 管理
+        .route("/admin/api-key", get(get_admin_api_key))
+        .route("/admin/api-key/regenerate", post(regenerate_admin_api_key))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
@@ -105,6 +109,148 @@ async fn list_merchants(
         "page": page,
         "page_size": page_size
     }))
+}
+
+#[derive(Deserialize)]
+pub struct CreateMerchantRequest {
+    pub username: String,
+    pub email: String,
+    pub password: String,
+}
+
+async fn create_merchant(
+    State(state): State<AppState>,
+    Json(body): Json<CreateMerchantRequest>,
+) -> Json<Value> {
+    if body.username.trim().is_empty() {
+        return Json(json!({"success": false, "message": "用户名不能为空"}));
+    }
+    if body.email.trim().is_empty() || !body.email.contains('@') {
+        return Json(json!({"success": false, "message": "邮箱格式不正确"}));
+    }
+    if body.password.len() < 6 {
+        return Json(json!({"success": false, "message": "密码至少 6 位"}));
+    }
+
+    // 查重
+    let exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id::text FROM merchants WHERE username = $1",
+    )
+    .bind(&body.username)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    if exists.is_some() {
+        return Json(json!({"success": false, "message": "用户名已存在"}));
+    }
+    let exists_email: Option<(String,)> = sqlx::query_as(
+        "SELECT id::text FROM merchants WHERE email_encrypted = $1",
+    )
+    .bind(&body.email) // 邮件加密前可先模糊匹配
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    if exists_email.is_some() {
+        return Json(json!({"success": false, "message": "邮箱已被使用"}));
+    }
+
+    let password_hash = match bcrypt::hash(&body.password, bcrypt::DEFAULT_COST) {
+        Ok(h) => h,
+        Err(_) => return Json(json!({"success": false, "message": "密码加密失败"})),
+    };
+
+    let merchant_id = Uuid::new_v4();
+
+    // 加密并哈希敏感字段
+    let email_key = format!("merchant_email_{}", merchant_id);
+    let api_key_key = format!("merchant_apikey_{}", merchant_id);
+
+    let encrypted_email = match state.encryptor.encrypt(&body.email, &email_key) {
+        Ok(v) => v,
+        Err(_) => return Json(json!({"success": false, "message": "加密邮箱失败"})),
+    };
+    let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
+
+    let raw_api_key = generate_api_key();
+    let encrypted_api_key = match state.encryptor.encrypt(&raw_api_key, &api_key_key) {
+        Ok(v) => v,
+        Err(_) => return Json(json!({"success": false, "message": "生成 API Key 失败"})),
+    };
+    let api_key_hash = EncryptedFieldsOps::generate_hash(&raw_api_key);
+
+    let result = sqlx::query(
+        "INSERT INTO merchants
+           (id, username, email_encrypted, email_hash, password_hash,
+            api_key_encrypted, api_key_hash, email_verified, created_by_admin)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, TRUE)",
+    )
+    .bind(merchant_id)
+    .bind(&body.username)
+    .bind(&encrypted_email)
+    .bind(&email_hash)
+    .bind(&password_hash)
+    .bind(&encrypted_api_key)
+    .bind(&api_key_hash)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(_) => {
+            Json(json!({
+                "success": true,
+                "message": "商户创建成功",
+                "data": {
+                    "id": merchant_id.to_string(),
+                    "username": body.username,
+                    "email": body.email,
+                    "api_key": raw_api_key,
+                }
+            }))
+        }
+        Err(e) => Json(json!({"success": false, "message": format!("创建失败: {}", e)})),
+    }
+}
+
+async fn delete_merchant(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Json<Value> {
+    // 仅允许删除管理员创建的商户
+    let target: Option<(bool,)> = sqlx::query_as(
+        "SELECT created_by_admin FROM merchants WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let target = match target {
+        Some(r) => r,
+        None => return Json(json!({"success": false, "message": "商户不存在"})),
+    };
+
+    if !target.0 {
+        return Json(json!({
+            "success": false,
+            "message": "该商户由用户自助注册，不允许删除。如需禁用请使用禁用功能。"
+        }));
+    }
+
+    // apps、cards、activations、messages 等关联表均有 ON DELETE CASCADE
+    // 只需删除商户主记录即可，其余自动级联清理
+    let result = sqlx::query("DELETE FROM merchants WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!("管理员删除了商户 {}", id);
+            Json(json!({"success": true, "message": "商户已删除，相关应用和卡密数据已一并清理"}))
+        }
+        Ok(_) => Json(json!({"success": false, "message": "删除失败"})),
+        Err(e) => Json(json!({"success": false, "message": format!("删除失败: {}", e)})),
+    }
 }
 
 async fn update_merchant_status(
@@ -247,4 +393,52 @@ async fn get_stats(State(state): State<AppState>) -> Json<Value> {
             "total_apps": app_count.0
         }
     }))
+}
+
+/// 获取当前管理员的 API Key
+async fn get_admin_api_key(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<Value> {
+    let admin_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效用户ID"})),
+    };
+
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT api_key FROM admins WHERE id = $1",
+    )
+    .bind(admin_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let api_key = row.and_then(|(k,)| k).unwrap_or_default();
+    Json(json!({"success": true, "data": { "api_key": api_key }}))
+}
+
+/// 重新生成管理员 API Key
+async fn regenerate_admin_api_key(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Json<Value> {
+    let admin_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效用户ID"})),
+    };
+
+    let new_key = generate_api_key();
+    let result = sqlx::query("UPDATE admins SET api_key = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&new_key)
+        .bind(admin_id)
+        .execute(&state.pool)
+        .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            Json(json!({"success": true, "message": "API Key 已重新生成", "data": { "api_key": new_key }}))
+        }
+        Ok(_) => Json(json!({"success": false, "message": "管理员不存在"})),
+        Err(e) => Json(json!({"success": false, "message": format!("生成失败: {}", e)})),
+    }
 }

@@ -3,6 +3,7 @@ pub mod middleware;
 pub mod models;
 pub mod routes;
 pub mod utils;
+use std::io::Write;
 mod workers;
 
 use dotenvy::dotenv;
@@ -40,6 +41,20 @@ pub fn run() {
 /// 独立服务器入口（供 server/ crate 调用）
 pub async fn start_server() -> anyhow::Result<()> {
     let _ = dotenv();
+
+    // 捕获所有 panic，打印到 stderr 确保能看到
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let _ = writeln!(std::io::stderr(), "[PANIC] {} at {}", msg, location);
+        let _ = std::io::stderr().flush();
+    }));
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -157,13 +172,13 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::webhooks::webhooks_router(state.clone()))
         .merge(routes::blacklist::blacklist_router(state.clone()))
         .merge(routes::agent::agent_router(state.clone()))
+        .merge(routes::payments::payments_router(state.clone()))
         .layer(axum_middleware::from_fn(middleware::security::security_headers))
         // 响应压缩：gzip / brotli，自动根据客户端 Accept-Encoding 协商
         // 对 JSON 响应压缩率通常 60-80%，显著降低带宽占用和客户端解析时间
         .layer(CompressionLayer::new())
-        // 请求体大小限制：防止超大 payload 耗尽内存/带宽（DoS 防护）
-        // 大多数 API 请求远不需要 2MB，批量生成卡密最大约 ~4KB
-        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)) // 2MB
+        // 请求体大小限制：保护上传最大 ~100MB，通用 API 2MB
+        .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024)) // 100MB
         .layer(cors)
         .with_state(state);
 

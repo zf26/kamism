@@ -11,4 +11,5 @@ pub mod webhooks;
 pub mod health;
 pub mod blacklist;
 pub mod agent;
+pub mod payments;
 
