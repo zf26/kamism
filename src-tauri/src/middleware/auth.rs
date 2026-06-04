@@ -1,3 +1,4 @@
+use crate::models::oauth_config::OAuthConfig;
 use crate::utils::jwt::{verify_token, Claims};
 use crate::utils::kms::Encryptor;
 use crate::utils::mailer::MailerConfig;
@@ -12,6 +13,11 @@ use axum::{
 use lapin::Channel;
 use redis::aio::ConnectionManager;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+pub type OAuthConfigCache = Arc<RwLock<HashMap<String, OAuthConfig>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,6 +28,46 @@ pub struct AppState {
     pub mq_channel: std::sync::Arc<Channel>,
     pub encryptor: std::sync::Arc<Encryptor>,
     pub ws_registry: WsRegistry,
+    pub oauth_config_cache: OAuthConfigCache,
+    pub app_url: String,
+}
+
+impl AppState {
+    pub async fn get_oauth_config(&self, provider: &str) -> Option<OAuthConfig> {
+        // 先从缓存读取
+        {
+            let cache = self.oauth_config_cache.read().await;
+            if let Some(config) = cache.get(provider) {
+                return Some(config.clone());
+            }
+        }
+
+        // 缓存未命中，从数据库加载
+        let config: Option<OAuthConfig> = sqlx::query_as(
+            "SELECT * FROM oauth_configs WHERE provider = $1 AND enabled = TRUE"
+        )
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(ref c) = config {
+            let mut cache = self.oauth_config_cache.write().await;
+            cache.insert(provider.to_string(), c.clone());
+        }
+
+        config
+    }
+
+    pub async fn invalidate_oauth_cache(&self, provider: Option<&str>) {
+        let mut cache = self.oauth_config_cache.write().await;
+        if let Some(p) = provider {
+            cache.remove(p);
+        } else {
+            cache.clear();
+        }
+    }
 }
 
 pub async fn auth_middleware(
