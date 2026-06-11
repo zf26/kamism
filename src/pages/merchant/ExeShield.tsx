@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from 'react';
 import { exeShieldApi, appsApi } from '../../lib/api';
 import { useAuthStore } from '../../stores/auth';
-import { Upload, RefreshCw, Download, Clock, CheckCircle2, XCircle, Loader2, Package, Monitor, Heart, Copy } from 'lucide-react';
+import { Upload, RefreshCw, Download, Clock, CheckCircle2, XCircle, Loader2, Package, Monitor, Heart } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface App {
@@ -47,8 +47,8 @@ export default function ExeShield() {
   // 上传表单
   const [selectedAppId, setSelectedAppId] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [windowTitle, setWindowTitle] = useState('');
-  const [windowHint, setWindowHint] = useState('');
+  const [windowTitle] = useState('');
+  const [windowHint] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 加载应用列表（用于下拉选择）

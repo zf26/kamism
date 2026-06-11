@@ -74,7 +74,7 @@ function AlipayForm({
   saving: boolean;
   onSave: () => void;
 }) {
-  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) =>
+  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
     setForm({ ...form, [k]: e.target.value });
 
   return (
@@ -144,7 +144,7 @@ function XorPayForm({
   saving: boolean;
   onSave: () => void;
 }) {
-  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) =>
+  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
     setForm({ ...form, [k]: e.target.value });
 
   return (
@@ -185,7 +185,7 @@ function MbdPayForm({
   saving: boolean;
   onSave: () => void;
 }) {
-  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) =>
+  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
     setForm({ ...form, [k]: e.target.value });
 
   return (
