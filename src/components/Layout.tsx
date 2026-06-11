@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard, KeyRound, Wallet, Monitor
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -22,6 +22,8 @@ const adminPlatformNav: NavItem[] = [
   { label: '总览', path: '/admin/dashboard', icon: <LayoutDashboard size={16} /> },
   { label: '商户管理', path: '/admin/merchants', icon: <Users size={16} /> },
   { label: '套餐配置', path: '/admin/plan-configs', icon: <Settings size={16} /> },
+  { label: 'OAuth2 配置', path: '/admin/oauth', icon: <KeyRound size={16} /> },
+  { label: '支付配置', path: '/admin/payment', icon: <Wallet size={16} /> },
   { label: '消息管理', path: '/admin/messages', icon: <Megaphone size={16} /> },
 ];
 
@@ -35,6 +37,8 @@ const merchantNav: NavItem[] = [
   { label: '风控管理', path: '/blacklist', icon: <ShieldAlert size={16} /> },
   { label: '代理管理', path: '/agents',    icon: <Network size={16} /> },
   { label: 'API 文档',  path: '/api-docs',  icon: <BookOpen size={16} /> },
+  { label: 'APK 加固', path: '/apk-shield', icon: <Shield size={16} /> },
+  { label: 'EXE 加固', path: '/exe-shield', icon: <Monitor size={16} /> },
   { label: '账号设置', path: '/settings', icon: <Settings size={16} /> },
 ];
 

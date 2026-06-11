@@ -9,8 +9,13 @@ pub struct Merchant {
     pub password_hash: String,
     #[sqlx(rename = "api_key_encrypted")]
     pub api_key: String,
+    pub api_key_hash: String,
     #[sqlx(rename = "email_encrypted")]
     pub email: String,
+    pub email_hash: String,
+    pub github_id: Option<String>,
+    pub google_id: Option<String>,
+    pub microsoft_id: Option<String>,
     pub status: String,
     pub plan: String,
     pub plan_expires_at: Option<DateTime<Utc>>,

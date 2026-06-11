@@ -260,13 +260,18 @@ async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Json<Value> {
     // 先查管理员表
-    let admin: Option<crate::models::admin::Admin> =
+    let admin_result: Result<Option<crate::models::admin::Admin>, _> =
         sqlx::query_as("SELECT * FROM admins WHERE email = $1")
             .bind(&body.email)
             .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-
+            .await;
+    let admin = match admin_result {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::error!("查询 admins 表失败: {}", e);
+            return Json(json!({"success": false, "message": format!("服务器内部错误: {}", e)}));
+        }
+    };
     if let Some(admin) = admin {
         let valid = verify(&body.password, &admin.password_hash).unwrap_or(false);
         if !valid {
@@ -280,16 +285,6 @@ async fn login(
             Ok(t) => t,
             Err(_) => return Json(json!({"success": false, "message": "生成令牌失败"})),
         };
-        // 获取管理员的 API Key（如果没有则自动生成）
-        let mut api_key = admin.api_key.unwrap_or_default();
-        if api_key.is_empty() {
-            api_key = generate_api_key();
-            let _ = sqlx::query("UPDATE admins SET api_key = $1, updated_at = NOW() WHERE id = $2")
-                .bind(&api_key)
-                .bind(admin.id)
-                .execute(&state.pool)
-                .await;
-        }
         return Json(json!({
             "success": true,
             "token": token,
@@ -299,19 +294,25 @@ async fn login(
                 "id": admin.id,
                 "username": admin.username,
                 "email": admin.email,
-                "api_key": api_key
             }
         }));
     }
 
     // 再查商户表（使用哈希索引查询）
     let email_hash = EncryptedFieldsOps::generate_hash(&body.email);
-    let merchant: Option<Merchant> =
+    let merchant_result: Result<Option<Merchant>, _> =
         sqlx::query_as("SELECT * FROM merchants WHERE email_hash = $1")
             .bind(&email_hash)
             .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
+            .await;
+    let merchant = match merchant_result {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::error!("查询 merchants 表失败: {}", e);
+            return Json(json!({"success": false, "message": format!("服务器内部错误: {}", e)}));
+        }
+    };
+    tracing::info!("查询 merchants 表结果: email_hash={:?}, result={:?}", email_hash, merchant);
 
     let merchant = match merchant {
         Some(m) => m,

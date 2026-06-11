@@ -74,6 +74,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       PORT: 9527
       ADMIN_EMAIL: ${ADMIN_EMAIL}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:1420}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       MASTER_KEY: ${MASTER_KEY}
       SMTP_HOST: ${SMTP_HOST:-}

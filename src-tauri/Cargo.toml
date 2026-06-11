@@ -68,12 +68,17 @@ futures-lite = "2"
 # 加密
 aes-gcm = "0.10"
 hex = "0.4"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 hmac = "0.12"
 base64 = "0.22"
 
-# HTTP 客户端（Webhook 推送）
+# HTTP 客户端（Webhook 推送、OAuth）
 reqwest = { version = "0.12", features = ["json"] }
+
 # 支付签名
 md5 = "0.7"
 bytes = "1"
+# 支付宝 RSA2 签名
+rsa = { version = "0.8", features = ["pem"] }
+pkcs8 = { version = "0.7", features = ["pem"] }
+urlencoding = "2"

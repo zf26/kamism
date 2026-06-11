@@ -1,10 +1,19 @@
 import axios, { type InternalAxiosRequestConfig } from 'axios';
+import type { AxiosInstance } from 'axios';
 
 // API 地址从环境变量读取
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9527';
-export const api = axios.create({
+const api = axios.create({
   baseURL: BASE_URL,
   timeout: 15000,
+});
+export { api };
+
+// APK 加固服务（独立 base URL）
+const SHIELD_URL = import.meta.env.VITE_SHIELD_URL || 'http://localhost:9529';
+const shieldApi: AxiosInstance = axios.create({
+  baseURL: SHIELD_URL,
+  timeout: 600_000, // 10min，超大 APK 上传需要更长时间
 });
 
 // ── 请求去重：防止相同 GET 请求并发重复发送（例如切换页面时的竞态）──────────
@@ -343,4 +352,62 @@ export const paymentsApi = {
     api.get('/pay/auth/orders', { params }),
   getStatus: (orderId: string) =>
     api.get('/pay/auth/status', { params: { order_id: orderId } }),
+};
+
+// ─── APK Shield ─────────────────────────────────────────
+export const apkShieldApi = {
+  upload: (file: File, appId: string, merchantId: string, apiKey: string, appName?: string) => {
+    const form = new FormData();
+    form.append('apk', file);
+    return shieldApi.post('/upload', form, {
+      params: {
+        app_id: appId,
+        merchant_id: merchantId,
+        api_key: apiKey,
+        ...(appName && { app_name: appName }),
+      },
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
+  health: () =>
+    shieldApi.get('/health'),
+  list: (merchantId: string, page = 1, pageSize = 20) =>
+    shieldApi.get('/jobs', { params: { merchant_id: merchantId, page, page_size: pageSize } }),
+  status: (jobId: string) =>
+    shieldApi.get(`/status/${jobId}`),
+  download: (jobId: string) =>
+    shieldApi.get(`/download/${jobId}`, { responseType: 'blob' }),
+};
+
+// ─── EXE Shield ─────────────────────────────────────────
+export const exeShieldApi = {
+  upload: (file: File, appId: string, merchantId: string, apiKey: string, appName?: string, windowTitle?: string, windowHint?: string) => {
+    return shieldApi.post('/exe/upload', file, {
+      params: {
+        app_id: appId,
+        merchant_id: merchantId,
+        api_key: apiKey,
+        ...(appName && { app_name: appName }),
+        ...(windowTitle && { window_title: windowTitle }),
+        ...(windowHint && { window_hint: windowHint }),
+      },
+      headers: { 'Content-Type': 'application/octet-stream' },
+    });
+  },
+  health: () =>
+    shieldApi.get('/exe/health'),
+  list: (merchantId: string, page = 1, pageSize = 20) =>
+    shieldApi.get('/exe/jobs', { params: { merchant_id: merchantId, page, page_size: pageSize } }),
+  status: (jobId: string) =>
+    shieldApi.get(`/exe/status/${jobId}`),
+  download: (jobId: string) =>
+    shieldApi.get(`/exe/download/${jobId}`, { responseType: 'blob' }),
+};
+
+// ─── OAuth ───────────────────────────────────────────────
+export const oauthApi = {
+  // 获取已启用的 OAuth 提供商列表
+  listProviders: () => api.get('/oauth/providers'),
+  // 发起 OAuth 授权
+  authorize: (provider: string) => api.get(`/oauth/${provider}/authorize`),
 };

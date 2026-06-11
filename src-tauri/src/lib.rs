@@ -100,6 +100,10 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     init_admin(&pool).await;
     let ws_registry = crate::utils::ws::WsRegistry::new();
+    let oauth_config_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let payment_config_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let app_url = env::var("VITE_API_URL")
+        .unwrap_or_else(|_| "http://localhost:9527".to_string());
     let state = AppState {
         pool: pool.clone(),
         jwt_secret: jwt_secret.clone(),
@@ -108,6 +112,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         mq_channel: mq_channel.clone(),
         encryptor: encryptor.clone(),
         ws_registry: ws_registry.clone(),
+        oauth_config_cache,
+        payment_config_cache,
+        app_url,
     };
 
     // 启动降级消费者（独立 task，传入独立 Redis 连接）
@@ -173,6 +180,9 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::blacklist::blacklist_router(state.clone()))
         .merge(routes::agent::agent_router(state.clone()))
         .merge(routes::payments::payments_router(state.clone()))
+        .merge(routes::oauth::oauth_router(state.clone()))
+        .merge(routes::oauth_admin::oauth_admin_router(state.clone()))
+        .merge(routes::payment_admin::payment_admin_router(state.clone()))
         .layer(axum_middleware::from_fn(middleware::security::security_headers))
         // 响应压缩：gzip / brotli，自动根据客户端 Accept-Encoding 协商
         // 对 JSON 响应压缩率通常 60-80%，显著降低带宽占用和客户端解析时间

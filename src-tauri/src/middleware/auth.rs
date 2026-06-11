@@ -1,4 +1,5 @@
 use crate::models::oauth_config::OAuthConfig;
+use crate::models::payment_config::PaymentConfig;
 use crate::utils::jwt::{verify_token, Claims};
 use crate::utils::kms::Encryptor;
 use crate::utils::mailer::MailerConfig;
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub type OAuthConfigCache = Arc<RwLock<HashMap<String, OAuthConfig>>>;
+pub type PaymentConfigCache = Arc<RwLock<HashMap<String, PaymentConfig>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +31,7 @@ pub struct AppState {
     pub encryptor: std::sync::Arc<Encryptor>,
     pub ws_registry: WsRegistry,
     pub oauth_config_cache: OAuthConfigCache,
+    pub payment_config_cache: PaymentConfigCache,
     pub app_url: String,
 }
 
@@ -64,6 +67,65 @@ impl AppState {
         let mut cache = self.oauth_config_cache.write().await;
         if let Some(p) = provider {
             cache.remove(p);
+        } else {
+            cache.clear();
+        }
+    }
+
+    pub async fn get_payment_config(&self, channel: &str) -> Option<PaymentConfig> {
+        {
+            let cache = self.payment_config_cache.read().await;
+            if let Some(config) = cache.get(channel) {
+                return Some(config.clone());
+            }
+        }
+
+        let config: Option<PaymentConfig> = sqlx::query_as(
+            "SELECT * FROM payment_configs WHERE channel = $1 AND enabled = TRUE",
+        )
+        .bind(channel)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(ref c) = config {
+            let mut cache = self.payment_config_cache.write().await;
+            cache.insert(channel.to_string(), c.clone());
+        }
+
+        config
+    }
+
+    pub async fn get_payment_config_any(&self, channel: &str) -> Option<PaymentConfig> {
+        {
+            let cache = self.payment_config_cache.read().await;
+            if let Some(config) = cache.get(channel) {
+                return Some(config.clone());
+            }
+        }
+
+        let config: Option<PaymentConfig> = sqlx::query_as(
+            "SELECT * FROM payment_configs WHERE channel = $1",
+        )
+        .bind(channel)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(ref c) = config {
+            let mut cache = self.payment_config_cache.write().await;
+            cache.insert(channel.to_string(), c.clone());
+        }
+
+        config
+    }
+
+    pub async fn invalidate_payment_cache(&self, channel: Option<&str>) {
+        let mut cache = self.payment_config_cache.write().await;
+        if let Some(c) = channel {
+            cache.remove(c);
         } else {
             cache.clear();
         }

@@ -8,6 +8,7 @@ import ConfirmDialog from './components/ConfirmDialog';
 import Login from './pages/auth/Login';
 import Register from './pages/auth/Register';
 import ResetPassword from './pages/auth/ResetPassword';
+import OAuthCallback from './pages/auth/OAuthCallback';
 
 // 立即同步主题，避免首屏闪烁
 applyStoredTheme();
@@ -18,6 +19,8 @@ const AdminApiDocs      = lazy(() => import('./pages/admin/ApiDocs'));
 const Merchants         = lazy(() => import('./pages/admin/Merchants'));
 const PlanConfigs       = lazy(() => import('./pages/admin/PlanConfigs'));
 const AdminMessages     = lazy(() => import('./pages/admin/Messages'));
+const OAuthSettings     = lazy(() => import('./pages/admin/OAuthSettings'));
+const PaymentSettings   = lazy(() => import('./pages/admin/PaymentSettings'));
 const MerchantDashboard = lazy(() => import('./pages/merchant/Dashboard'));
 const Apps              = lazy(() => import('./pages/merchant/Apps'));
 const Cards             = lazy(() => import('./pages/merchant/Cards'));
@@ -28,6 +31,8 @@ const Blacklist         = lazy(() => import('./pages/merchant/Blacklist'));
 const Agents            = lazy(() => import('./pages/merchant/Agents'));
 const ApiDocs           = lazy(() => import('./pages/merchant/ApiDocs'));
 const Upgrade           = lazy(() => import('./pages/merchant/Upgrade'));
+const ApkShield         = lazy(() => import('./pages/merchant/ApkShield'));
+const ExeShield         = lazy(() => import('./pages/merchant/ExeShield'));
 
 const PageFallback = () => (
   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--bg)' }}>
@@ -74,6 +79,7 @@ function AppRoutes() {
           <Route path="/login"          element={<Login />} />
           <Route path="/register"       element={<Register />} />
           <Route path="/reset-password" element={<ResetPassword />} />
+          <Route path="/oauth/callback" element={<OAuthCallback />} />
 
           {/* Admin */}
           <Route path="/admin/dashboard"    element={<RequireAuth role="admin"><Layout><AdminDashboard    key={pageKey} /></Layout></RequireAuth>} />
@@ -81,6 +87,8 @@ function AppRoutes() {
           <Route path="/admin/merchants"    element={<RequireAuth role="admin"><Layout><Merchants         key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/plan-configs" element={<RequireAuth role="admin"><Layout><PlanConfigs       key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/messages"     element={<RequireAuth role="admin"><Layout><AdminMessages     key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/admin/oauth"        element={<RequireAuth role="admin"><Layout><OAuthSettings     key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/admin/payment"       element={<RequireAuth role="admin"><Layout><PaymentSettings   key={pageKey} /></Layout></RequireAuth>} />
 
           {/* Merchant */}
           <Route path="/dashboard"   element={<RequireAuth role="merchant"><Layout><MerchantDashboard key={pageKey} /></Layout></RequireAuth>} />
@@ -93,6 +101,8 @@ function AppRoutes() {
           <Route path="/agents"      element={<RequireAuth role="merchant"><Layout><Agents             key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/api-docs"    element={<RequireAuth role="merchant"><Layout><ApiDocs            key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/upgrade"     element={<RequireAuth role="merchant"><Layout><Upgrade            key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/apk-shield" element={<RequireAuth role="merchant"><Layout><ApkShield          key={pageKey} /></Layout></RequireAuth>} />
+          <Route path="/exe-shield" element={<RequireAuth role="merchant"><Layout><ExeShield          key={pageKey} /></Layout></RequireAuth>} />
 
           {/* Default */}
           <Route path="/"  element={<Navigate to={role === 'admin' ? '/admin/dashboard' : role === 'merchant' ? '/dashboard' : '/login'} replace />} />

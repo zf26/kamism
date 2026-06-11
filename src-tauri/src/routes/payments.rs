@@ -1,15 +1,23 @@
 use crate::middleware::auth::{auth_middleware, AppState};
 use crate::utils::jwt::Claims;
+use crate::models::payment_config::PaymentConfig;
 use axum::{
     extract::{Query, State},
     middleware,
     routing::{get, post},
     Extension, Json, Router,
 };
+use base64::Engine;
 use md5;
+use rsa::{
+    pkcs1v15::{SigningKey, VerifyingKey},
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+    signature::{RandomizedSigner, SignatureEncoding, Verifier},
+    RsaPrivateKey, RsaPublicKey,
+};
+use sha2::Sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::env;
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24,12 +32,12 @@ pub struct XorPayConfig {
 }
 
 impl XorPayConfig {
-    pub fn from_env() -> Self {
+    pub fn from_db(cfg: &PaymentConfig) -> Self {
         Self {
-            aid: env::var("XORPAY_AID").unwrap_or_default(),
-            app_key: env::var("XORPAY_APP_KEY").unwrap_or_default(),
-            notify_url: env::var("XORPAY_NOTIFY_URL")
-                .unwrap_or_else(|_| "http://localhost:9527/pay/notify".to_string()),
+            aid: cfg.xorpay_aid.clone().unwrap_or_default(),
+            app_key: cfg.xorpay_app_key.clone().unwrap_or_default(),
+            notify_url: cfg.xorpay_notify_url.clone()
+                .unwrap_or_else(|| "http://localhost:9527/pay/notify".to_string()),
         }
     }
 
@@ -41,7 +49,13 @@ impl XorPayConfig {
         format!("{:x}", md5::compute(data.as_bytes()))
     }
 
-    pub fn verify_sign(&self, aoid: &str, order_id: &str, pay_price: &str, pay_time: &str) -> String {
+    pub fn verify_sign(
+        &self,
+        aoid: &str,
+        order_id: &str,
+        pay_price: &str,
+        pay_time: &str,
+    ) -> String {
         let data = format!(
             "{}{}{}{}{}",
             aoid, order_id, pay_price, pay_time, self.app_key
@@ -88,9 +102,13 @@ impl XorPayConfig {
             aoid: Option<String>,
         }
         #[derive(serde::Deserialize)]
-        struct XorPayQr { qr: String }
+        struct XorPayQr {
+            qr: String,
+        }
 
-        let xor_resp: XorPayResp = resp.json().await
+        let xor_resp: XorPayResp = resp
+            .json()
+            .await
             .map_err(|e| format!("XorPay 响应解析失败: {}", e))?;
 
         if xor_resp.status != "ok" {
@@ -113,6 +131,180 @@ pub struct XorPayCreateResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 支付宝电脑网站支付配置
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct AlipayConfig {
+    pub app_id: String,
+    pub app_private_key: String,
+    pub alipay_public_key: String,
+    pub notify_url: String,
+    pub gateway: String,
+    pub return_url: String,
+}
+
+impl AlipayConfig {
+    pub fn from_db(cfg: &PaymentConfig) -> Self {
+        Self {
+            app_id: cfg.alipay_app_id.clone().unwrap_or_default(),
+            app_private_key: cfg.alipay_private_key.clone().unwrap_or_default(),
+            alipay_public_key: cfg.alipay_public_key.clone().unwrap_or_default(),
+            notify_url: cfg.alipay_notify_url.clone()
+                .unwrap_or_else(|| "http://localhost:9527/pay/notify".to_string()),
+            gateway: cfg.alipay_gateway.clone()
+                .unwrap_or_else(|| "https://openapi.alipay.com/gateway.do".to_string()),
+            return_url: cfg.alipay_return_url.clone()
+                .unwrap_or_else(|| "http://localhost:1420/dashboard".to_string()),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.app_id.is_empty()
+            && !self.app_private_key.is_empty()
+            && !self.alipay_public_key.is_empty()
+    }
+
+    /// 自动拼接 PEM 格式，解析支付宝私钥
+    fn sign(&self, content: &str) -> Result<String, String> {
+        let trimmed = self.app_private_key.trim();
+        
+        // 自动拼接 PKCS8 格式头尾部
+        let full_private_key = if trimmed.starts_with("-----BEGIN") {
+            trimmed.to_string()
+        } else {
+            format!(
+                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+                trimmed
+            )
+        };
+        
+        tracing::info!("[sign] 私钥长度: {}, 前50字符: {}", full_private_key.len(), &full_private_key[..50.min(full_private_key.len())]);
+        tracing::info!("[sign] 私钥最后50字符: {}", &full_private_key[full_private_key.len().saturating_sub(50)..]);
+
+        let private_key = RsaPrivateKey::from_pkcs8_pem(&full_private_key)
+            .map_err(|e| format!("解析支付宝私钥失败: {}", e))?;
+
+        let signing_key = SigningKey::<Sha256>::new(private_key);
+        let signature = signing_key.sign_with_rng(&mut rand::thread_rng(), content.as_bytes());
+        let sig_bytes = signature.to_bytes();
+
+        Ok(base64::engine::general_purpose::STANDARD.encode(sig_bytes))
+    }
+
+    /// 验证签名（自动补全公钥格式）
+    pub fn verify_sign(&self, sign: &str, content: &str) -> bool {
+        let trimmed = self.alipay_public_key.trim();
+        
+        // 自动拼接公钥格式头尾部
+        let full_public_key = if trimmed.starts_with("-----BEGIN") {
+            trimmed.to_string()
+        } else {
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+                trimmed
+            )
+        };
+
+        let public_key: RsaPublicKey = match DecodePublicKey::from_public_key_pem(&full_public_key) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+
+        let decoded_sign = match base64::engine::general_purpose::STANDARD.decode(sign) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let signature = match rsa::pkcs1v15::Signature::try_from(decoded_sign.as_slice()) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(public_key);
+        verifying_key.verify(content.as_bytes(), &signature).is_ok()
+    }
+
+    /// 构建签名参数
+    fn build_signed_params(&self, mut params: Vec<(&str, String)>) -> Result<String, String> {
+        // 按字典序排列参数
+        params.sort_by(|a, b| a.0.cmp(b.0));
+
+        let content: String = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let sign = self.sign(&content)?;
+
+        // 重新拼接并添加签名
+        let signed_content: String = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        Ok(format!(
+            "{}&sign={}",
+            signed_content,
+            urlencoding::encode(&sign)
+        ))
+    }
+
+    /// 创建支付宝电脑网站支付订单
+    pub async fn create_order(
+        &self,
+        _client: &reqwest::Client,
+        order_id: &str,
+        subject: &str,
+        total_amount: &str,
+    ) -> Result<AlipayCreateResult, String> {
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let out_trade_no = order_id.to_string();
+
+        let params = vec![
+            ("app_id", self.app_id.clone()),
+            ("method", "alipay.trade.page.pay".to_string()),
+            ("charset", "utf-8".to_string()),
+            ("sign_type", "RSA2".to_string()),
+            ("timestamp", timestamp),
+            ("version", "1.0".to_string()),
+            ("notify_url", self.notify_url.clone()),
+            ("return_url", self.return_url.clone()),
+            (
+                "biz_content",
+                json!({
+                    "out_trade_no": out_trade_no,
+                    "product_code": "FAST_INSTANT_TRADE_PAY",
+                    "total_amount": total_amount,
+                    "subject": subject,
+                    "qr_pay_mode": "2"  // 电脑网站支付模式
+                })
+                .to_string(),
+            ),
+        ];
+
+        let signed_query = self.build_signed_params(params)?;
+
+        Ok(AlipayCreateResult {
+            pay_url: Some(format!("{}?{}", self.gateway, signed_query)),
+            pay_html: None,
+            expires_in: 7200,
+            charge_id: Some(order_id.to_string()),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct AlipayCreateResult {
+    pub pay_url: Option<String>,
+    pub pay_html: Option<String>,
+    pub expires_in: i32,
+    pub charge_id: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MbdPay 配置
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -124,23 +316,25 @@ pub struct MbdPayConfig {
 }
 
 impl MbdPayConfig {
-    pub fn from_env() -> Self {
+    pub fn from_db(cfg: &PaymentConfig) -> Self {
         Self {
-            app_id: env::var("MBD_APP_ID").unwrap_or_default(),
-            app_key: env::var("MBD_APP_KEY").unwrap_or_default(),
-            notify_url: env::var("MBD_NOTIFY_URL")
-                .unwrap_or_else(|_| "http://localhost:9527/pay/notify".to_string()),
+            app_id: cfg.mbdpay_app_id.clone().unwrap_or_default(),
+            app_key: cfg.mbdpay_app_key.clone().unwrap_or_default(),
+            notify_url: cfg.mbdpay_notify_url.clone()
+                .unwrap_or_else(|| "http://localhost:9527/pay/notify".to_string()),
         }
     }
 
     /// 面包多签名：key1=value1&key2=value2&...&key={app_key}，然后 MD5
     fn sign(&self, params: &[(String, String)]) -> String {
-        let mut sorted: Vec<_> = params.iter()
+        let mut sorted: Vec<_> = params
+            .iter()
             .filter(|(_, v)| !v.is_empty())
             .cloned()
             .collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let query = sorted.iter()
+        let query = sorted
+            .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
             .join("&");
@@ -170,7 +364,10 @@ impl MbdPayConfig {
         let sign = self.sign(&params);
 
         #[derive(serde::Deserialize)]
-        struct MbdWxResp { h5_url: Option<String>, error: Option<String> }
+        struct MbdWxResp {
+            h5_url: Option<String>,
+            error: Option<String>,
+        }
 
         let resp = client
             .post("https://newapi.mbd.pub/release/wx/prepay")
@@ -187,7 +384,9 @@ impl MbdPayConfig {
             .await
             .map_err(|e| format!("MbdPay 微信H5请求失败: {}", e))?;
 
-        let body: MbdWxResp = resp.json().await
+        let body: MbdWxResp = resp
+            .json()
+            .await
             .map_err(|e| format!("MbdPay 响应解析失败: {}", e))?;
 
         if let Some(err) = body.error {
@@ -240,7 +439,9 @@ impl MbdPayConfig {
             .await
             .map_err(|e| format!("MbdPay 支付宝请求失败: {}", e))?;
 
-        let body: MbdAliResp = resp.json().await
+        let body: MbdAliResp = resp
+            .json()
+            .await
             .map_err(|e| format!("MbdPay 响应解析失败: {}", e))?;
 
         if let Some(err) = body.error {
@@ -272,12 +473,20 @@ impl MbdPayConfig {
     }
 
     /// 验签 webhook，返回 (是否有效, order_id, 实付金额字符串)
-    pub fn verify_notify(&self, body: &serde_json::Value) -> Result<(bool, String, String), String> {
+    pub fn verify_notify(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<(bool, String, String), String> {
         let typ = body.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let data = body.get("data").and_then(|v| v.as_object())
+        let data = body
+            .get("data")
+            .and_then(|v| v.as_object())
             .ok_or("MbdPay webhook 缺少 data 字段")?;
 
-        let out_trade_no = data.get("out_trade_no").and_then(|v| v.as_str()).unwrap_or("");
+        let out_trade_no = data
+            .get("out_trade_no")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let amount = data.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
         let amount_str = format!("{:.2}", amount as f64 / 100.0);
         let sign = body.get("sign").and_then(|v| v.as_str()).unwrap_or("");
@@ -290,11 +499,15 @@ impl MbdPayConfig {
         ];
         let mut sorted = params.clone();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let query = sorted.iter()
+        let query = sorted
+            .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect::<Vec<_>>()
             .join("&");
-        let expected = format!("{:x}", md5::compute(format!("{}&key={}", query, self.app_key).as_bytes()));
+        let expected = format!(
+            "{:x}",
+            md5::compute(format!("{}&key={}", query, self.app_key).as_bytes())
+        );
 
         if !expected.eq_ignore_ascii_case(sign) {
             return Err("MbdPay 签名验证失败".to_string());
@@ -319,24 +532,21 @@ pub struct MbdPayCreateResult {
 #[derive(Clone)]
 pub struct PayConfig {
     pub enabled_channel: String,
-    pub xorpay: XorPayConfig,
-    pub mbdpay: MbdPayConfig,
 }
 
 impl PayConfig {
-    pub fn from_env() -> Self {
-        Self {
-            enabled_channel: env::var("PAY_CHANNEL").unwrap_or_else(|_| "mbdpay".to_string()),
-            xorpay: XorPayConfig::from_env(),
-            mbdpay: MbdPayConfig::from_env(),
-        }
+    /// 从数据库读取支付配置
+    pub async fn get_channel_config(
+        app_state: &AppState,
+        channel: &str,
+    ) -> Option<PaymentConfig> {
+        app_state.get_payment_config(channel).await
     }
 }
 
 #[derive(Clone)]
 pub struct PayState {
     pub app_state: AppState,
-    pub config: PayConfig,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -344,8 +554,9 @@ pub struct PayState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn payments_router(state: AppState) -> Router<AppState> {
-    let config = PayConfig::from_env();
-    let pay_state = PayState { app_state: state.clone(), config };
+    let pay_state = PayState {
+        app_state: state.clone(),
+    };
 
     Router::new()
         .nest("/pay/auth", authed_payment_router(pay_state.clone()))
@@ -359,7 +570,10 @@ fn authed_payment_router(state: PayState) -> Router<PayState> {
         .route("/create", post(create_order))
         .route("/orders", get(list_orders))
         .route("/status", get(get_order_status))
-        .route_layer(middleware::from_fn_with_state(state.app_state.clone(), auth_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            state.app_state.clone(),
+            auth_middleware,
+        ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,7 +603,7 @@ fn get_plan_price(expires_days: Option<i32>) -> (String, String) {
 
 #[derive(Deserialize)]
 pub struct CreateOrderRequest {
-    pub pay_type: String,  // 'wechat' | 'alipay'
+    pub pay_type: String, // 'wechat' | 'alipay'
     pub plan: String,
     pub expires_days: Option<i32>,
     /// 可选：强制指定支付渠道（mbdpay | xorpay）
@@ -432,12 +646,27 @@ async fn create_order(
     };
 
     let (price, name) = get_plan_price(body.expires_days);
+    let price_f64: f64 = price.parse().unwrap_or(0.0);
     let order_id = format!("KAMI{}", chrono::Utc::now().timestamp_millis());
     let now = chrono::Utc::now();
 
-    // 渠道选择：优先用请求指定的，其次用配置的
-    let channel = body.channel.as_deref()
-        .unwrap_or(&state.config.enabled_channel);
+    // 渠道选择：优先用请求指定的，其次查 DB 中已启用的，再 fallback 到 env
+    let channel_str = body
+        .channel
+        .clone()
+        .unwrap_or_else(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let enabled: Option<(String,)> = sqlx::query_as(
+                    "SELECT channel FROM payment_configs WHERE enabled = TRUE LIMIT 1",
+                )
+                .fetch_optional(&state.app_state.pool)
+                .await
+                .unwrap_or(None);
+                enabled.map(|r| r.0).unwrap_or_else(|| "alipay".to_string())
+            })
+        });
+    let channel: &str = &channel_str;
 
     // 保存订单记录
     let res = sqlx::query(
@@ -450,7 +679,7 @@ async fn create_order(
     .bind(&order_id)
     .bind(channel)
     .bind(&pay_type)
-    .bind(&price)
+    .bind(price_f64)
     .bind(&body.plan)
     .bind(body.expires_days)
     .bind(now)
@@ -467,10 +696,12 @@ async fn create_order(
     let channel_name: &str;
     let (pay_url, pay_html, charge_id, expires_in) = match channel {
         "mbdpay" => {
-            let cfg = &state.config.mbdpay;
-            if !cfg.is_configured() {
-                return Json(json!({"success": false, "message": "MbdPay 未配置"}));
-            }
+            let db_cfg = PayConfig::get_channel_config(&state.app_state, channel).await
+                .map(|c| MbdPayConfig::from_db(&c));
+            let cfg = match db_cfg {
+                Some(c) => c,
+                None => return Json(json!({"success": false, "message": "MbdPay 未配置"})),
+            };
             match cfg.create_order(&client, &order_id, &name, &price, &pay_type).await {
                 Ok(r) => {
                     channel_name = "MbdPay";
@@ -479,11 +710,28 @@ async fn create_order(
                 Err(e) => return Json(json!({"success": false, "message": e})),
             }
         }
-        _ => {
-            let cfg = &state.config.xorpay;
-            if !cfg.is_configured() {
-                return Json(json!({"success": false, "message": "XorPay 未配置"}));
+        "alipay" => {
+            let db_cfg = PayConfig::get_channel_config(&state.app_state, channel).await
+                .map(|c| AlipayConfig::from_db(&c));
+            let cfg = match db_cfg {
+                Some(c) => c,
+                None => return Json(json!({"success": false, "message": "支付宝电脑网站支付未配置"})),
+            };
+            match cfg.create_order(&client, &order_id, &name, &price).await {
+                Ok(r) => {
+                    channel_name = "Alipay";
+                    (r.pay_url, r.pay_html, r.charge_id, r.expires_in)
+                }
+                Err(e) => return Json(json!({"success": false, "message": e})),
             }
+        }
+        _ => {
+            let db_cfg = PayConfig::get_channel_config(&state.app_state, channel).await
+                .map(|c| XorPayConfig::from_db(&c));
+            let cfg = match db_cfg {
+                Some(c) => c,
+                None => return Json(json!({"success": false, "message": "XorPay 未配置"})),
+            };
             match cfg.create_order(&client, &order_id, &name, &price, &pay_type).await {
                 Ok(r) => {
                     channel_name = "XorPay";
@@ -496,9 +744,14 @@ async fn create_order(
 
     // 记录 charge_id
     if let Some(cid) = charge_id {
-        let col = if channel == "mbdpay" { "mbdpay_charge_id" } else { "xorpay_aoid" };
+        let col = match channel {
+            "mbdpay" => "mbdpay_charge_id",
+            "alipay" => "alipay_trade_no",
+            _ => "xorpay_aoid",
+        };
         let _ = sqlx::query(&format!(
-            "UPDATE payments SET {} = $1 WHERE order_id = $2", col
+            "UPDATE payments SET {} = $1 WHERE order_id = $2",
+            col
         ))
         .bind(&cid)
         .bind(&order_id)
@@ -506,7 +759,12 @@ async fn create_order(
         .await;
     }
 
-    tracing::info!("创建{}订单: order_id={}, price={}", channel_name, order_id, price);
+    tracing::info!(
+        "创建{}订单: order_id={}, price={}",
+        channel_name,
+        order_id,
+        price
+    );
 
     Json(json!({
         "success": true,
@@ -529,8 +787,14 @@ async fn create_order(
 // ─────────────────────────────────────────────────────────────────────────────
 
 type OrderRow = (
-    String, String, String, String, String, Option<i32>,
-    chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i32>,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
 );
 
 async fn list_orders(
@@ -547,7 +811,9 @@ async fn list_orders(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let channel_filter = q.channel.as_ref()
+    let channel_filter = q
+        .channel
+        .as_ref()
         .map(|c| format!(" AND pay_channel = '{}'", c));
 
     let orders: Vec<OrderRow> = {
@@ -565,28 +831,37 @@ async fn list_orders(
             .unwrap_or_default()
     };
 
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM payments WHERE merchant_id = $1"
-    )
-    .bind(merchant_id)
-    .fetch_one(&state.app_state.pool)
-    .await
-    .unwrap_or((0,));
+    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payments WHERE merchant_id = $1")
+        .bind(merchant_id)
+        .fetch_one(&state.app_state.pool)
+        .await
+        .unwrap_or((0,));
 
     let data: Vec<Value> = orders
         .into_iter()
-        .map(|(order_id, pay_channel, pay_type, amount, status, expires_days, created_at, pay_time)| {
-            json!({
-                "order_id": order_id,
-                "pay_channel": pay_channel,
-                "pay_type": pay_type,
-                "amount": amount,
-                "status": status,
-                "expires_days": expires_days,
-                "created_at": created_at.to_rfc3339(),
-                "pay_time": pay_time.map(|t| t.to_rfc3339()),
-            })
-        })
+        .map(
+            |(
+                order_id,
+                pay_channel,
+                pay_type,
+                amount,
+                status,
+                expires_days,
+                created_at,
+                pay_time,
+            )| {
+                json!({
+                    "order_id": order_id,
+                    "pay_channel": pay_channel,
+                    "pay_type": pay_type,
+                    "amount": amount,
+                    "status": status,
+                    "expires_days": expires_days,
+                    "created_at": created_at.to_rfc3339(),
+                    "pay_time": pay_time.map(|t| t.to_rfc3339()),
+                })
+            },
+        )
         .collect();
 
     Json(json!({
@@ -623,42 +898,58 @@ async fn get_order_status(
     .unwrap_or(None);
 
     match row {
-        Some((order_id, pay_channel, pay_type, amount, status, expires_days, created_at, pay_time)) => {
-            Json(json!({
-                "success": true,
-                "data": {
-                    "order_id": order_id,
-                    "pay_channel": pay_channel,
-                    "pay_type": pay_type,
-                    "amount": amount,
-                    "status": status,
-                    "expires_days": expires_days,
-                    "created_at": created_at.to_rfc3339(),
-                    "pay_time": pay_time.map(|t| t.to_rfc3339()),
-                }
-            }))
-        }
+        Some((
+            order_id,
+            pay_channel,
+            pay_type,
+            amount,
+            status,
+            expires_days,
+            created_at,
+            pay_time,
+        )) => Json(json!({
+            "success": true,
+            "data": {
+                "order_id": order_id,
+                "pay_channel": pay_channel,
+                "pay_type": pay_type,
+                "amount": amount,
+                "status": status,
+                "expires_days": expires_days,
+                "created_at": created_at.to_rfc3339(),
+                "pay_time": pay_time.map(|t| t.to_rfc3339()),
+            }
+        })),
         None => Json(json!({"success": false, "message": "订单不存在"})),
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 支付回调（双通道共用）
+// 支付回调（多通道共用）
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn pay_notify(
     State(state): State<PayState>,
     Json(body): Json<serde_json::Value>,
 ) -> &'static str {
-    // 判定是哪个通道的回调：MbdPay 有 type 字段
+    // 判定是哪个通道的回调
     let is_mbdpay = body.get("type").is_some() && body.get("data").is_some();
+    let is_alipay = body.get("sign_type").is_some() && body.get("sign").is_some();
 
     let (channel_name, order_id, pay_price) = if is_mbdpay {
-        let cfg = &state.config.mbdpay;
-        if !cfg.is_configured() {
-            tracing::warn!("MbdPay 回调但未配置");
-            return "error";
-        }
+        let rt = tokio::runtime::Handle::current();
+        let cfg = rt.block_on(async {
+            PayConfig::get_channel_config(&state.app_state, "mbdpay")
+                .await
+                .map(|c| MbdPayConfig::from_db(&c))
+        });
+        let cfg = match cfg {
+            Some(c) => c,
+            None => {
+                tracing::warn!("MbdPay 回调但未配置");
+                return "error";
+            }
+        };
         match cfg.verify_notify(&body) {
             Ok((_, oid, price)) => ("MbdPay", oid, price),
             Err(e) => {
@@ -666,13 +957,83 @@ async fn pay_notify(
                 return "sign_error";
             }
         }
+    } else if is_alipay {
+        // 支付宝回调格式：有 sign_type 和 sign 字段
+        let rt = tokio::runtime::Handle::current();
+        let cfg = rt.block_on(async {
+            PayConfig::get_channel_config(&state.app_state, "alipay")
+                .await
+                .map(|c| AlipayConfig::from_db(&c))
+        });
+        let cfg = match cfg {
+            Some(c) => c,
+            None => {
+                tracing::warn!("支付宝回调但未配置");
+                return "error";
+            }
+        };
+
+        // 提取回调参数
+        let _sign_type = body.get("sign_type").and_then(|v| v.as_str()).unwrap_or("");
+        let sign = body.get("sign").and_then(|v| v.as_str()).unwrap_or("");
+        let out_trade_no = body
+            .get("out_trade_no")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let trade_status = body
+            .get("trade_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // 只处理交易成功的回调
+        if trade_status != "TRADE_SUCCESS" && trade_status != "TRADE_FINISHED" {
+            tracing::warn!("支付宝回调交易状态非成功: {}", trade_status);
+            return "success";
+        }
+
+        // 验证签名：排除 sign 和 sign_type 字段后按字典序拼接再验证
+        let mut params: Vec<(String, String)> = body
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter(|(k, _)| *k != "sign" && *k != "sign_type")
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        let content: String = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        // 支付宝回调签名验证
+        if !cfg.verify_sign(sign, &content) {
+            tracing::warn!("支付宝签名验证失败: out_trade_no={}", out_trade_no);
+            return "sign_error";
+        }
+
+        let total_amount = body
+            .get("total_amount")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0.00");
+        ("Alipay", out_trade_no.to_string(), total_amount.to_string())
     } else {
         // XorPay 回调格式：{ aoid, order_id, pay_price, pay_time, sign }
-        let cfg = &state.config.xorpay;
-        if !cfg.is_configured() {
-            tracing::warn!("XorPay 回调但未配置");
-            return "error";
-        }
+        let rt = tokio::runtime::Handle::current();
+        let cfg = rt.block_on(async {
+            PayConfig::get_channel_config(&state.app_state, "xorpay")
+                .await
+                .map(|c| XorPayConfig::from_db(&c))
+        });
+        let cfg = match cfg {
+            Some(c) => c,
+            None => {
+                tracing::warn!("XorPay 回调但未配置");
+                return "error";
+            }
+        };
         let aoid = body.get("aoid").and_then(|v| v.as_str()).unwrap_or("");
         let order_id = body.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
         let pay_price = body.get("pay_price").and_then(|v| v.as_str()).unwrap_or("");
@@ -688,13 +1049,12 @@ async fn pay_notify(
     };
 
     // 幂等检查
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT id::text, status FROM payments WHERE order_id = $1",
-    )
-    .bind(&order_id)
-    .fetch_optional(&state.app_state.pool)
-    .await
-    .unwrap_or(None);
+    let row: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id::text, status FROM payments WHERE order_id = $1")
+            .bind(&order_id)
+            .fetch_optional(&state.app_state.pool)
+            .await
+            .unwrap_or(None);
 
     let payment_id = match row {
         Some((id, s)) if s != "paid" => id,
@@ -747,13 +1107,23 @@ async fn pay_notify(
                 .ok();
             }
 
-            if let Err(e) = crate::utils::mq::publish_upgrade(&state.app_state.mq_channel, &merchant_id.to_string()).await {
+            if let Err(e) = crate::utils::mq::publish_upgrade(
+                &state.app_state.mq_channel,
+                &merchant_id.to_string(),
+            )
+            .await
+            {
                 tracing::error!("发布升级恢复消息失败: {}", e);
             }
         }
     }
 
-    tracing::info!("[{}] 支付成功: order_id={}, price={}", channel_name, order_id, pay_price);
+    tracing::info!(
+        "[{}] 支付成功: order_id={}, price={}",
+        channel_name,
+        order_id,
+        pay_price
+    );
     "ok"
 }
 
@@ -781,9 +1151,9 @@ async fn pay_query(
     .unwrap_or(None);
 
     match row {
-        Some((order_id, status, pay_channel)) => {
-            Json(json!({"success": true, "data": { "order_id": order_id, "status": status, "pay_channel": pay_channel }}))
-        }
+        Some((order_id, status, pay_channel)) => Json(
+            json!({"success": true, "data": { "order_id": order_id, "status": status, "pay_channel": pay_channel }}),
+        ),
         None => Json(json!({"success": false, "message": "订单不存在"})),
     }
 }

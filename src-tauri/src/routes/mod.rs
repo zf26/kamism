@@ -12,4 +12,6 @@ pub mod health;
 pub mod blacklist;
 pub mod agent;
 pub mod payments;
-
+pub mod oauth;
+pub mod oauth_admin;
+pub mod payment_admin;
