@@ -60,19 +60,29 @@ async fn oauth_authorize(
     let state_value = generate_random_state();
 
     // 优先用请求头中的 Host 动态构建回调地址（支持反向代理）
-    let callback_base = headers
+    let callback_base = if let Some(proto) = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|h| format!("http://{}", h))
-                .unwrap_or_else(|| state.app_url.clone())
-        });
+    {
+        // 优先用 x-forwarded-host，否则用 host
+        let host = headers
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| headers.get("host").and_then(|v| v.to_str().ok()));
+        match host {
+            Some(h) => format!("{}://{}", proto, h),
+            None => state.app_url.clone(),
+        }
+    } else {
+        // 非反向代理场景：直接用 host 或 app_url兜底
+        headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(|h| format!("http://{}", h))
+            .unwrap_or_else(|| state.app_url.clone())
+    };
 
-    let redirect_uri = format!("{}/oauth/{}/callback", callback_base, provider);
+    let redirect_uri = format!("{}/api/oauth/{}/callback", callback_base, provider);
 
     let auth_url = format!(
         "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",

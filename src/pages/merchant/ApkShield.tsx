@@ -81,8 +81,8 @@ export default function ApkShield() {
 
   useEffect(() => { loadApps(); }, []);
   useEffect(() => {
-    if (apps.length > 0) loadJobs();
-  }, [apps, page, pageSize]);
+    loadJobs();
+  }, [page, pageSize, user?.id]);
 
   const checkHealth = async () => {
     setHealthLoading(true);

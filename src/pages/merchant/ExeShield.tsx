@@ -98,8 +98,8 @@ export default function ExeShield() {
 
   useEffect(() => { loadApps(); }, []);
   useEffect(() => {
-    if (apps.length > 0) loadJobs();
-  }, [apps, page, pageSize]);
+    loadJobs();
+  }, [page, pageSize, user?.id]);
 
   // 上传 EXE
   const handleUpload = async (e: React.FormEvent) => {
