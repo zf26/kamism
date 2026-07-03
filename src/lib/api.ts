@@ -140,7 +140,7 @@ function logout() {
   localStorage.removeItem('refreshToken');
   localStorage.removeItem('role');
   localStorage.removeItem('user');
-  window.location.href = '/kamism/login';
+  window.location.href = '/login';
 }
 
 // ─── Auth ───────────────────────────────────────────

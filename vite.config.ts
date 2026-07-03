@@ -11,7 +11,7 @@ export default defineConfig(async () => {
       react(),
     ],
     // Docker/web 部署用 '/'，Tauri 桌面端打包时 tauri-cli 会自动覆盖
-    base: '/kamism/',
+    base: '/',
 
     // ── 构建优化 ──────────────────────────────────────────────────────────
     build: {
