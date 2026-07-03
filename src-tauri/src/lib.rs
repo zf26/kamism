@@ -183,6 +183,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .merge(routes::oauth::oauth_router(state.clone()))
         .merge(routes::oauth_admin::oauth_admin_router(state.clone()))
         .merge(routes::payment_admin::payment_admin_router(state.clone()))
+        .merge(routes::subscription_plan::subscription_plan_router(state.clone()))
         .layer(axum_middleware::from_fn(middleware::security::security_headers))
         // 响应压缩：gzip / brotli，自动根据客户端 Accept-Encoding 协商
         // 对 JSON 响应压缩率通常 60-80%，显著降低带宽占用和客户端解析时间

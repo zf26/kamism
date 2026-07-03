@@ -140,7 +140,7 @@ function logout() {
   localStorage.removeItem('refreshToken');
   localStorage.removeItem('role');
   localStorage.removeItem('user');
-  window.location.href = '/login';
+  window.location.href = '/kamism/login';
 }
 
 // ─── Auth ───────────────────────────────────────────
@@ -346,12 +346,44 @@ export const webhookApi = {
 
 // ─── Payments ─────────────────────────────────────────
 export const paymentsApi = {
-  create: (data: { pay_type: string; plan: string; expires_days?: number }) =>
+  create: (data: { pay_type: string; plan_id?: string; expires_days?: number; channel?: string }) =>
     api.post('/pay/auth/create', data),
   list: (params?: { page?: number; page_size?: number }) =>
     api.get('/pay/auth/orders', { params }),
   getStatus: (orderId: string) =>
     api.get('/pay/auth/status', { params: { order_id: orderId } }),
+  cancel: (data: { order_id: string }) =>
+    api.post('/pay/auth/cancel', data),
+};
+
+// ─── Subscription Plans ────────────────────────────────
+export const plansApi = {
+  list: (params?: { enabled_only?: boolean }) =>
+    api.get('/admin/subscription-plans', { params }),
+  listEnabled: () =>
+    api.get('/pay/auth/plans'),
+  create: (data: {
+    plan: string;
+    name: string;
+    days?: number | null;
+    price: number;
+    original_price?: number | null;
+    badge?: string | null;
+    highlight?: boolean;
+    sort_order?: number;
+    enabled?: boolean;
+  }) => api.post('/admin/subscription-plans', data),
+  update: (id: string, data: {
+    name?: string;
+    days?: number | null;
+    price?: number;
+    original_price?: number | null;
+    badge?: string | null;
+    highlight?: boolean;
+    sort_order?: number;
+    enabled?: boolean;
+  }) => api.put(`/admin/subscription-plans/${id}`, data),
+  remove: (id: string) => api.delete(`/admin/subscription-plans/${id}`),
 };
 
 // ─── APK Shield ─────────────────────────────────────────

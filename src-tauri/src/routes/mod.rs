@@ -15,3 +15,4 @@ pub mod payments;
 pub mod oauth;
 pub mod oauth_admin;
 pub mod payment_admin;
+pub mod subscription_plan;

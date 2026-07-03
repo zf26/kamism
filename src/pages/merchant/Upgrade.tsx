@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../stores/auth';
-import { paymentsApi } from '../../lib/api';
+import { paymentsApi, plansApi } from '../../lib/api';
 import toast from 'react-hot-toast';
-import { CreditCard, CheckCircle, XCircle, Clock, RefreshCw } from 'lucide-react';
+import { CreditCard, CheckCircle, XCircle, Clock, RefreshCw, ChevronLeft, ChevronRight } from 'lucide-react';
 
-type PayStatus = 'pending' | 'paid' | 'expired';
+type PayStatus = 'pending' | 'paid' | 'expired' | 'cancelled';
 type PayType = 'wechat' | 'alipay';
 
 interface PlanOption {
+  id?: string;
   label: string;
   price: string;
   days: number | null;
@@ -16,28 +17,48 @@ interface PlanOption {
   highlight?: boolean;
 }
 
-const PLAN_OPTIONS: PlanOption[] = [
-  { label: '30 天续费', price: '30.00', days: 30 },
-  { label: '90 天续费', price: '90.00', days: 90, badge: '省 9 元' },
-  { label: '180 天续费', price: '180.00', days: 180, badge: '省 18 元' },
-  { label: '永久专业版', price: '365.00', days: null, highlight: true, badge: '最划算' },
-];
-
 export default function Upgrade() {
   const navigate = useNavigate();
   const { user, updateUser } = useAuthStore();
 
+  // 套餐列表（从 API 加载）
+  const [plans, setPlans] = useState<PlanOption[]>([]);
+  const [plansLoading, setPlansLoading] = useState(true);
+
   // 选中套餐
-  const [selectedPlan, setSelectedPlan] = useState<PlanOption | null>(
-    PLAN_OPTIONS.find(p => p.highlight) ?? null
-  );
-  const [payType, setPayType] = useState<PayType>('wechat');
+  const [selectedPlan, setSelectedPlan] = useState<PlanOption | null>(null);
+  const [payType, setPayType] = useState<PayType>('alipay');
   const [creating, setCreating] = useState(false);
+
+  // 加载套餐
+  const fetchPlans = async () => {
+    setPlansLoading(true);
+    try {
+      const res = await plansApi.listEnabled();
+      if (res.data.success) {
+        const mapped: PlanOption[] = res.data.data.map((p: any) => ({
+          id: p.id,
+          label: p.name,
+          price: parseFloat(p.price).toFixed(2),
+          days: p.days,
+          badge: p.badge || undefined,
+          highlight: p.highlight,
+        }));
+        setPlans(mapped);
+        // 默认选中推荐项
+        const def = mapped.find(p => p.highlight) ?? mapped[0] ?? null;
+        setSelectedPlan(def);
+      }
+    } catch { /* ignore */ }
+    finally { setPlansLoading(false); }
+  };
+
+  useEffect(() => { fetchPlans(); }, []);
 
   // 当前订单
   const [currentOrder, setCurrentOrder] = useState<{
     order_id: string;
-    qr_url: string;
+    pay_url: string;
     pay_type: string;
     price: string;
     status: PayStatus;
@@ -45,6 +66,27 @@ export default function Upgrade() {
     expires_days: number | null;
     plan: string;
   } | null>(null);
+
+  // 历史订单列表
+  const [orders, setOrders] = useState<any[]>([]);
+  const [ordersTotal, setOrdersTotal] = useState(0);
+  const [ordersPage, setOrdersPage] = useState(1);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const PAGE_SIZE = 10;
+
+  const fetchOrders = async (page: number) => {
+    setOrdersLoading(true);
+    try {
+      const res = await paymentsApi.list({ page, page_size: PAGE_SIZE });
+      if (res.data.success) {
+        setOrders(res.data.data);
+        setOrdersTotal(res.data.total);
+      }
+    } catch { /* ignore */ }
+    finally { setOrdersLoading(false); }
+  };
+
+  useEffect(() => { fetchOrders(1); }, []);
 
   // 轮询 timer
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -67,6 +109,7 @@ export default function Upgrade() {
           if (d.status === 'paid') {
             clearPoll();
             setCurrentOrder(prev => prev ? { ...prev, status: 'paid' } : null);
+            fetchOrders(1); // 刷新订单列表
             toast.success('支付成功！专业版已开通');
             // 刷新用户状态
             setTimeout(() => {
@@ -96,14 +139,13 @@ export default function Upgrade() {
     try {
       const res = await paymentsApi.create({
         pay_type: payType,
-        plan: 'pro',
-        expires_days: selectedPlan.days ?? undefined,
+        plan_id: selectedPlan.id,
       });
       if (res.data.success) {
         const d = res.data.data;
         setCurrentOrder({
           order_id: d.order_id,
-          qr_url: d.qr_url,
+          pay_url: d.pay_url,
           pay_type: d.pay_type,
           price: d.price,
           status: 'pending',
@@ -112,6 +154,10 @@ export default function Upgrade() {
           plan: d.plan,
         });
         startPoll(d.order_id);
+        // 在新窗口打开支付宝支付页面
+        if (d.pay_url) {
+          window.open(d.pay_url, '_blank');
+        }
       } else {
         toast.error(res.data.message || '创建订单失败');
       }
@@ -122,9 +168,16 @@ export default function Upgrade() {
     }
   };
 
-  const handleCancelOrder = () => {
+  const handleCancelOrder = async () => {
+    const oid = currentOrder?.order_id;
     clearPoll();
     setCurrentOrder(null);
+    if (oid) {
+      try {
+        await paymentsApi.cancel({ order_id: oid });
+        fetchOrders(ordersPage);
+      } catch { /* ignore */ }
+    }
   };
 
   const StatusBadge = ({ status }: { status: PayStatus }) => {
@@ -136,6 +189,11 @@ export default function Upgrade() {
     if (status === 'expired') return (
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--danger)', fontSize: 14, fontWeight: 700 }}>
         <XCircle size={16} /> 已过期
+      </span>
+    );
+    if (status === 'cancelled') return (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: 14, fontWeight: 700 }}>
+        <XCircle size={16} /> 已取消
       </span>
     );
     return (
@@ -183,16 +241,24 @@ export default function Upgrade() {
           }}>
             <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 20 }}>选择套餐</h3>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
-              {PLAN_OPTIONS.map((plan) => (
+              {plansLoading ? (
+                <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: '24px 0', color: 'var(--text-muted)' }}>
+                  <span className="spinner" /> 加载套餐中…
+                </div>
+              ) : plans.length === 0 ? (
+                <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: '24px 0', color: 'var(--text-muted)', fontSize: 14 }}>
+                  暂无可用套餐，请联系管理员配置
+                </div>
+              ) : plans.map((plan) => (
                 <button
-                  key={plan.label}
+                  key={plan.id ?? plan.label}
                   onClick={() => setSelectedPlan(plan)}
                   style={{
                     padding: '16px 14px', borderRadius: 12,
-                    border: selectedPlan?.label === plan.label
+                    border: selectedPlan?.id === plan.id
                       ? '2px solid var(--accent)'
                       : '2px solid var(--border)',
-                    background: selectedPlan?.label === plan.label
+                    background: selectedPlan?.id === plan.id
                       ? 'rgba(124,106,247,0.08)'
                       : 'var(--bg)',
                     cursor: 'pointer', textAlign: 'left',
@@ -300,27 +366,28 @@ export default function Upgrade() {
             </div>
           </div>
 
-          {/* 二维码 */}
+          {/* 支付宝支付页面 */}
           {currentOrder.status === 'pending' && (
-            <div style={{ marginBottom: 16 }}>
-              {currentOrder.qr_url ? (
-                <div style={{
-                  display: 'inline-block', padding: 16, background: '#fff',
-                  borderRadius: 16, border: '1px solid var(--border)',
-                }}>
-                  <QrCode value={currentOrder.qr_url} size={220} />
-                  <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-muted)' }}>
-                    {currentOrder.pay_type === 'wechat' ? '请使用微信扫码支付' : '请使用支付宝扫码支付'}
-                  </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-                    二维码有效期 {Math.floor(currentOrder.expires_in / 60)} 分钟
-                  </div>
-                </div>
-              ) : (
-                <div style={{ padding: '40px 0', color: 'var(--text-muted)' }}>
-                  <span className="spinner" /> 正在生成二维码…
-                </div>
-              )}
+            <div style={{ padding: '24px 0', textAlign: 'center' }}>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>📱</div>
+              <h4 style={{ fontSize: 16, fontWeight: 700, marginBottom: 8 }}>
+                请在支付宝页面中完成支付
+              </h4>
+              <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 4 }}>
+                已在新窗口打开支付宝官方支付页面
+              </p>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20 }}>
+                如果浏览器阻止了弹窗，请点击下方按钮手动打开
+              </p>
+              <button
+                className="btn btn-primary"
+                onClick={() => window.open(currentOrder.pay_url!, '_blank')}
+              >
+                重新打开支付页面
+              </button>
+              <div style={{ marginTop: 16, fontSize: 12, color: 'var(--text-muted)' }}>
+                请使用支付宝 App 扫码完成支付
+              </div>
             </div>
           )}
 
@@ -347,39 +414,110 @@ export default function Upgrade() {
           )}
         </div>
       )}
+
+      {/* ── 历史订单列表 ── */}
+      <div style={{
+        background: 'var(--bg-card)', borderRadius: 16,
+        border: '1px solid var(--border)', padding: 24, marginTop: 28,
+      }}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16 }}>
+          我的订单
+          <span style={{ fontSize: 12, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 8 }}>
+            共 {ordersTotal} 条
+          </span>
+        </h3>
+
+        {ordersLoading && orders.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '32px 0', color: 'var(--text-muted)' }}>
+            <span className="spinner" /> 加载中…
+          </div>
+        ) : orders.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '32px 0', color: 'var(--text-muted)', fontSize: 14 }}>
+            暂无订单记录
+          </div>
+        ) : (
+          <>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ padding: '10px 8px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>订单号</th>
+                    <th style={{ padding: '10px 8px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>金额</th>
+                    <th style={{ padding: '10px 8px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>方式</th>
+                    <th style={{ padding: '10px 8px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>状态</th>
+                    <th style={{ padding: '10px 8px', textAlign: 'left', fontWeight: 600, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {orders.map((o: any) => (
+                    <tr key={o.order_id} style={{
+                      borderBottom: '1px solid var(--border)',
+                      background: o.order_id === currentOrder?.order_id ? 'rgba(124,106,247,0.05)' : undefined,
+                    }}>
+                      <td style={{ padding: '10px 8px', fontFamily: 'monospace', fontSize: 12, whiteSpace: 'nowrap' }}>
+                        {o.order_id.slice(-12)}
+                      </td>
+                      <td style={{ padding: '10px 8px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                        ¥{o.amount}
+                      </td>
+                      <td style={{ padding: '10px 8px', whiteSpace: 'nowrap' }}>
+                        {o.pay_type === 'alipay' ? '支付宝' : o.pay_type === 'wechat' ? '微信' : o.pay_type}
+                      </td>
+                      <td style={{ padding: '10px 8px', whiteSpace: 'nowrap' }}>
+                        {o.status === 'paid' ? (
+                          <span style={{ color: 'var(--success)', fontWeight: 600 }}>✓ 已支付</span>
+                        ) : o.status === 'expired' ? (
+                          <span style={{ color: 'var(--danger)', fontWeight: 600 }}>✗ 已过期</span>
+                        ) : o.status === 'cancelled' ? (
+                          <span style={{ color: 'var(--text-muted)', fontWeight: 600 }}>— 已取消</span>
+                        ) : (
+                          <span style={{ color: 'var(--warning)', fontWeight: 600 }}>⏳ 待支付</span>
+                        )}
+                      </td>
+                      <td style={{ padding: '10px 8px', color: 'var(--text-muted)', fontSize: 12, whiteSpace: 'nowrap' }}>
+                        {new Date(o.created_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* 分页 */}
+            {ordersTotal > PAGE_SIZE && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, marginTop: 16 }}>
+                <button
+                  className="btn btn-ghost"
+                  style={{ padding: '6px 12px', fontSize: 12 }}
+                  disabled={ordersPage <= 1}
+                  onClick={() => {
+                    const p = ordersPage - 1;
+                    setOrdersPage(p);
+                    fetchOrders(p);
+                  }}
+                >
+                  <ChevronLeft size={14} /> 上一页
+                </button>
+                <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                  第 {ordersPage} / {Math.ceil(ordersTotal / PAGE_SIZE)} 页
+                </span>
+                <button
+                  className="btn btn-ghost"
+                  style={{ padding: '6px 12px', fontSize: 12 }}
+                  disabled={ordersPage >= Math.ceil(ordersTotal / PAGE_SIZE)}
+                  onClick={() => {
+                    const p = ordersPage + 1;
+                    setOrdersPage(p);
+                    fetchOrders(p);
+                  }}
+                >
+                  下一页 <ChevronRight size={14} />
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
-}
-
-// 二维码组件（使用 qrcode npm 包生成）
-function QrCode({ value, size }: { value: string; size: number }) {
-  const [src, setSrc] = useState('');
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    if (!value) { setSrc(''); return; }
-    let cancelled = false;
-    setLoading(true);
-    import('qrcode').then(({ default: QRCode }) => {
-      if (cancelled) return;
-      QRCode.toDataURL(value, {
-        width: size,
-        margin: 2,
-        color: { dark: '#000000', light: '#ffffff' },
-      }).then((dataUrl: string) => {
-        if (!cancelled) { setSrc(dataUrl); setLoading(false); }
-      }).catch(() => {
-        if (!cancelled) { setSrc(''); setLoading(false); }
-      });
-    }).catch(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [value, size]);
-
-  if (loading) {
-    return <div style={{ width: size, height: size, background: '#f5f5f5', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 8 }}><span className="spinner" /></div>;
-  }
-  if (!src) {
-    return <div style={{ width: size, height: size, background: '#f5f5f5', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 8, fontSize: 12, color: '#999' }}>加载中…</div>;
-  }
-  return <img src={src} width={size} height={size} alt="支付二维码" style={{ display: 'block', borderRadius: 8 }} />;
 }

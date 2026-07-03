@@ -115,7 +115,7 @@ function AppRoutes() {
 
 export default function App() {
   return (
-    <BrowserRouter basename="/">
+    <BrowserRouter basename="/kamism/">
       <AppRoutes />
     </BrowserRouter>
   );

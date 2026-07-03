@@ -365,6 +365,8 @@ async fn login(
             "email": email,
             "api_key": api_key,
             "status": merchant.status,
+            "plan": merchant.plan,
+            "plan_expires_at": merchant.plan_expires_at,
             "email_verified": merchant.email_verified,
             "created_at": merchant.created_at
         }

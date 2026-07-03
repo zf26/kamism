@@ -10,6 +10,7 @@ use axum::{
 use base64::Engine;
 use md5;
 use rsa::{
+    pkcs1::DecodeRsaPrivateKey,
     pkcs1v15::{SigningKey, VerifyingKey},
     pkcs8::{DecodePrivateKey, DecodePublicKey},
     signature::{RandomizedSigner, SignatureEncoding, Verifier},
@@ -167,46 +168,86 @@ impl AlipayConfig {
 
     /// 自动拼接 PEM 格式，解析支付宝私钥
     fn sign(&self, content: &str) -> Result<String, String> {
-        let trimmed = self.app_private_key.trim();
-        
-        // 自动拼接 PKCS8 格式头尾部
-        let full_private_key = if trimmed.starts_with("-----BEGIN") {
-            trimmed.to_string()
+        tracing::info!("[sign] 被调用，content 长度 {} 字节", content.len());
+        let mut raw = self.app_private_key.trim().to_string();
+
+        // 去掉用户复制时可能带上的引号
+        raw = raw.trim_matches(|c| c == '"' || c == '\'').to_string();
+
+        // 直接用 base64 解码为 DER，再尝试 PKCS#8 / PKCS#1 DER 解析。
+        // 这样完全绕过 pem-rfc7468 的行宽限制（它要求每行 ≤ 64 字符，
+        // 但支付宝工具导出的私钥常为整行 base64，交给 PEM parser 会报
+        // "invalid Base64 encoding"）。
+        let der_bytes = if raw.starts_with("-----BEGIN") {
+            // 有 PEM 头尾：从 PEM 中提取 base64 并解码
+            Self::extract_b64_from_pem(&raw)
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64)
+                    .map_err(|e| format!("私钥 base64 解码失败: {}", e)))
         } else {
-            format!(
-                "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
-                trimmed
-            )
-        };
-        
-        tracing::info!("[sign] 私钥长度: {}, 前50字符: {}", full_private_key.len(), &full_private_key[..50.min(full_private_key.len())]);
-        tracing::info!("[sign] 私钥最后50字符: {}", &full_private_key[full_private_key.len().saturating_sub(50)..]);
+            // 无 PEM 头尾：去掉所有空白后直接解码
+            let oneline: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+            base64::engine::general_purpose::STANDARD.decode(&oneline)
+                .map_err(|e| format!("私钥 base64 解码失败: {}", e))
+        }.map_err(|e| format!("解析支付宝私钥失败: {}", e))?;
 
-        let private_key = RsaPrivateKey::from_pkcs8_pem(&full_private_key)
-            .map_err(|e| format!("解析支付宝私钥失败: {}", e))?;
+        tracing::info!("[sign] DER 字节长度: {}", der_bytes.len());
+        tracing::info!("[sign] DER 首字节: 0x{:02x} (0x30=PKCS8/PKCS1, 0x2x=裸DSA签名等)", der_bytes.first().copied().unwrap_or(0));
+        // 打印前 16 字节的十六进制，方便对照 DER 结构
+        tracing::info!("[sign] DER hex (前16字节): {}", der_bytes.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
 
+        tracing::info!("[sign] 正在解析私钥 DER...");
+        let private_key = RsaPrivateKey::from_pkcs8_der(&der_bytes)
+            .or_else(|_| RsaPrivateKey::from_pkcs1_der(&der_bytes))
+            .map_err(|e| {
+                tracing::error!("[sign] 私钥 DER 解析失败，首字节: 0x{:02x}", der_bytes.first().copied().unwrap_or(0));
+                format!("解析支付宝私钥失败: {}（DER 首字节 0x{:02x}，若为 0x30 则应为 PKCS#8/PKCS#1 格式）",
+                    e, der_bytes.first().copied().unwrap_or(0))
+            })?;
+        tracing::info!("[sign] 私钥解析成功，开始签名...");
+
+        tracing::info!("[sign] 正在签名 content 长度 {} 字节...", content.len());
+        tracing::info!("[sign] content hex: {}", content.bytes().map(|b| format!("{:02x}", b)).collect::<String>());
         let signing_key = SigningKey::<Sha256>::new(private_key);
         let signature = signing_key.sign_with_rng(&mut rand::thread_rng(), content.as_bytes());
+        tracing::info!("[sign] 签名完成");
         let sig_bytes = signature.to_bytes();
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+        tracing::info!("[sign] 签名 base64: {}", sig_b64);
+        tracing::info!("[sign] 签名 hex: {}", sig_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>());
 
         Ok(base64::engine::general_purpose::STANDARD.encode(sig_bytes))
     }
 
-    /// 验证签名（自动补全公钥格式）
+    /// 从已有 PEM 中提取 base64 内容（去掉头尾行和所有换行）
+    fn extract_b64_from_pem(pem: &str) -> Result<String, String> {
+        Ok(pem.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect())
+    }
+
+    /// 验证签名（RSA-PSS + SHA256，支付宝 RSA2 标准）
     pub fn verify_sign(&self, sign: &str, content: &str) -> bool {
         let trimmed = self.alipay_public_key.trim();
-        
-        // 自动拼接公钥格式头尾部
-        let full_public_key = if trimmed.starts_with("-----BEGIN") {
-            trimmed.to_string()
+
+        // 提取干净 base64 字符串
+        let b64 = if trimmed.starts_with("-----BEGIN") {
+            Self::extract_b64_from_pem(trimmed).unwrap_or_default()
         } else {
-            format!(
-                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
-                trimmed
-            )
+            trimmed.chars().filter(|c| !c.is_whitespace()).collect()
         };
 
-        let public_key: RsaPublicKey = match DecodePublicKey::from_public_key_pem(&full_public_key) {
+        // base64 解码为 DER
+        let der_bytes = match base64::engine::general_purpose::STANDARD.decode(&b64) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+
+        // 公钥 SPKI/DER 解析
+        let public_key: RsaPublicKey = match RsaPublicKey::from_public_key_der(&der_bytes) {
             Ok(k) => k,
             Err(_) => return false,
         };
@@ -221,38 +262,11 @@ impl AlipayConfig {
             Err(_) => return false,
         };
 
-        let verifying_key = VerifyingKey::<Sha256>::new_with_prefix(public_key);
+        let verifying_key = VerifyingKey::<Sha256>::new(public_key);
         verifying_key.verify(content.as_bytes(), &signature).is_ok()
     }
 
-    /// 构建签名参数
-    fn build_signed_params(&self, mut params: Vec<(&str, String)>) -> Result<String, String> {
-        // 按字典序排列参数
-        params.sort_by(|a, b| a.0.cmp(b.0));
-
-        let content: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        let sign = self.sign(&content)?;
-
-        // 重新拼接并添加签名
-        let signed_content: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-
-        Ok(format!(
-            "{}&sign={}",
-            signed_content,
-            urlencoding::encode(&sign)
-        ))
-    }
-
-    /// 创建支付宝电脑网站支付订单
+    /// 创建支付宝电脑网站支付（返回支付页面 URL，前端打开后展示二维码）
     pub async fn create_order(
         &self,
         _client: &reqwest::Client,
@@ -260,8 +274,17 @@ impl AlipayConfig {
         subject: &str,
         total_amount: &str,
     ) -> Result<AlipayCreateResult, String> {
+        tracing::info!("[alipay create_order] order_id={}", order_id);
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let out_trade_no = order_id.to_string();
+
+        let biz_content = json!({
+            "out_trade_no": order_id,
+            "product_code": "FAST_INSTANT_TRADE_PAY",
+            "total_amount": total_amount,
+            "subject": subject,
+            "qr_pay_mode": "1",
+        })
+        .to_string();
 
         let params = vec![
             ("app_id", self.app_id.clone()),
@@ -272,23 +295,34 @@ impl AlipayConfig {
             ("version", "1.0".to_string()),
             ("notify_url", self.notify_url.clone()),
             ("return_url", self.return_url.clone()),
-            (
-                "biz_content",
-                json!({
-                    "out_trade_no": out_trade_no,
-                    "product_code": "FAST_INSTANT_TRADE_PAY",
-                    "total_amount": total_amount,
-                    "subject": subject,
-                    "qr_pay_mode": "2"  // 电脑网站支付模式
-                })
-                .to_string(),
-            ),
+            ("biz_content", biz_content),
         ];
 
-        let signed_query = self.build_signed_params(params)?;
+        // ── 按字典序排列，生成验签内容 ──
+        let mut sorted = params.clone();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let content: String = sorted
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&");
+        tracing::info!("[alipay] 排序后验签内容: {}", content);
+
+        let sign = self.sign(&content)?;
+
+        // ── 构建签名的 URL（参数值 URL 编码）──
+        let query: String = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let pay_url = format!("{}?{}&sign={}", self.gateway, query, urlencoding::encode(&sign));
+
+        tracing::info!("[alipay create_order] pay_url 生成完成");
 
         Ok(AlipayCreateResult {
-            pay_url: Some(format!("{}?{}", self.gateway, signed_query)),
+            pay_url: Some(pay_url),
             pay_html: None,
             expires_in: 7200,
             charge_id: Some(order_id.to_string()),
@@ -570,6 +604,7 @@ fn authed_payment_router(state: PayState) -> Router<PayState> {
         .route("/create", post(create_order))
         .route("/orders", get(list_orders))
         .route("/status", get(get_order_status))
+        .route("/cancel", post(cancel_order))
         .route_layer(middleware::from_fn_with_state(
             state.app_state.clone(),
             auth_middleware,
@@ -604,9 +639,11 @@ fn get_plan_price(expires_days: Option<i32>) -> (String, String) {
 #[derive(Deserialize)]
 pub struct CreateOrderRequest {
     pub pay_type: String, // 'wechat' | 'alipay'
-    pub plan: String,
+    /// 套餐 ID（UUID），优先使用；从 subscription_plans 表查询
+    pub plan_id: Option<Uuid>,
+    /// 后备：按 expires_days 计算价格（plan_id 不存在时使用）
     pub expires_days: Option<i32>,
-    /// 可选：强制指定支付渠道（mbdpay | xorpay）
+    /// 可选：强制指定支付渠道（mbdpay | xorpay | alipay）
     pub channel: Option<String>,
 }
 
@@ -619,6 +656,11 @@ pub struct ListOrdersQuery {
 
 #[derive(Deserialize)]
 pub struct OrderStatusQuery {
+    pub order_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct CancelOrderRequest {
     pub order_id: String,
 }
 
@@ -636,36 +678,54 @@ async fn create_order(
         Err(e) => return e,
     };
 
-    if body.plan != "pro" {
-        return Json(json!({"success": false, "message": "无效套餐"}));
-    }
-
     let pay_type = match body.pay_type.as_str() {
         "wechat" | "alipay" => body.pay_type.clone(),
         _ => return Json(json!({"success": false, "message": "pay_type 仅支持 wechat / alipay"})),
     };
 
-    let (price, name) = get_plan_price(body.expires_days);
+    // 优先从 subscription_plans 表查套餐，否则按 expires_days 兜底
+    let (price, name) = match body.plan_id {
+        Some(plan_id) => {
+            let plan: Option<crate::models::subscription_plan::SubscriptionPlan> =
+                sqlx::query_as(
+                    "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, \
+                     badge, highlight, sort_order, enabled, created_at, updated_at \
+                     FROM subscription_plans WHERE id = $1 AND enabled = TRUE"
+                )
+                    .bind(plan_id)
+                    .fetch_optional(&state.app_state.pool)
+                    .await
+                    .unwrap_or(None);
+            match plan {
+                Some(p) => (
+                    format!("{:.2}", p.price),
+                    match p.days {
+                        Some(d) => format!("KamiSM 专业版 {} 天续费", d),
+                        None => "KamiSM 专业版（永久）".to_string(),
+                    },
+                ),
+                None => get_plan_price(body.expires_days),
+            }
+        }
+        None => get_plan_price(body.expires_days),
+    };
     let price_f64: f64 = price.parse().unwrap_or(0.0);
     let order_id = format!("KAMI{}", chrono::Utc::now().timestamp_millis());
     let now = chrono::Utc::now();
 
     // 渠道选择：优先用请求指定的，其次查 DB 中已启用的，再 fallback 到 env
-    let channel_str = body
-        .channel
-        .clone()
-        .unwrap_or_else(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                let enabled: Option<(String,)> = sqlx::query_as(
-                    "SELECT channel FROM payment_configs WHERE enabled = TRUE LIMIT 1",
-                )
-                .fetch_optional(&state.app_state.pool)
-                .await
-                .unwrap_or(None);
-                enabled.map(|r| r.0).unwrap_or_else(|| "alipay".to_string())
-            })
-        });
+    let channel_str = match body.channel.clone() {
+        Some(c) => c,
+        None => {
+            let enabled: Option<(String,)> = sqlx::query_as(
+                "SELECT channel FROM payment_configs WHERE enabled = TRUE LIMIT 1",
+            )
+            .fetch_optional(&state.app_state.pool)
+            .await
+            .unwrap_or(None);
+            enabled.map(|r| r.0).unwrap_or_else(|| "alipay".to_string())
+        }
+    };
     let channel: &str = &channel_str;
 
     // 保存订单记录
@@ -680,7 +740,7 @@ async fn create_order(
     .bind(channel)
     .bind(&pay_type)
     .bind(price_f64)
-    .bind(&body.plan)
+    .bind("pro")
     .bind(body.expires_days)
     .bind(now)
     .bind(now)
@@ -717,6 +777,7 @@ async fn create_order(
                 Some(c) => c,
                 None => return Json(json!({"success": false, "message": "支付宝电脑网站支付未配置"})),
             };
+            tracing::info!("[handler] 准备调用 AlipayConfig::create_order, order_id={}", order_id);
             match cfg.create_order(&client, &order_id, &name, &price).await {
                 Ok(r) => {
                     channel_name = "Alipay";
@@ -775,7 +836,7 @@ async fn create_order(
             "expires_in": expires_in,
             "price": price,
             "pay_type": pay_type,
-            "plan": body.plan,
+            "plan": "pro",
             "expires_days": body.expires_days,
             "channel": channel,
         }
@@ -930,19 +991,32 @@ async fn get_order_status(
 
 async fn pay_notify(
     State(state): State<PayState>,
-    Json(body): Json<serde_json::Value>,
+    body: String,
 ) -> &'static str {
+    // 兼容 JSON 和 form-urlencoded 两种格式（MbdPay 发 JSON，支付宝/XorPay 发 form）
+    let body_value: serde_json::Value = if body.trim().starts_with('{') {
+        serde_json::from_str(&body).unwrap_or_default()
+    } else {
+        let mut map = std::collections::BTreeMap::new();
+        for pair in body.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                let key = urlencoding::decode(k).unwrap_or_else(|_| std::borrow::Cow::Borrowed(k)).to_string();
+                let value = urlencoding::decode(v).unwrap_or_else(|_| std::borrow::Cow::Borrowed(v)).to_string();
+                map.insert(key, value);
+            }
+        }
+        serde_json::to_value(&map).unwrap_or_default()
+    };
+
+    let body = body_value;
     // 判定是哪个通道的回调
     let is_mbdpay = body.get("type").is_some() && body.get("data").is_some();
     let is_alipay = body.get("sign_type").is_some() && body.get("sign").is_some();
 
     let (channel_name, order_id, pay_price) = if is_mbdpay {
-        let rt = tokio::runtime::Handle::current();
-        let cfg = rt.block_on(async {
-            PayConfig::get_channel_config(&state.app_state, "mbdpay")
-                .await
-                .map(|c| MbdPayConfig::from_db(&c))
-        });
+        let cfg = PayConfig::get_channel_config(&state.app_state, "mbdpay")
+            .await
+            .map(|c| MbdPayConfig::from_db(&c));
         let cfg = match cfg {
             Some(c) => c,
             None => {
@@ -958,13 +1032,9 @@ async fn pay_notify(
             }
         }
     } else if is_alipay {
-        // 支付宝回调格式：有 sign_type 和 sign 字段
-        let rt = tokio::runtime::Handle::current();
-        let cfg = rt.block_on(async {
-            PayConfig::get_channel_config(&state.app_state, "alipay")
-                .await
-                .map(|c| AlipayConfig::from_db(&c))
-        });
+        let cfg = PayConfig::get_channel_config(&state.app_state, "alipay")
+            .await
+            .map(|c| AlipayConfig::from_db(&c));
         let cfg = match cfg {
             Some(c) => c,
             None => {
@@ -1008,6 +1078,8 @@ async fn pay_notify(
             .collect::<Vec<_>>()
             .join("&");
 
+        tracing::debug!("[alipay callback] 验签 content: {}", content);
+
         // 支付宝回调签名验证
         if !cfg.verify_sign(sign, &content) {
             tracing::warn!("支付宝签名验证失败: out_trade_no={}", out_trade_no);
@@ -1020,13 +1092,9 @@ async fn pay_notify(
             .unwrap_or("0.00");
         ("Alipay", out_trade_no.to_string(), total_amount.to_string())
     } else {
-        // XorPay 回调格式：{ aoid, order_id, pay_price, pay_time, sign }
-        let rt = tokio::runtime::Handle::current();
-        let cfg = rt.block_on(async {
-            PayConfig::get_channel_config(&state.app_state, "xorpay")
-                .await
-                .map(|c| XorPayConfig::from_db(&c))
-        });
+        let cfg = PayConfig::get_channel_config(&state.app_state, "xorpay")
+            .await
+            .map(|c| XorPayConfig::from_db(&c));
         let cfg = match cfg {
             Some(c) => c,
             None => {
@@ -1155,5 +1223,42 @@ async fn pay_query(
             json!({"success": true, "data": { "order_id": order_id, "status": status, "pay_channel": pay_channel }}),
         ),
         None => Json(json!({"success": false, "message": "订单不存在"})),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 取消订单
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn cancel_order(
+    State(state): State<PayState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<CancelOrderRequest>,
+) -> Json<Value> {
+    let merchant_id = match get_merchant_id(&claims) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // 只允许取消 pending 状态的订单，且必须属于当前用户
+    let result = sqlx::query(
+        "UPDATE payments SET status = 'cancelled', updated_at = NOW()
+         WHERE order_id = $1 AND merchant_id = $2 AND status = 'pending'",
+    )
+    .bind(&body.order_id)
+    .bind(merchant_id)
+    .execute(&state.app_state.pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!("订单已取消: order_id={}", body.order_id);
+            Json(json!({"success": true, "message": "订单已取消"}))
+        }
+        Ok(_) => Json(json!({"success": false, "message": "订单不存在或无法取消"})),
+        Err(e) => {
+            tracing::error!("取消订单失败: {}", e);
+            Json(json!({"success": false, "message": "取消失败"}))
+        }
     }
 }

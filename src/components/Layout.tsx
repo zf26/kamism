@@ -203,7 +203,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                   padding: '1px 5px',
                   borderRadius: 4,
                   letterSpacing: '0.3px',
-                  background: user?.plan === 'pro' ? 'linear-gradient(135deg,#f59e0b,#d97706)' : 'var(--bg-hover)',
+                  background: user?.plan === 'pro' ? 'linear-gradient(135deg,var(--accent),#5a4ed1)' : 'var(--bg-hover)',
                   color: user?.plan === 'pro' ? '#fff' : 'var(--text-muted)',
                   border: user?.plan === 'pro' ? 'none' : '1px solid var(--border)',
                   lineHeight: '16px',

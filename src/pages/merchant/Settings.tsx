@@ -10,7 +10,8 @@ function getPlanLabel(plan?: string) {
 }
 
 function getPlanExpiry(plan?: string, expiresAt?: string | null): string | null {
-  if (plan !== 'pro' || !expiresAt) return null;
+  if (plan !== 'pro') return null;
+  if (!expiresAt) return '永久';
   const exp = new Date(expiresAt);
   const now = new Date();
   const diffMs = exp.getTime() - now.getTime();
@@ -95,7 +96,7 @@ export default function Settings() {
               <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>当前套餐</span>
               <span style={{
                 fontSize: 12, fontWeight: 700, padding: '2px 8px', borderRadius: 5,
-                background: user?.plan === 'pro' ? 'linear-gradient(135deg,#f59e0b,#d97706)' : 'var(--bg-hover)',
+                background: user?.plan === 'pro' ? 'linear-gradient(135deg,var(--accent),#5a4ed1)' : 'var(--bg-hover)',
                 color: user?.plan === 'pro' ? '#fff' : 'var(--text-muted)',
                 border: user?.plan === 'pro' ? 'none' : '1px solid var(--border)',
               }}>
@@ -108,8 +109,8 @@ export default function Settings() {
                 <span style={{
                   fontSize: 13, fontWeight: 500,
                   color: (() => {
-                    const exp = user?.plan_expires_at ? new Date(user.plan_expires_at) : null;
-                    if (!exp) return 'var(--text-muted)';
+                    if (!user?.plan_expires_at) return 'var(--text-muted)';
+                    const exp = new Date(user.plan_expires_at);
                     const days = Math.floor((exp.getTime() - Date.now()) / 86400000);
                     return days <= 7 ? '#ef4444' : days <= 30 ? '#f59e0b' : 'var(--text)';
                   })()

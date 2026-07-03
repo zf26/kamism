@@ -271,7 +271,7 @@ async fn activate(
         .await;
 
         let expires_at = card.expires_at;
-        let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0));
+        let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0) + 1);
         return Json(json!({
             "success": true,
             "message": "卡密已激活（设备已绑定）",
@@ -342,8 +342,7 @@ async fn activate(
     .execute(&state.pool)
     .await;
 
-    let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0));
-
+    let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0) + 1);
     // 异步触发 Webhook（activate 事件）
     let pool_clone = state.pool.clone();
     let app_id_clone = card.app_id;
@@ -568,7 +567,7 @@ async fn verify(
         .await;
     });
 
-    let remaining_days = card.expires_at.map(|e| (e - Utc::now()).num_days().max(0));
+    let remaining_days = card.expires_at.map(|e| (e - Utc::now()).num_days().max(0) + 1);
     let device_count: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM activations WHERE card_id = $1")
             .bind(card.id)
