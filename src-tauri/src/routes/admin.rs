@@ -44,6 +44,7 @@ async fn list_merchants(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
     let keyword = q.keyword.unwrap_or_default();
+    let keyword = &keyword[..keyword.len().min(100)]; // 限制搜索关键词长度
     let like = format!("%{}%", keyword);
     let plan_filter = q.plan.as_deref().unwrap_or("");
 

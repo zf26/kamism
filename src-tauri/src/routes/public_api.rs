@@ -283,15 +283,25 @@ async fn activate(
         }));
     }
 
-    // 检查设备数量上限
+    // ── 事务：设备数检查 + 激活 INSERT + 卡状态更新 原子操作 ──
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("开启事务失败: {}", e);
+            return Json(json!({"success": false, "message": "服务器繁忙，请稍后重试"}));
+        }
+    };
+
+    // 事务内检查设备数量（带行锁防止竞态）
     let device_count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM activations WHERE card_id = $1")
+        sqlx::query_as("SELECT COUNT(*) FROM activations WHERE card_id = $1 FOR UPDATE")
             .bind(card.id)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut *tx)
             .await
             .unwrap_or((0,));
 
     if device_count.0 >= card.max_devices as i64 {
+        let _ = tx.rollback().await;
         return Json(json!({
             "success": false,
             "message": format!("该卡密最多支持 {} 台设备，已达上限", card.max_devices)
@@ -317,11 +327,12 @@ async fn activate(
         Ok(e) => e,
         Err(e) => {
             tracing::error!("加密设备 ID 失败: {}", e);
+            let _ = tx.rollback().await;
             return Json(json!({"success": false, "message": "激活失败"}));
         }
     };
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO activations (id, card_id, app_id, device_id_encrypted, device_id_hash, device_name, ip_address) VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(activation_id)
@@ -331,16 +342,31 @@ async fn activate(
     .bind(&device_id_hash)
     .bind(&body.device_name)
     .bind(&ip)
-    .execute(&state.pool)
-    .await;
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!("插入激活记录失败: {}", e);
+        let _ = tx.rollback().await;
+        return Json(json!({"success": false, "message": "激活失败，请稍后重试"}));
+    }
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE cards SET status = 'active', activated_at = COALESCE(activated_at, NOW()), expires_at = $1 WHERE id = $2",
     )
     .bind(expires_at)
     .bind(card.id)
-    .execute(&state.pool)
-    .await;
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!("更新卡状态失败: {}", e);
+        let _ = tx.rollback().await;
+        return Json(json!({"success": false, "message": "激活失败，请稍后重试"}));
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("提交事务失败: {}", e);
+        return Json(json!({"success": false, "message": "激活失败，请稍后重试"}));
+    }
 
     let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0) + 1);
     // 异步触发 Webhook（activate 事件）

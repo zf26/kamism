@@ -49,7 +49,9 @@ export default function Upgrade() {
         const def = mapped.find(p => p.highlight) ?? mapped[0] ?? null;
         setSelectedPlan(def);
       }
-    } catch { /* ignore */ }
+    } catch {
+      if (import.meta.env.DEV) console.error('加载套餐失败');
+    }
     finally { setPlansLoading(false); }
   };
 
@@ -82,7 +84,7 @@ export default function Upgrade() {
         setOrders(res.data.data);
         setOrdersTotal(res.data.total);
       }
-    } catch { /* ignore */ }
+    } catch { if (import.meta.env.DEV) console.error('加载订单历史失败'); }
     finally { setOrdersLoading(false); }
   };
 
@@ -111,12 +113,11 @@ export default function Upgrade() {
             setCurrentOrder(prev => prev ? { ...prev, status: 'paid' } : null);
             fetchOrders(1); // 刷新订单列表
             toast.success('支付成功！专业版已开通');
-            // 刷新用户状态
+            // 刷新用户状态（从 zustand store 合并，避免覆盖 store 中的最新数据）
             setTimeout(() => {
-              const stored = localStorage.getItem('user');
-              if (stored) {
-                const u = JSON.parse(stored);
-                updateUser({ ...u, plan: 'pro' });
+              const { user: currentUser } = useAuthStore.getState();
+              if (currentUser) {
+                updateUser({ ...currentUser, plan: 'pro' });
               }
               navigate('/dashboard');
             }, 1500);
@@ -125,7 +126,7 @@ export default function Upgrade() {
             setCurrentOrder(prev => prev ? { ...prev, status: 'expired' } : null);
           }
         }
-      } catch { /* ignore */ }
+      } catch { /* 轮询静默失败，下次继续 */ }
     }, 3000);
   };
 
@@ -176,7 +177,7 @@ export default function Upgrade() {
       try {
         await paymentsApi.cancel({ order_id: oid });
         fetchOrders(ordersPage);
-      } catch { /* ignore */ }
+      } catch { if (import.meta.env.DEV) console.error('取消订单API失败'); }
     }
   };
 

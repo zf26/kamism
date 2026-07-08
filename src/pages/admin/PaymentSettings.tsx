@@ -366,14 +366,14 @@ export default function PaymentSettings() {
         setConfig(res.data.data);
         setForm({
           xorpay_aid: res.data.data.xorpay_aid || '',
-          xorpay_app_key: res.data.data.xorpay_app_key || '',
+          xorpay_app_key: res.data.data.xorpay_app_key_set ? '******' : '',
           xorpay_notify_url: res.data.data.xorpay_notify_url || '',
           mbdpay_app_id: res.data.data.mbdpay_app_id || '',
-          mbdpay_app_key: res.data.data.mbdpay_app_key || '',
+          mbdpay_app_key: res.data.data.mbdpay_app_key_set ? '******' : '',
           mbdpay_notify_url: res.data.data.mbdpay_notify_url || '',
           alipay_app_id: res.data.data.alipay_app_id || '',
-          alipay_private_key: res.data.data.alipay_private_key || '',
-          alipay_public_key: res.data.data.alipay_public_key || '',
+          alipay_private_key: res.data.data.alipay_private_key_set ? '******' : '',
+          alipay_public_key: res.data.data.alipay_public_key_set ? '******' : '',
           alipay_notify_url: res.data.data.alipay_notify_url || '',
           alipay_gateway: res.data.data.alipay_gateway || '',
           alipay_return_url: res.data.data.alipay_return_url || '',
@@ -386,6 +386,8 @@ export default function PaymentSettings() {
     }
   };
 
+  const isPlaceholder = (v: string) => v === '******';
+
   const handleSave = async () => {
     if (!activeChannel) return;
     setSaving(true);
@@ -393,16 +395,16 @@ export default function PaymentSettings() {
       const updateData: Record<string, string> = {};
       if (activeChannel === 'xorpay') {
         if (form.xorpay_aid) updateData.xorpay_aid = form.xorpay_aid;
-        if (form.xorpay_app_key) updateData.xorpay_app_key = form.xorpay_app_key;
+        if (form.xorpay_app_key && !isPlaceholder(form.xorpay_app_key)) updateData.xorpay_app_key = form.xorpay_app_key;
         if (form.xorpay_notify_url) updateData.xorpay_notify_url = form.xorpay_notify_url;
       } else if (activeChannel === 'mbdpay') {
         if (form.mbdpay_app_id) updateData.mbdpay_app_id = form.mbdpay_app_id;
-        if (form.mbdpay_app_key) updateData.mbdpay_app_key = form.mbdpay_app_key;
+        if (form.mbdpay_app_key && !isPlaceholder(form.mbdpay_app_key)) updateData.mbdpay_app_key = form.mbdpay_app_key;
         if (form.mbdpay_notify_url) updateData.mbdpay_notify_url = form.mbdpay_notify_url;
       } else if (activeChannel === 'alipay') {
         if (form.alipay_app_id) updateData.alipay_app_id = form.alipay_app_id;
-        if (form.alipay_private_key) updateData.alipay_private_key = form.alipay_private_key;
-        if (form.alipay_public_key) updateData.alipay_public_key = form.alipay_public_key;
+        if (form.alipay_private_key && !isPlaceholder(form.alipay_private_key)) updateData.alipay_private_key = form.alipay_private_key;
+        if (form.alipay_public_key && !isPlaceholder(form.alipay_public_key)) updateData.alipay_public_key = form.alipay_public_key;
         if (form.alipay_notify_url) updateData.alipay_notify_url = form.alipay_notify_url;
         if (form.alipay_gateway) updateData.alipay_gateway = form.alipay_gateway;
         if (form.alipay_return_url) updateData.alipay_return_url = form.alipay_return_url;

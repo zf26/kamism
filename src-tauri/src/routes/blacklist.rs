@@ -96,7 +96,10 @@ async fn list_ip(
     Extension(claims): Extension<Claims>,
     Query(q): Query<PageQuery>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
@@ -139,7 +142,10 @@ async fn add_ip(
     if ip.is_empty() {
         return Json(json!({"success": false, "message": "IP 不能为空"}));
     }
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let result = sqlx::query(
         "INSERT INTO ip_blacklist (merchant_id, ip, reason) VALUES ($1, $2, $3)
          ON CONFLICT DO NOTHING"
@@ -162,7 +168,10 @@ async fn remove_ip(
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let result = sqlx::query(
         "DELETE FROM ip_blacklist WHERE id = $1 AND merchant_id = $2"
     )
@@ -185,7 +194,10 @@ async fn list_device(
     Extension(claims): Extension<Claims>,
     Query(q): Query<PageQuery>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
@@ -228,7 +240,10 @@ async fn add_device(
     if device_id.is_empty() {
         return Json(json!({"success": false, "message": "设备 ID 不能为空"}));
     }
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let device_id_hash = EncryptedFieldsOps::generate_hash(&device_id);
     let device_hint = if device_id.len() >= 4 {
         format!("{}****", &device_id[..4])
@@ -260,7 +275,10 @@ async fn remove_device(
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let result = sqlx::query(
         "DELETE FROM device_blacklist WHERE id = $1 AND merchant_id = $2"
     )
@@ -283,7 +301,10 @@ async fn list_alerts(
     Extension(claims): Extension<Claims>,
     Query(q): Query<PageQuery>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
@@ -322,7 +343,10 @@ async fn alerts_unread_count(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM activation_alerts WHERE merchant_id = $1 AND is_read = FALSE"
     )
@@ -339,7 +363,10 @@ async fn mark_alert_read(
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let result = sqlx::query(
         "UPDATE activation_alerts SET is_read = TRUE WHERE id = $1 AND merchant_id = $2"
     )

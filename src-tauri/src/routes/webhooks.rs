@@ -32,7 +32,10 @@ async fn list_webhooks(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let rows: Vec<(Uuid, Uuid, String, String, bool, Vec<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
         sqlx::query_as(
             "SELECT id, app_id, url, secret, enabled, events, created_at, updated_at
@@ -68,7 +71,10 @@ async fn get_webhook(
     Extension(claims): Extension<Claims>,
     Path(app_id): Path<Uuid>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let row: Option<(Uuid, Uuid, String, String, bool, Vec<String>, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> =
         sqlx::query_as(
             "SELECT id, app_id, url, secret, enabled, events, created_at, updated_at
@@ -105,7 +111,10 @@ async fn upsert_webhook(
     Path(app_id): Path<Uuid>,
     Json(body): Json<WebhookUpsertRequest>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
 
     if body.url.trim().is_empty() {
         return Json(json!({ "success": false, "message": "URL 不能为空" }));
@@ -177,7 +186,10 @@ async fn delete_webhook(
     Extension(claims): Extension<Claims>,
     Path(app_id): Path<Uuid>,
 ) -> Json<Value> {
-    let merchant_id = Uuid::parse_str(&claims.sub).unwrap_or_default();
+    let merchant_id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
     let result = sqlx::query(
         "DELETE FROM app_webhooks WHERE app_id = $1 AND merchant_id = $2",
     )
@@ -258,12 +270,18 @@ pub async fn fire_webhook(
 }
 
 fn hmac_sha256_hex(key: &str, data: &str) -> String {
-    use sha2::Sha256;
+    use sha2::{Sha256, Digest};
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap_or_else(|_| {
-        HmacSha256::new_from_slice(b"fallback").unwrap()
-    });
+    // 如果密钥太短（< 32 字节），先 SHA-256 哈希为固定长度
+    let mac = if key.len() < 32 {
+        let hashed = Sha256::digest(key.as_bytes());
+        HmacSha256::new_from_slice(&hashed).expect("SHA-256 哈希后密钥长度应正好 32 字节")
+    } else {
+        HmacSha256::new_from_slice(key.as_bytes())
+            .expect("密钥长度 >= 32 字节时应能正常构造 HMAC")
+    };
+    let mut mac = mac;
     mac.update(data.as_bytes());
     let result = mac.finalize();
     hex::encode(result.into_bytes())

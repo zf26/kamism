@@ -39,6 +39,11 @@ const flushQueue = (token: string) => {
   refreshQueue = [];
 };
 
+const flushQueueReject = () => {
+  refreshQueue.forEach(cb => cb(''));
+  refreshQueue = [];
+};
+
 // ── 请求拦截器 ①：GET 去重 ──────────────────────────────────────────────────
 api.interceptors.request.use((config) => {
   if (config.method?.toUpperCase() === 'GET') {
@@ -99,10 +104,14 @@ api.interceptors.response.use(
 
       if (isRefreshing) {
         // 已在刷新中，把请求加入队列，等待新 token
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
           refreshQueue.push((token: string) => {
-            original.headers.Authorization = `Bearer ${token}`;
-            resolve(api(original));
+            if (!token) {
+              reject(err);
+            } else {
+              original.headers.Authorization = `Bearer ${token}`;
+              resolve(api(original));
+            }
           });
         });
       }
@@ -121,10 +130,12 @@ api.interceptors.response.use(
           original.headers.Authorization = `Bearer ${newToken}`;
           return api(original);
         } else {
+          flushQueueReject();
           logout();
           return Promise.reject(err);
         }
       } catch {
+        flushQueueReject();
         logout();
         return Promise.reject(err);
       } finally {

@@ -57,7 +57,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     if (role !== 'merchant') return;
     merchantMessagesApi.unreadCount()
       .then((res) => { if (res.data.success) setUnread(res.data.data.unread); })
-      .catch(() => {});
+      .catch(() => { if (import.meta.env.DEV) console.warn('拉取未读消息失败'); });
   }, [role, location.pathname]);
 
   // 商户端：登录后拉取最新公告，用 localStorage 永久记录已读，只弹未读过的
@@ -71,7 +71,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           .filter((n) => !shown.includes(n.id));
         if (pending.length > 0) setNoticeQueue(pending);
       })
-      .catch(() => {});
+      .catch(() => { if (import.meta.env.DEV) console.warn('拉取公告失败'); });
   }, [role]);
 
   // 仅商户端建立 WebSocket 连接，管理员不需要

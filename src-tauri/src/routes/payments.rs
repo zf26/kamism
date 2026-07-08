@@ -872,19 +872,15 @@ async fn list_orders(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let channel_filter = q
-        .channel
-        .as_ref()
-        .map(|c| format!(" AND pay_channel = '{}'", c));
-
     let orders: Vec<OrderRow> = {
-        let query = format!(
-            "SELECT order_id, pay_channel, pay_type, amount::text, status, expires_days, created_at, pay_time
-             FROM payments WHERE merchant_id = $1{} ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            channel_filter.as_deref().unwrap_or(""),
-        );
-        sqlx::query_as::<_, OrderRow>(&query)
+        sqlx::query_as::<_, OrderRow>(
+            "SELECT order_id, pay_channel, pay_type, amount::text, status, expires_days, created_at, pay_time \
+             FROM payments WHERE merchant_id = $1 \
+             AND ($2::text IS NULL OR pay_channel = $2) \
+             ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+        )
             .bind(merchant_id)
+            .bind(&q.channel)
             .bind(page_size)
             .bind(offset)
             .fetch_all(&state.app_state.pool)
@@ -1133,46 +1129,64 @@ async fn pay_notify(
         }
     };
 
-    // 更新订单
+    // ── 使用 DB 事务：支付状态更新 + 套餐升级原子操作 ──
+    let tx_result = state.app_state.pool.begin().await;
+    let mut tx = match tx_result {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("[{}] 开启事务失败: {}", channel_name, e);
+            return "error";
+        }
+    };
+
     let notify_json = serde_json::to_string(&body).unwrap_or_default();
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE payments SET status = 'paid', pay_price = $1, pay_time = $2, notify_data = $3, updated_at = NOW() WHERE id = $4",
     )
     .bind(&pay_price)
     .bind(chrono::Utc::now())
     .bind(&notify_json)
     .bind(payment_id)
-    .execute(&state.app_state.pool)
-    .await;
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!("[{}] 更新支付状态失败: {}", channel_name, e);
+        let _ = tx.rollback().await;
+        return "error";
+    }
 
-    // 更新商户套餐
+    // 查询订单信息用于套餐升级
     let order_row: Option<(Uuid, String, Option<i32>)> = sqlx::query_as(
         "SELECT merchant_id::text, plan, expires_days FROM payments WHERE order_id = $1",
     )
     .bind(&order_id)
-    .fetch_optional(&state.app_state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .unwrap_or(None);
 
     if let Some((merchant_id, plan, expires_days)) = order_row {
         if plan == "pro" {
-            if expires_days.is_some() {
+            let update_result = if let Some(days) = expires_days {
                 sqlx::query(
                     "UPDATE merchants SET plan = 'pro', plan_expires_at = COALESCE(plan_expires_at, NOW()) + ($1 || ' days')::INTERVAL, updated_at = NOW() WHERE id = $2",
                 )
-                .bind(expires_days.unwrap().to_string())
+                .bind(days.to_string())
                 .bind(merchant_id)
-                .execute(&state.app_state.pool)
+                .execute(&mut *tx)
                 .await
-                .ok();
             } else {
                 sqlx::query(
                     "UPDATE merchants SET plan = 'pro', plan_expires_at = NULL, updated_at = NOW() WHERE id = $1",
                 )
                 .bind(merchant_id)
-                .execute(&state.app_state.pool)
+                .execute(&mut *tx)
                 .await
-                .ok();
+            };
+
+            if let Err(e) = update_result {
+                tracing::error!("[{}] 更新商户套餐失败: {}", channel_name, e);
+                let _ = tx.rollback().await;
+                return "error";
             }
 
             if let Err(e) = crate::utils::mq::publish_upgrade(
@@ -1181,9 +1195,14 @@ async fn pay_notify(
             )
             .await
             {
-                tracing::error!("发布升级恢复消息失败: {}", e);
+                tracing::error!("[{}] 发布升级恢复消息失败: {}", channel_name, e);
             }
         }
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("[{}] 提交事务失败: {}", channel_name, e);
+        return "error";
     }
 
     tracing::info!(

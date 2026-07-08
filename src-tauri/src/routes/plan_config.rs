@@ -87,20 +87,33 @@ pub async fn get_config_by_plan(
     pool: &sqlx::PgPool,
     plan: &str,
 ) -> PlanConfig {
-    sqlx::query_as("SELECT * FROM plan_configs WHERE plan = $1")
+    match sqlx::query_as("SELECT * FROM plan_configs WHERE plan = $1")
         .bind(plan)
         .fetch_optional(pool)
         .await
-        .unwrap_or(None)
-        .unwrap_or_else(|| PlanConfig {
-            id: Uuid::nil(),
-            plan: plan.to_string(),
-            label: "免费版".to_string(),
-            max_apps: 1,
-            max_cards: 500,
-            max_devices: 3,
-            max_gen_once: 100,
-            updated_at: chrono::Utc::now(),
-        })
+    {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            tracing::warn!("套餐配置不存在 (plan={})，使用默认限制", plan);
+            default_plan_config(plan)
+        }
+        Err(e) => {
+            tracing::error!("查询套餐配置失败 (plan={}): {}，使用默认限制", plan, e);
+            default_plan_config(plan)
+        }
+    }
+}
+
+fn default_plan_config(plan: &str) -> PlanConfig {
+    PlanConfig {
+        id: Uuid::nil(),
+        plan: plan.to_string(),
+        label: if plan == "pro" { "专业版".to_string() } else { "免费版".to_string() },
+        max_apps: if plan == "pro" { -1 } else { 1 },
+        max_cards: if plan == "pro" { -1 } else { 500 },
+        max_devices: if plan == "pro" { 100 } else { 3 },
+        max_gen_once: if plan == "pro" { 1000 } else { 100 },
+        updated_at: chrono::Utc::now(),
+    }
 }
 

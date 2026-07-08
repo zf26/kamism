@@ -66,7 +66,7 @@ pub async fn start_server() -> anyhow::Result<()> {
     let database_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/kamism".to_string());
     let jwt_secret = env::var("JWT_SECRET")
-        .unwrap_or_else(|_| "kamism-super-secret-key-change-in-production".to_string());
+        .expect("JWT_SECRET 环境变量未设置 — 请设置一个随机密钥，例如：openssl rand -hex 32");
     let redis_url = env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let amqp_url = env::var("AMQP_URL")

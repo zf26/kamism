@@ -140,13 +140,17 @@ export default function ExeShield() {
     }
   };
 
-  // 轮询进行中的任务
+  // 轮询进行中的任务（使用 ref 避免每 3 秒重建定时器）
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+
   useEffect(() => {
-    const pending = jobs.filter(j => j.status === 'pending' || j.status === 'processing');
-    if (pending.length === 0) return;
+    const hasPending = () => jobsRef.current.some(j => j.status === 'pending' || j.status === 'processing');
+    if (!hasPending()) return;
 
     const interval = setInterval(() => {
-      pending.forEach(job => {
+      if (!hasPending()) { clearInterval(interval); return; }
+      jobsRef.current.filter(j => j.status === 'pending' || j.status === 'processing').forEach(job => {
         exeShieldApi.status(job.job_id).then(res => {
           if (res.data.success) {
             setJobs(prev => prev.map(j =>
@@ -155,12 +159,12 @@ export default function ExeShield() {
                 : j
             ));
           }
-        }).catch(() => {});
+        }).catch(() => { if (import.meta.env.DEV) console.warn('轮询任务状态失败'); });
       });
     }, 3000);
 
     return () => clearInterval(interval);
-  }, [jobs]);
+  }, []); // 空依赖，只在挂载时启动，通过 ref 读取最新 jobs
 
   // 下载
   const handleDownload = async (job: Job) => {

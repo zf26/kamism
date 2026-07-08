@@ -69,7 +69,7 @@ export default function Login() {
         setOauthProviders(res.data.data);
       }
     } catch {
-      // 忽略错误
+      if (import.meta.env.DEV) console.warn('加载 OAuth 提供商列表失败');
     }
   };
 

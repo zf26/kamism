@@ -164,15 +164,21 @@ async fn change_password(
         Err(_) => return Json(json!({"success": false, "message": "密码加密失败"})),
     };
 
-    let _ = sqlx::query(
+    match sqlx::query(
         "UPDATE merchants SET password_hash = $1, updated_at = NOW() WHERE id = $2",
     )
     .bind(&new_hash)
     .bind(id)
     .execute(&state.pool)
-    .await;
-
-    Json(json!({"success": true, "message": "密码已修改"}))
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "密码已修改"})),
+        Ok(_) => Json(json!({"success": false, "message": "修改失败"})),
+        Err(e) => {
+            tracing::error!("更新密码失败: {}", e);
+            Json(json!({"success": false, "message": "服务器错误，请稍后重试"}))
+        }
+    }
 }
 
 async fn regenerate_api_key(
@@ -185,14 +191,20 @@ async fn regenerate_api_key(
     };
 
     let new_key = crate::utils::card_gen::generate_api_key();
-    let _ = sqlx::query(
+    match sqlx::query(
         "UPDATE merchants SET api_key = $1, updated_at = NOW() WHERE id = $2",
     )
     .bind(&new_key)
     .bind(id)
     .execute(&state.pool)
-    .await;
-
-    Json(json!({"success": true, "data": {"api_key": new_key}}))
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "data": {"api_key": new_key}})),
+        Ok(_) => Json(json!({"success": false, "message": "重生成失败"})),
+        Err(e) => {
+            tracing::error!("重生成 API Key 失败: {}", e);
+            Json(json!({"success": false, "message": "服务器错误，请稍后重试"}))
+        }
+    }
 }
 

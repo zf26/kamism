@@ -12,6 +12,12 @@ export default function OAuthCallback() {
   useEffect(() => {
     if (handledRef.current) return;
     handledRef.current = true;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    const delayedNav = (path: string, ms: number) => {
+      const t = setTimeout(() => navigate(path), ms);
+      timers.push(t);
+    };
 
     const handleCallback = async () => {
       const params = new URLSearchParams(window.location.search);
@@ -31,14 +37,14 @@ export default function OAuthCallback() {
         };
         toast.error(errorMessages[error] || 'GitHub 登录失败');
         setStatus('error');
-        setTimeout(() => navigate('/login'), 2000);
+        delayedNav('/login', 2000);
         return;
       }
 
       if (!token || !refresh || !role || !userStr) {
         toast.error('OAuth 回调参数不完整');
         setStatus('error');
-        setTimeout(() => navigate('/login'), 2000);
+        delayedNav('/login', 2000);
         return;
       }
 
@@ -54,11 +60,13 @@ export default function OAuthCallback() {
       } catch {
         toast.error('用户信息解析失败');
         setStatus('error');
-        setTimeout(() => navigate('/login'), 2000);
+        delayedNav('/login', 2000);
       }
     };
 
     handleCallback();
+
+    return () => timers.forEach(clearTimeout);
   }, [navigate, setAuth]);
 
   return (
