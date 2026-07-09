@@ -1167,7 +1167,7 @@ async fn pay_notify(
     }
 
     // 查询订单信息用于套餐升级
-    let order_row: Option<(Uuid, String, Option<i32>)> = sqlx::query_as(
+    let merchant_plan_info: Option<(Uuid, String, Option<i32>)> = sqlx::query_as(
         "SELECT merchant_id::text, plan, expires_days FROM payments WHERE order_id = $1",
     )
     .bind(&order_id)
@@ -1175,7 +1175,9 @@ async fn pay_notify(
     .await
     .unwrap_or(None);
 
-    if let Some((merchant_id, plan, expires_days)) = order_row {
+    let mut need_upgrade_msg = false;
+
+    if let Some((merchant_id, ref plan, expires_days)) = merchant_plan_info {
         if plan == "pro" {
             let update_result = if let Some(days) = expires_days {
                 sqlx::query(
@@ -1200,6 +1202,18 @@ async fn pay_notify(
                 return "error";
             }
 
+            need_upgrade_msg = true;
+        }
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!("[{}] 提交事务失败: {}", channel_name, e);
+        return "error";
+    }
+
+    // ── 事务成功后发布升级消息（避免事务回滚但消息已发出）──
+    if need_upgrade_msg {
+        if let Some((merchant_id, _, _)) = merchant_plan_info {
             if let Err(e) = crate::utils::mq::publish_upgrade(
                 &state.app_state.mq_channel,
                 &merchant_id.to_string(),
@@ -1209,11 +1223,6 @@ async fn pay_notify(
                 tracing::error!("[{}] 发布升级恢复消息失败: {}", channel_name, e);
             }
         }
-    }
-
-    if let Err(e) = tx.commit().await {
-        tracing::error!("[{}] 提交事务失败: {}", channel_name, e);
-        return "error";
     }
 
     tracing::info!(

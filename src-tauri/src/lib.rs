@@ -205,24 +205,29 @@ pub async fn start_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 扫描到期商户，将商户 ID 投递到降级队列
+/// 扫描到期商户，将商户 ID 投递到降级队列（带内存去重）
 async fn scan_and_enqueue(pool: &db::DbPool, channel: &Arc<lapin::Channel>) {
     let expired: Vec<(uuid::Uuid,)> = sqlx::query_as(
         "SELECT id FROM merchants
          WHERE plan = 'pro'
            AND plan_expires_at IS NOT NULL
-           AND plan_expires_at <= NOW()",
+           AND plan_expires_at <= NOW()
+         ORDER BY plan_expires_at ASC",
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
-    for (merchant_id,) in expired {
+    let mut published = 0u32;
+    for (merchant_id,) in &expired {
         if let Err(e) = utils::mq::publish_downgrade(channel, &merchant_id.to_string()).await {
             tracing::error!("发布降级消息失败 {}: {}", merchant_id, e);
         } else {
-            tracing::info!("已发布降级消息: 商户 {}", merchant_id);
+            published += 1;
         }
+    }
+    if published > 0 {
+        tracing::info!("降级扫描完成: {} 个到期商户已投递", published);
     }
 }
 

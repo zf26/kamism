@@ -182,13 +182,19 @@ async fn downgrade_merchant(pool: &DbPool, msg: &PlanMessage) -> anyhow::Result<
 
     match check {
         Some((plan, updated_at)) => {
-            let issued = chrono::DateTime::<chrono::Utc>::from_timestamp(msg.issued_at, 0)
-                .unwrap_or_default();
-            // 如果当前已是 free 且更新时间 > issued_at，说明被更新过了，跳过
-            if plan != "pro" && updated_at > issued {
+            let issued = match chrono::DateTime::<chrono::Utc>::from_timestamp(msg.issued_at, 0) {
+                Some(t) => t,
+                None => {
+                    warn!("商户 {} 降级消息 issued_at 无效: {}", msg.merchant_id, msg.issued_at);
+                    return Ok(true);
+                }
+            };
+            // 如果商户状态在消息发出后被修改过（如续费），跳过此消息
+            if updated_at > issued {
+                info!("商户 {} 状态在降级消息发出后已变更，跳过", msg.merchant_id);
                 return Ok(true);
             }
-            // 如果已经是 free 但 updated_at <= issued_at（扫描器发出，状态已符合），跳过
+            // 如果已经是 free，跳过
             if plan != "pro" {
                 return Ok(true);
             }
@@ -196,12 +202,17 @@ async fn downgrade_merchant(pool: &DbPool, msg: &PlanMessage) -> anyhow::Result<
         None => return Ok(true), // 商户不存在
     }
 
-    let free_config: (i32, i32) = sqlx::query_as(
+    let free_config: (i32, i32) = match sqlx::query_as(
         "SELECT max_apps, max_cards FROM plan_configs WHERE plan = 'free'",
     )
     .fetch_one(pool)
-    .await
-    .unwrap_or((1, 500));
+    .await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("查询免费版配额失败，使用默认值: {}", e);
+            (1, 500)
+        }
+    };
     let (max_apps, max_cards) = free_config;
 
     // 1. 降级商户
@@ -304,8 +315,24 @@ async fn restore_merchant(pool: &DbPool, msg: &PlanMessage) -> anyhow::Result<bo
     .await?;
 
     match check {
-        Some((plan, _)) if plan == "pro" => {} // 继续执行
-        _ => return Ok(true), // 当前不是 pro，跳过（防乱序：升级消息到达但商户已被降级）
+        Some((plan, updated_at)) => {
+            let issued = match chrono::DateTime::<chrono::Utc>::from_timestamp(msg.issued_at, 0) {
+                Some(t) => t,
+                None => {
+                    warn!("商户 {} 升级消息 issued_at 无效: {}", msg.merchant_id, msg.issued_at);
+                    return Ok(true);
+                }
+            };
+            // 如果商户状态在消息发出后被修改过（如被管理员降级），跳过
+            if updated_at > issued {
+                info!("商户 {} 状态在升级消息发出后已变更，跳过", msg.merchant_id);
+                return Ok(true);
+            }
+            if plan != "pro" {
+                return Ok(true); // 当前不是 pro，跳过
+            }
+        }
+        None => return Ok(true), // 商户不存在
     }
 
     // 分批恢复被降级禁用的应用
