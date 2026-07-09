@@ -684,7 +684,7 @@ async fn create_order(
     };
 
     // 优先从 subscription_plans 表查套餐，否则按 expires_days 兜底
-    let (price, name) = match body.plan_id {
+    let (price, name, plan_days) = match body.plan_id {
         Some(plan_id) => {
             let plan: Option<crate::models::subscription_plan::SubscriptionPlan> =
                 sqlx::query_as(
@@ -697,18 +697,29 @@ async fn create_order(
                     .await
                     .unwrap_or(None);
             match plan {
-                Some(p) => (
-                    format!("{:.2}", p.price),
-                    match p.days {
-                        Some(d) => format!("KamiSM 专业版 {} 天续费", d),
-                        None => "KamiSM 专业版（永久）".to_string(),
-                    },
-                ),
-                None => get_plan_price(body.expires_days),
+                Some(p) => {
+                    let (price, name) = (
+                        format!("{:.2}", p.price),
+                        match p.days {
+                            Some(d) => format!("KamiSM 专业版 {} 天续费", d),
+                            None => "KamiSM 专业版（永久）".to_string(),
+                        },
+                    );
+                    (price, name, p.days)
+                }
+                None => {
+                    let (price, name) = get_plan_price(body.expires_days);
+                    (price, name, body.expires_days)
+                }
             }
         }
-        None => get_plan_price(body.expires_days),
+        None => {
+            let (price, name) = get_plan_price(body.expires_days);
+            (price, name, body.expires_days)
+        }
     };
+    // 从套餐查到的天数优先于请求传入的 days
+    let final_expires_days = plan_days.or(body.expires_days);
     let price_f64: f64 = price.parse().unwrap_or(0.0);
     let order_id = format!("KAMI{}", chrono::Utc::now().timestamp_millis());
     let now = chrono::Utc::now();
@@ -741,7 +752,7 @@ async fn create_order(
     .bind(&pay_type)
     .bind(price_f64)
     .bind("pro")
-    .bind(body.expires_days)
+    .bind(final_expires_days)
     .bind(now)
     .bind(now)
     .fetch_one(&state.app_state.pool)

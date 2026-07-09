@@ -3,11 +3,12 @@ use crate::{
     models::payment_config::{PaymentConfig, PaymentConfigPublic, UpdatePaymentConfig},
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     middleware,
     routing::{get, patch, post},
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub fn payment_admin_router(state: AppState) -> Router<AppState> {
@@ -16,6 +17,7 @@ pub fn payment_admin_router(state: AppState) -> Router<AppState> {
         .route("/admin/payment/configs/:channel", get(get_payment_config))
         .route("/admin/payment/configs/:channel", patch(update_payment_config))
         .route("/admin/payment/configs/:channel/toggle", post(toggle_payment_config))
+        .route("/admin/payment/orders", get(list_all_orders))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
 }
@@ -209,4 +211,94 @@ async fn toggle_payment_config(
             "message": format!("操作失败: {}", e)
         })),
     }
+}
+
+// ── 订单管理 ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AdminOrdersQuery {
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+    pub status: Option<String>,    // 筛选：paid / pending / expired / cancelled
+    pub channel: Option<String>,   // 筛选：alipay / xorpay / mbdpay
+}
+
+type AdminOrderRow = (
+    String,             // order_id
+    String,             // merchant_id
+    String,             // username
+    String,             // pay_channel
+    String,             // pay_type
+    String,             // amount::text
+    String,             // status
+    Option<i32>,        // expires_days
+    chrono::DateTime<chrono::Utc>, // created_at
+    Option<chrono::DateTime<chrono::Utc>>, // pay_time
+    Option<String>,     // pay_price::text
+);
+
+async fn list_all_orders(
+    State(state): State<AppState>,
+    Query(q): Query<AdminOrdersQuery>,
+) -> Json<Value> {
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(20).min(100);
+    let offset = (page - 1) * page_size;
+
+    let orders: Vec<AdminOrderRow> = sqlx::query_as(
+        r#"
+        SELECT p.order_id, p.merchant_id::text, COALESCE(m.username, '(已删除)') AS username,
+               p.pay_channel, p.pay_type, p.amount::text, p.status,
+               p.expires_days, p.created_at, p.pay_time, p.pay_price::text
+        FROM payments p
+        LEFT JOIN merchants m ON m.id = p.merchant_id
+        WHERE ($1::text IS NULL OR p.status = $1)
+          AND ($2::text IS NULL OR p.pay_channel = $2)
+        ORDER BY p.created_at DESC
+        LIMIT $3 OFFSET $4
+        "#
+    )
+    .bind(&q.status)
+    .bind(&q.channel)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM payments WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR pay_channel = $2)"
+    )
+    .bind(&q.status)
+    .bind(&q.channel)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((0,));
+
+    let data: Vec<Value> = orders.into_iter().map(|(
+        order_id, merchant_id, username, pay_channel, pay_type,
+        amount, status, expires_days, created_at, pay_time, pay_price,
+    )| {
+        json!({
+            "order_id": order_id,
+            "merchant_id": merchant_id,
+            "username": username,
+            "pay_channel": pay_channel,
+            "pay_type": pay_type,
+            "amount": amount,
+            "status": status,
+            "expires_days": expires_days,
+            "created_at": created_at.to_rfc3339(),
+            "pay_time": pay_time.map(|t| t.to_rfc3339()),
+            "pay_price": pay_price,
+        })
+    }).collect();
+
+    Json(json!({
+        "success": true,
+        "data": data,
+        "total": total.0,
+        "page": page,
+        "page_size": page_size,
+    }))
 }

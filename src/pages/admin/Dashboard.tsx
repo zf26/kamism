@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { adminApi, healthApi } from '../../lib/api';
-import { Users, Key, Activity, Package, TrendingUp, Database, Server, GitBranch } from 'lucide-react';
+import { Users, Key, Activity, Package, TrendingUp, Database, Server, GitBranch, BarChart3 } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 interface Stats {
   merchants: number;
@@ -8,6 +9,17 @@ interface Stats {
   active_cards: number;
   total_activations: number;
   total_apps: number;
+}
+
+interface TrendPoint {
+  date: string;
+  count: number;
+}
+
+interface TrendData {
+  merchants: TrendPoint[];
+  apps: TrendPoint[];
+  cards: TrendPoint[];
 }
 
 interface HealthStatus {
@@ -25,16 +37,68 @@ function formatUptime(secs: number): string {
   return `${Math.floor(secs / 86400)} 天 ${Math.floor((secs % 86400) / 3600)} 小时`;
 }
 
+const chartColors = {
+  merchants: '#7c6af7',
+  apps: '#34d399',
+  cards: '#fbbf24',
+};
+
+function TrendChart({ title, data, color, icon }: { title: string; data: TrendPoint[]; color: string; icon: React.ReactNode }) {
+  return (
+    <div className="card" style={{ padding: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+        <span style={{ color }}>{icon}</span>
+        <span style={{ fontWeight: 600, fontSize: 14 }}>{title}</span>
+      </div>
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart data={data} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" />
+          <XAxis
+            dataKey="date"
+            tick={{ fontSize: 11, fill: 'var(--text-muted)' }}
+            tickFormatter={(v: any) => String(v).slice(5)}
+            axisLine={{ stroke: 'var(--border)' }}
+            tickLine={false}
+          />
+          <YAxis
+            allowDecimals={false}
+            tick={{ fontSize: 11, fill: 'var(--text-muted)' }}
+            axisLine={{ stroke: 'var(--border)' }}
+            tickLine={false}
+          />
+          <Tooltip
+            contentStyle={{
+              background: 'var(--bg-card)',
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              fontSize: 13,
+            }}
+            labelFormatter={(v: any) => String(v)}
+            formatter={(value: any) => [value, '新增']}
+          />
+          <Line type="monotone" dataKey="count" stroke={color} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 export default function AdminDashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [healthLoading, setHealthLoading] = useState(true);
+  const [trends, setTrends] = useState<TrendData | null>(null);
+  const [trendsLoading, setTrendsLoading] = useState(true);
 
   useEffect(() => {
     adminApi.getStats().then(res => {
       if (res.data.success) setStats(res.data.data);
     }).catch(() => {}).finally(() => setLoading(false));
+
+    adminApi.getTrends().then(res => {
+      if (res.data.success) setTrends(res.data.data);
+    }).catch(() => {}).finally(() => setTrendsLoading(false));
 
     healthApi.check().then(res => {
       setHealth(res.data);
@@ -82,8 +146,32 @@ export default function AdminDashboard() {
         ))}
       </div>
 
+      {/* ── 每日增量趋势 ── */}
+      <div style={{ marginTop: 28 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+          <BarChart3 size={18} style={{ color: 'var(--text-muted)' }} />
+          <h3 style={{ fontSize: 15, fontWeight: 700 }}>近 30 天每日增量</h3>
+        </div>
+        {trendsLoading ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+            {[1, 2, 3].map(i => (
+              <div key={i} className="card" style={{ padding: 20 }}>
+                <span className="skeleton" style={{ width: '40%', height: 18, display: 'block', marginBottom: 16 }} />
+                <span className="skeleton" style={{ width: '100%', height: 200, display: 'block' }} />
+              </div>
+            ))}
+          </div>
+        ) : trends ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+            <TrendChart title="注册商户" data={trends.merchants} color={chartColors.merchants} icon={<Users size={15} />} />
+            <TrendChart title="新增应用" data={trends.apps} color={chartColors.apps} icon={<Package size={15} />} />
+            <TrendChart title="新增卡密" data={trends.cards} color={chartColors.cards} icon={<Key size={15} />} />
+          </div>
+        ) : null}
+      </div>
+
       {/* ── 依赖健康状态 ── */}
-      <div className="card" style={{ marginTop: 24 }}>
+      <div className="card" style={{ marginTop: 28 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
           <span style={{ fontWeight: 600, fontSize: 14, color: 'var(--text)' }}>服务依赖状态</span>
           {healthLoading ? (
@@ -133,15 +221,6 @@ export default function AdminDashboard() {
             运行时长：{formatUptime(health.uptime_secs)}
           </div>
         )}
-      </div>
-
-      <div className="card">
-        <div style={{ color: 'var(--text-muted)', fontSize: 13, lineHeight: 1.8 }}>
-          <p style={{ marginBottom: 8 }}><strong style={{ color: 'var(--accent)' }}>管理员提示</strong></p>
-          <p>• 前往「商户管理」查看所有注册商户，可禁用/启用账号</p>
-          <p>• 初始管理员账号在 .env 文件中配置（ADMIN_EMAIL / ADMIN_PASSWORD）</p>
-          <p>• 服务器默认监听端口 9527，可通过 PORT 环境变量修改</p>
-        </div>
       </div>
     </div>
   );

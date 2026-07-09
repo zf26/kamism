@@ -297,11 +297,15 @@ export default function Upgrade() {
             background: 'var(--bg-card)', borderRadius: 16,
             border: '1px solid var(--border)', padding: 28, marginBottom: 20,
           }}>
-            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 20 }}>选择支付方式</h3>
-            <div style={{ display: 'flex', gap: 12 }}>
+            <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 20 }}>支付方式</h3>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
               {[
-                { value: 'wechat', label: '微信支付', icon: '💬' },
-                { value: 'alipay', label: '支付宝', icon: '💙' },
+                { value: 'alipay', label: '支付宝', icon: (
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                    <rect x="2" y="2" width="20" height="20" rx="4" fill="#1677FF"/>
+                    <text x="12" y="16" textAnchor="middle" fill="#fff" fontSize="10" fontWeight="bold" fontFamily="sans-serif">支</text>
+                  </svg>
+                ) },
               ].map(pt => (
                 <button
                   key={pt.value}

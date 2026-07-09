@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard, KeyRound, Wallet, Monitor
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard, KeyRound, Wallet, Monitor, Search
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -24,6 +24,7 @@ const adminPlatformNav: NavItem[] = [
   { label: '套餐配置', path: '/admin/plan-configs', icon: <Settings size={16} /> },
   { label: 'OAuth2 配置', path: '/admin/oauth', icon: <KeyRound size={16} /> },
   { label: '支付配置', path: '/admin/payment', icon: <Wallet size={16} /> },
+  { label: '订单管理', path: '/admin/orders', icon: <Search size={16} /> },
   { label: '消息管理', path: '/admin/messages', icon: <Megaphone size={16} /> },
 ];
 

@@ -173,6 +173,7 @@ export const authApi = {
 // ─── Admin ──────────────────────────────────────────
 export const adminApi = {
   getStats: () => api.get('/admin/stats'),
+  getTrends: () => api.get('/admin/stats/trends'),
   getMerchants: (params?: { page?: number; page_size?: number; keyword?: string; plan?: string }) =>
     api.get('/admin/merchants', { params }),
   createMerchant: (data: { username: string; email: string; password: string }) =>

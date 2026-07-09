@@ -29,6 +29,7 @@ pub fn admin_router_with_state(state: AppState) -> Router<AppState> {
         .route("/admin/merchants/:id/status", patch(update_merchant_status))
         .route("/admin/merchants/:id/plan", patch(update_merchant_plan))
         .route("/admin/stats", get(get_stats))
+        .route("/admin/stats/trends", get(get_trends))
         // 管理员商户功能：API Key 管理
         .route("/admin/api-key", get(get_admin_api_key))
         .route("/admin/api-key/regenerate", post(regenerate_admin_api_key))
@@ -392,6 +393,57 @@ async fn get_stats(State(state): State<AppState>) -> Json<Value> {
             "active_cards": active_card_count.0,
             "total_activations": activation_count.0,
             "total_apps": app_count.0
+        }
+    }))
+}
+
+/// 每日增量趋势（近 30 天）
+async fn get_trends(State(state): State<AppState>) -> Json<Value> {
+    let merchants: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"SELECT DATE(created_at) AS day, COUNT(*)::bigint AS cnt
+           FROM merchants WHERE created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY day ORDER BY day"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let apps: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"SELECT DATE(created_at) AS day, COUNT(*)::bigint AS cnt
+           FROM apps WHERE created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY day ORDER BY day"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let cards: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        r#"SELECT DATE(created_at) AS day, COUNT(*)::bigint AS cnt
+           FROM cards WHERE created_at >= NOW() - INTERVAL '30 days'
+           GROUP BY day ORDER BY day"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    // 补全 30 天空白天
+    let fill_days = |rows: Vec<(chrono::NaiveDate, i64)>| -> Vec<Value> {
+        let mut map: std::collections::HashMap<chrono::NaiveDate, i64> = rows.into_iter().collect();
+        let mut filled = Vec::new();
+        for i in (0..30).rev() {
+            let d = (chrono::Utc::now() - chrono::Duration::days(i)).date_naive();
+            let cnt = map.remove(&d).unwrap_or(0);
+            filled.push(json!({"date": d.to_string(), "count": cnt}));
+        }
+        filled
+    };
+
+    Json(json!({
+        "success": true,
+        "data": {
+            "merchants": fill_days(merchants),
+            "apps": fill_days(apps),
+            "cards": fill_days(cards),
         }
     }))
 }
