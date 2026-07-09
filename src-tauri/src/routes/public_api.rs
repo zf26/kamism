@@ -252,38 +252,7 @@ async fn activate(
         }
     }
 
-    // 检查该设备是否已绑定此卡密（使用 device_id_hash 索引，O(1) 查询，无需全量解密）
-    let existing_activation: Option<Activation> = sqlx::query_as(
-        "SELECT * FROM activations WHERE card_id = $1 AND device_id_hash = $2",
-    )
-    .bind(card.id)
-    .bind(&device_id_hash)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
-
-    if let Some(existing) = existing_activation {
-        let _ = sqlx::query(
-            "UPDATE activations SET last_verified_at = NOW() WHERE id = $1",
-        )
-        .bind(existing.id)
-        .execute(&state.pool)
-        .await;
-
-        let expires_at = card.expires_at;
-        let remaining_days = expires_at.map(|e| (e - Utc::now()).num_days().max(0) + 1);
-        return Json(json!({
-            "success": true,
-            "message": "卡密已激活（设备已绑定）",
-            "data": {
-                "expires_at": expires_at,
-                "remaining_days": remaining_days,
-                "max_devices": card.max_devices
-            }
-        }));
-    }
-
-    // ── 事务：设备数检查 + 激活 INSERT + 卡状态更新 原子操作 ──
+    // ── 事务：设备去重 + 设备数检查 + 激活 INSERT + 卡状态更新 原子操作 ──
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => {
@@ -292,13 +261,64 @@ async fn activate(
         }
     };
 
-    // 事务内检查设备数量（带行锁防止竞态）
-    let device_count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM activations WHERE card_id = $1 FOR UPDATE")
-            .bind(card.id)
-            .fetch_one(&mut *tx)
+    // 事务内加锁检查重复（防止并发两个相同 card+device 都通过外层检查）
+    let existing_in_tx: Option<(Uuid,)> = match sqlx::query_as(
+        "SELECT id FROM activations WHERE card_id = $1 AND device_id_hash = $2 FOR UPDATE",
+    )
+    .bind(card.id)
+    .bind(&device_id_hash)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询重复激活失败: {}", e);
+            let _ = tx.rollback().await;
+            return Json(json!({"success": false, "message": "激活失败，请稍后重试"}));
+        }
+    };
+
+    if let Some((existing_id,)) = existing_in_tx {
+        if let Err(e) = sqlx::query("UPDATE activations SET last_verified_at = NOW() WHERE id = $1")
+            .bind(existing_id)
+            .execute(&mut *tx)
             .await
-            .unwrap_or((0,));
+        {
+            tracing::error!("更新激活时间失败: {}", e);
+            let _ = tx.rollback().await;
+            return Json(json!({"success": false, "message": "激活失败"}));
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::error!("提交事务失败: {}", e);
+            return Json(json!({"success": false, "message": "激活失败"}));
+        }
+        let remaining_days = card.expires_at.map(|e| (e - Utc::now()).num_days().max(0) + 1);
+        return Json(json!({
+            "success": true,
+            "message": "卡密已激活（设备已绑定）",
+            "data": {
+                "expires_at": card.expires_at,
+                "remaining_days": remaining_days,
+                "max_devices": card.max_devices
+            }
+        }));
+    }
+
+    // 事务内检查设备数量（已有 FOR UPDATE 行锁，和上面共用同一个锁）
+    let device_count: (i64,) = match sqlx::query_as(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM activations WHERE card_id = $1 FOR UPDATE) AS sub",
+    )
+    .bind(card.id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("查询设备数量失败: {}", e);
+            let _ = tx.rollback().await;
+            return Json(json!({"success": false, "message": "激活失败，请稍后重试"}));
+        }
+    };
 
     if device_count.0 >= card.max_devices as i64 {
         let _ = tx.rollback().await;
