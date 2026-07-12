@@ -48,10 +48,11 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      test: ["CMD", "sh", "-c", "rabbitmq-diagnostics ping && nc -z 127.0.0.1 5672"]
       interval: 10s
-      timeout: 5s
-      retries: 10
+      timeout: 10s
+      retries: 15
+      start_period: 30s
 
   # ─── 后端服务（不对外暴露，由 Nginx 代理）────────────
   app:

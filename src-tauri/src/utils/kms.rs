@@ -19,26 +19,98 @@ impl KmsManager {
     /// 初始化 KMS 管理器
     /// 优先级：环境变量 MASTER_KEY > 生成新密钥
     pub fn new() -> Result<Self> {
-        let master_key = if let Ok(key_hex) = env::var("MASTER_KEY") {
-            // 从环境变量读取主密钥（必须是 64 个十六进制字符，代表 32 字节）
-            let key_bytes = decode(&key_hex)
-                .map_err(|_| anyhow!("MASTER_KEY 必须是有效的十六进制字符串（64 个字符）"))?;
-            if key_bytes.len() != 32 {
-                return Err(anyhow!("MASTER_KEY 必须是 32 字节（64 个十六进制字符）"));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&key_bytes);
-            key
-        } else {
-            // 生成新的主密钥（仅用于开发环境）
-            tracing::warn!("未设置 MASTER_KEY 环境变量，生成临时主密钥（仅用于开发）");
-            let mut rng = rand::thread_rng();
-            let mut key = [0u8; 32];
-            rng.fill(&mut key);
-            key
-        };
-
+        let master_key = Self::load_or_generate_key()?;
         Ok(KmsManager { master_key })
+    }
+
+    /// 加载环境变量中的密钥，或自动生成并写入 .env
+    fn load_or_generate_key() -> Result<[u8; 32]> {
+        // 尝试从环境变量读取（空字符串视为未设置）
+        if let Ok(key_hex) = env::var("MASTER_KEY") {
+            let trimmed = key_hex.trim();
+            if !trimmed.is_empty() {
+                let key_hex = trimmed.trim_start_matches("0x");
+                if let Ok(key_bytes) = decode(key_hex) {
+                    if key_bytes.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&key_bytes);
+                        return Ok(key);
+                    }
+                }
+                tracing::warn!("MASTER_KEY 格式无效（需要 64 位十六进制字符串），将自动生成新密钥");
+            }
+        }
+
+        // 自动生成 32 字节随机密钥
+        let mut rng = rand::thread_rng();
+        let mut key = [0u8; 32];
+        rng.fill(&mut key);
+        let key_hex = encode(&key);
+        tracing::info!("已自动生成 MASTER_KEY: {}", key_hex);
+
+        // 尝试写入 .env 文件（可能不存在或只读，失败不影响启动）
+        Self::persist_key_to_env(&key_hex);
+
+        tracing::warn!(
+            "请将上面的 MASTER_KEY 保存到 .env 文件中，否则重启后所有已加密的数据将无法解密！"
+        );
+
+        Ok(key)
+    }
+
+    /// 将密钥写入 .env 文件（幂等，失败静默）
+    fn persist_key_to_env(key_hex: &str) {
+        let env_paths = [".env", ".env.production", ".env.development"];
+        for path in &env_paths {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue, // 文件不存在，尝试下一个
+            };
+
+            let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            let key_line = format!("MASTER_KEY={}", key_hex);
+
+            // 检查是否已有 MASTER_KEY 行
+            let existing = lines.iter().position(|l| l.starts_with("MASTER_KEY="));
+            match existing {
+                Some(idx) => {
+                    // 如果已有但内容不同则更新
+                    if lines[idx] != key_line {
+                        lines[idx] = key_line.clone();
+                    } else {
+                        return; // 内容一致，无需写入
+                    }
+                }
+                None => {
+                    // 没有 MASTER_KEY 行，追加
+                    lines.push(String::new());
+                    lines.push("# 主密钥（请勿泄露、勿修改，否则已加密数据无法解密）".to_string());
+                    lines.push(key_line.clone());
+                }
+            }
+
+            let new_content = lines.join("\n") + "\n";
+            match std::fs::write(path, &new_content) {
+                Ok(_) => {
+                    tracing::info!("已自动写入 MASTER_KEY 到 {}", path);
+                    return; // 成功写入一个即可
+                }
+                Err(e) => {
+                    tracing::warn!("写入 {} 失败（{}），请手动添加 MASTER_KEY", path, e);
+                }
+            }
+        }
+
+        // 所有文件都不存在，创建 .env
+        let content = format!(
+            "# 主密钥（请勿泄露、勿修改，否则已加密数据无法解密）\nMASTER_KEY={}\n",
+            key_hex
+        );
+        if let Err(e) = std::fs::write(".env", &content) {
+            tracing::warn!("创建 .env 文件失败（{}），请手动添加 MASTER_KEY", e);
+        } else {
+            tracing::info!("已创建 .env 文件并写入 MASTER_KEY");
+        }
     }
 
     /// 生成数据加密密钥（DEK）
