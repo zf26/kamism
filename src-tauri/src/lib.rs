@@ -77,24 +77,30 @@ pub async fn start_server() -> anyhow::Result<()> {
         .unwrap_or(9527);
 
     tracing::info!("正在连接数据库...");
-    let pool = db::create_pool(&database_url).await?;
+    let pool = db::create_pool(&database_url).await
+        .map_err(|e| anyhow::anyhow!("数据库连接失败: {}", e))?;
     tracing::info!("数据库连接成功");
 
-    db::run_migrations(&pool).await?;
+    db::run_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("数据库迁移失败: {}", e))?;
     tracing::info!("数据库迁移完成");
 
     tracing::info!("正在连接 Redis...");
-    let redis_client = redis::Client::open(redis_url.as_str())?;
-    let redis_conn = redis::aio::ConnectionManager::new(redis_client).await?;
+    let redis_client = redis::Client::open(redis_url.as_str())
+        .map_err(|e| anyhow::anyhow!("Redis URL 无效: {} (REDIS_URL={})", e, redis_url))?;
+    let redis_conn = redis::aio::ConnectionManager::new(redis_client).await
+        .map_err(|e| anyhow::anyhow!("Redis 连接失败: {}", e))?;
     tracing::info!("Redis 连接成功");
 
     tracing::info!("正在连接 RabbitMQ...");
-    let mq_channel = utils::mq::connect(&amqp_url).await?;
+    let mq_channel = utils::mq::connect(&amqp_url).await
+        .map_err(|e| anyhow::anyhow!("RabbitMQ 连接失败: {} (AMQP_URL={})", e, amqp_url))?;
     let mq_channel = Arc::new(mq_channel);
     tracing::info!("RabbitMQ 连接成功");
 
     tracing::info!("正在初始化 KMS...");
-    let kms = utils::kms::KmsManager::new()?;
+    let kms = utils::kms::KmsManager::new()
+        .map_err(|e| anyhow::anyhow!("KMS 初始化失败: {}", e))?;
     let encryptor = Arc::new(utils::kms::Encryptor::new(kms));
     tracing::info!("KMS 初始化成功");
 
@@ -193,7 +199,8 @@ pub async fn start_server() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await
+        .map_err(|e| anyhow::anyhow!("监听端口 {} 失败: {}", port, e))?;
     tracing::info!("KamiSM 服务器已启动，监听端口: {}", port);
 
     axum::serve(
