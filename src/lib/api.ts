@@ -222,6 +222,8 @@ export const cardsApi = {
   batchExtend: (ids: string[], days: number) =>
     api.post('/cards/batch-extend', { ids, days }),
   stats: () => api.get('/cards/stats'),
+  extend: (id: string, days: number) => api.patch(`/cards/${id}/extend`, { days }),
+  updateNote: (id: string, note: string) => api.patch(`/cards/${id}/note`, { note }),
   generate: (data: {
     app_id: string;
     count: number;

@@ -37,9 +37,9 @@ VALUES (
     'alipay',
     '支付宝电脑网站支付',
     FALSE,
-    'https://km.fly-fly.fun/api/pay/notify',
+    'https://yourdomain/api/pay/notify',
     'https://openapi.alipay.com/gateway.do',
-    'https://km.fly-fly.fun/dashboard'
+    'https://yourdomain/dashboard'
 ) ON CONFLICT (channel) DO NOTHING;
 
 -- 初始化 XorPay 配置（禁用状态）
@@ -48,7 +48,7 @@ VALUES (
     'xorpay',
     'XorPay',
     FALSE,
-    'https://km.fly-fly.fun/api/pay/notify'
+    'https://yourdomain/api/pay/notify'
 ) ON CONFLICT (channel) DO NOTHING;
 
 -- 初始化 MbdPay 配置（禁用状态）
@@ -57,7 +57,7 @@ VALUES (
     'mbdpay',
     'MbdPay（面包多）',
     FALSE,
-    'https://km.fly-fly.fun/api/pay/notify'
+    'https://yourdomain/api/pay/notify'
 ) ON CONFLICT (channel) DO NOTHING;
 
 COMMIT;

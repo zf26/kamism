@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { cardsApi, appsApi } from '../../lib/api';
-import { Plus, Ban, Trash2, RefreshCw, Copy, CheckCircle, Download, Clock, BarChart2 } from 'lucide-react';
+import { Plus, Ban, Trash2, RefreshCw, Copy, CheckCircle, Download, Clock, BarChart2, Edit2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useConfirm } from '../../stores/confirm';
 
@@ -39,6 +39,8 @@ export default function Cards() {
   const PAGE_SIZE_OPTIONS = [5, 10, 15, 20];
   const [showModal, setShowModal] = useState(false);
   const [showExtendModal, setShowExtendModal] = useState(false);
+  const [showSingleExtend, setShowSingleExtend] = useState<string | null>(null);
+  const [singleExtendDays, setSingleExtendDays] = useState(30);
   const [showStatsModal, setShowStatsModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -46,6 +48,8 @@ export default function Cards() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [stats, setStats] = useState<CardGroupStat[]>([]);
   const [statsLoading, setStatsLoading] = useState(false);
+  const [editingNote, setEditingNote] = useState<string | null>(null);
+  const [noteText, setNoteText] = useState('');
 
   const [form, setForm] = useState({
     app_id: '', count: 10, duration_days: 30, max_devices: 1, note: '',
@@ -160,6 +164,31 @@ export default function Cards() {
       } else toast.error(res.data.message);
     } catch { toast.error('操作失败'); }
     finally { setSubmitting(false); }
+  };
+
+  const handleSingleExtend = async () => {
+    if (!showSingleExtend) return;
+    setSubmitting(true);
+    try {
+      const res = await cardsApi.extend(showSingleExtend, singleExtendDays);
+      if (res.data.success) {
+        toast.success(res.data.message);
+        setShowSingleExtend(null);
+        load();
+      } else toast.error(res.data.message);
+    } catch { toast.error('操作失败'); }
+    finally { setSubmitting(false); }
+  };
+
+  const handleSaveNote = async (id: string) => {
+    try {
+      const res = await cardsApi.updateNote(id, noteText);
+      if (res.data.success) {
+        toast.success('备注已更新');
+        setEditingNote(null);
+        load();
+      } else toast.error(res.data.message);
+    } catch { toast.error('操作失败'); }
   };
 
   const handleShowStats = async () => {
@@ -282,11 +311,39 @@ export default function Cards() {
                 <td>{card.max_devices} 台</td>
                 <td><span className={`badge badge-${card.status}`}>{statusLabel[card.status]}</span></td>
                 <td>{card.expires_at ? new Date(card.expires_at).toLocaleDateString('zh-CN') : '—'}</td>
-                <td><span style={{ color: 'var(--text-muted)' }}>{card.note || '—'}</span></td>
+                <td style={{ maxWidth: 140 }}>
+                  {editingNote === card.id ? (
+                    <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                      <input
+                        value={noteText}
+                        onChange={e => setNoteText(e.target.value)}
+                        style={{ width: 100, fontSize: 12, padding: '2px 6px' }}
+                        autoFocus
+                        onKeyDown={e => { if (e.key === 'Enter') handleSaveNote(card.id); if (e.key === 'Escape') setEditingNote(null); }}
+                      />
+                      <button style={{ background: 'none', color: 'var(--success)', padding: 2, fontSize: 12 }} onClick={() => handleSaveNote(card.id)}>✓</button>
+                      <button style={{ background: 'none', color: 'var(--text-muted)', padding: 2, fontSize: 12 }} onClick={() => setEditingNote(null)}>✗</button>
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}
+                      onClick={() => { setEditingNote(card.id); setNoteText(card.note || ''); }}>
+                      <span style={{ color: 'var(--text-muted)', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 100 }}>
+                        {card.note || '—'}
+                      </span>
+                      <Edit2 size={11} style={{ color: 'var(--text-muted)', opacity: 0.5, flexShrink: 0 }} />
+                    </div>
+                  )}
+                </td>
                 <td>
                   <div style={{ display: 'flex', gap: 6 }}>
-                    {card.status !== 'disabled' && (
-                      <button className="btn btn-sm btn-danger" onClick={() => handleDisable(card.id)}><Ban size={12} /></button>
+                    {(card.status === 'unused' || card.status === 'active') && (
+                      <>
+                        <button className="btn btn-sm btn-ghost" title="续期"
+                          onClick={() => { setShowSingleExtend(card.id); setSingleExtendDays(30); }}>
+                          <Clock size={12} />
+                        </button>
+                        <button className="btn btn-sm btn-danger" onClick={() => handleDisable(card.id)}><Ban size={12} /></button>
+                      </>
                     )}
                     {card.status === 'disabled' && (
                       <button className="btn btn-sm btn-ghost" style={{ color: 'var(--success)', borderColor: 'rgba(52,211,153,0.3)' }} onClick={() => handleEnable(card.id)}><CheckCircle size={12} /></button>
@@ -404,6 +461,30 @@ export default function Cards() {
               <button className="btn btn-ghost" onClick={() => setShowExtendModal(false)}>取消</button>
               <button className="btn btn-primary" disabled={submitting || extendDays === 0} onClick={handleBatchExtend}>
                 {submitting ? <span className="spinner" /> : `确认${extendDays > 0 ? '延期' : '缩短'} ${Math.abs(extendDays)} 天`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── 单卡续期弹窗 ── */}
+      {showSingleExtend && (
+        <div className="modal-overlay" onClick={() => setShowSingleExtend(null)}>
+          <div className="modal" style={{ maxWidth: 360 }} onClick={e => e.stopPropagation()}>
+            <h2 className="modal-title">卡密续期</h2>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 16 }}>
+              正数延期，负数缩短。已激活卡密缩短后不早于当前时间。
+            </p>
+            <div className="form-group">
+              <label className="form-label">调整天数</label>
+              <input type="number" value={singleExtendDays}
+                onChange={e => setSingleExtendDays(+e.target.value)}
+                placeholder="正数延期，负数缩短" />
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={() => setShowSingleExtend(null)}>取消</button>
+              <button className="btn btn-primary" disabled={submitting || singleExtendDays === 0} onClick={handleSingleExtend}>
+                {submitting ? <span className="spinner" /> : `确认${singleExtendDays > 0 ? '延期' : '缩短'} ${Math.abs(singleExtendDays)} 天`}
               </button>
             </div>
           </div>

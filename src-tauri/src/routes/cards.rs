@@ -51,6 +51,16 @@ pub struct CardGroupStat {
 }
 
 #[derive(Deserialize)]
+pub struct ExtendCardRequest {
+    pub days: i32,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateNoteRequest {
+    pub note: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct CardQuery {
     pub app_id: Option<Uuid>,
     pub status: Option<String>,
@@ -75,6 +85,8 @@ pub fn cards_router(state: AppState) -> Router<AppState> {
         .route("/cards/:id", get(get_card).delete(delete_card))
         .route("/cards/:id/disable", patch(disable_card))
         .route("/cards/:id/enable", patch(enable_card))
+        .route("/cards/:id/extend", patch(extend_card))
+        .route("/cards/:id/note", patch(update_card_note))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
@@ -496,6 +508,80 @@ async fn enable_card(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "卡密已启用"})),
         Ok(_) => Json(json!({"success": false, "message": "卡密不存在、状态不符或无权限"})),
+        Err(e) => Json(json!({"success": false, "message": format!("操作失败: {}", e)})),
+    }
+}
+
+/// 单卡延期
+async fn extend_card(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ExtendCardRequest>,
+) -> Json<Value> {
+    let merchant_id = match merchant_id_from_claims(&claims) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if body.days == 0 {
+        return Json(json!({"success": false, "message": "days 不能为 0"}));
+    }
+
+    let r1 = sqlx::query(
+        "UPDATE cards SET duration_days = GREATEST(1, duration_days + $1)
+         WHERE id = $2 AND status = 'unused' AND merchant_id = $3"
+    )
+    .bind(body.days)
+    .bind(id)
+    .bind(merchant_id)
+    .execute(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let r2 = sqlx::query(
+        "UPDATE cards SET expires_at = GREATEST(NOW(), expires_at + ($1 || ' days')::INTERVAL)
+         WHERE id = $2 AND status = 'active' AND expires_at IS NOT NULL AND merchant_id = $3"
+    )
+    .bind(body.days)
+    .bind(id)
+    .bind(merchant_id)
+    .execute(&state.pool)
+    .await
+    .unwrap_or_default();
+
+    let affected = r1.rows_affected() + r2.rows_affected();
+    if affected > 0 {
+        let action = if body.days > 0 { "延期" } else { "缩短" };
+        Json(json!({"success": true, "message": format!("已{}{} 天", action, body.days.abs())}))
+    } else {
+        Json(json!({"success": false, "message": "卡密不存在或无权限"}))
+    }
+}
+
+/// 编辑备注
+async fn update_card_note(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateNoteRequest>,
+) -> Json<Value> {
+    let merchant_id = match merchant_id_from_claims(&claims) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let result = sqlx::query(
+        "UPDATE cards SET note = $1 WHERE id = $2 AND merchant_id = $3"
+    )
+    .bind(&body.note)
+    .bind(id)
+    .bind(merchant_id)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "备注已更新"})),
+        Ok(_) => Json(json!({"success": false, "message": "卡密不存在或无权限"})),
         Err(e) => Json(json!({"success": false, "message": format!("操作失败: {}", e)})),
     }
 }

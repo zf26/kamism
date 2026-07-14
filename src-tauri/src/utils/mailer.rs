@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lettre::{
     message::header::ContentType,
-    transport::smtp::authentication::Credentials,
+    transport::smtp::{authentication::Credentials, client::Tls},
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 
@@ -149,8 +149,26 @@ pub async fn send_verify_code(config: &MailerConfig, to_email: &str, code: &str)
 
     let creds = Credentials::new(config.smtp_user.clone(), config.smtp_pass.clone());
 
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)?
+    // port 465 → 直接 SSL 包裹；port 587 → STARTTLS
+    let tls = if config.smtp_port == 465 {
+        let tls_params = lettre::transport::smtp::client::TlsParameters::builder(
+            config.smtp_host.clone(),
+        )
+        .build()
+        .map_err(|e| anyhow::anyhow!("TLS 参数构建失败: {}", e))?;
+        Tls::Wrapper(tls_params)
+    } else {
+        let tls_params = lettre::transport::smtp::client::TlsParameters::builder(
+            config.smtp_host.clone(),
+        )
+        .build()
+        .map_err(|e| anyhow::anyhow!("TLS 参数构建失败: {}", e))?;
+        Tls::Required(tls_params)
+    };
+
+    let mailer = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.smtp_host)
         .port(config.smtp_port)
+        .tls(tls)
         .credentials(creds)
         .build();
 
