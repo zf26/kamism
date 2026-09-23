@@ -30,6 +30,9 @@ export default function Apps() {
   const [webhookLoading, setWebhookLoading] = useState(false);
   const [webhookSubmitting, setWebhookSubmitting] = useState(false);
   const [webhookExists, setWebhookExists] = useState(false);
+  // 首次自动生成的签名密钥：**只在这一处短暂持有**，关掉弹窗即从内存里丢掉。
+  // 服务端只在「本次替你生成」的那一次响应里回传明文，之后接口一律只给掩码。
+  const [generatedSecret, setGeneratedSecret] = useState<string | null>(null);
 
   const load = (p = page, ps = pageSize) => {
     setLoading(true);
@@ -70,10 +73,15 @@ export default function Apps() {
     setWebhookLoading(true);
     setWebhookForm({ url: '', secret: '', enabled: true, events: ['activate', 'verify'] });
     setWebhookExists(false);
+    setGeneratedSecret(null);
     try {
       const res = await webhookApi.get(app.id);
       if (res.data.success) {
         const d = res.data.data;
+        // ⚠️ 接口回的是**掩码**（前4 + **** + 后4），不是可用密钥 —— 所以这里
+        // 刻意把 secret 置空：提交时 `secret || undefined` → 字段从 JSON 里消失
+        // → 后端按「未提供」处理 → 保留库里的原密钥。
+        // 这正是「不修改请留空」的实现方式；也是「改个 URL 就把密钥搞丢」的旧 bug 现场。
         setWebhookForm({ url: d.url, secret: '', enabled: d.enabled, events: d.events });
         setWebhookExists(true);
       }
@@ -92,10 +100,30 @@ export default function Apps() {
         enabled: webhookForm.enabled,
         events: webhookForm.events,
       });
-      if (res.data.success) { toast.success('Webhook 已保存'); setWebhookApp(null); }
+      if (res.data.success) {
+        const fresh = res.data.data?.secret as string | undefined;
+        if (fresh) {
+          // 服务端本次替我们生成了密钥 —— 这是**唯一一次**能看到它的机会
+          // （之后接口只回掩码）。不关弹窗，切到「密钥展示」视图，先让商户复制走。
+          setGeneratedSecret(fresh);
+          setWebhookExists(true);
+        } else {
+          toast.success('Webhook 已保存');
+          setWebhookApp(null);
+        }
+      }
       else toast.error(res.data.message);
     } catch { toast.error('保存失败'); }
     finally { setWebhookSubmitting(false); }
+  };
+
+  const copySecret = async (s: string) => {
+    try {
+      await navigator.clipboard.writeText(s);
+      toast.success('签名密钥已复制');
+    } catch {
+      toast.error('复制失败，请手动选中复制');
+    }
   };
 
   const handleWebhookDelete = async () => {
@@ -244,6 +272,33 @@ export default function Apps() {
             </p>
             {webhookLoading ? (
               <div style={{ textAlign: 'center', padding: 40 }}><span className="spinner" /></div>
+            ) : generatedSecret ? (
+              /* 一次性密钥展示 —— 关掉这个弹窗后就再也取不回来了 */
+              <div>
+                <p style={{ fontSize: 13, color: 'var(--text-dim)', lineHeight: 1.7 }}>
+                  Webhook 配置已保存。<strong style={{ color: 'var(--text)' }}>签名密钥只显示这一次</strong>，
+                  请立刻复制到你接收端的配置里 —— 保存后接口只会返回掩码，无法再取回明文。
+                </p>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'stretch', margin: '14px 0' }}>
+                  <code style={{
+                    flex: 1, padding: '10px 12px', background: 'var(--bg)', border: '1px solid var(--border-light)',
+                    borderRadius: 6, fontSize: 13, wordBreak: 'break-all', color: 'var(--text)', userSelect: 'all',
+                  }}>{generatedSecret}</code>
+                  <button type="button" className="btn btn-ghost" onClick={() => copySecret(generatedSecret)} title="复制密钥">
+                    <Copy size={14} />
+                  </button>
+                </div>
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.7 }}>
+                  验签方式：对<strong>原始请求体</strong>做 HMAC-SHA256（密钥即上面这串），结果放在
+                  <code>X-KamiSM-Signature</code> 头里，格式 <code>sha256=&lt;hex&gt;</code>。
+                  以后修改回调 URL、增删订阅事件或开关时，密钥输入框<strong>留空即保持这把密钥不变</strong>。
+                </p>
+                <div className="modal-actions">
+                  <button type="button" className="btn btn-primary" onClick={() => { setGeneratedSecret(null); setWebhookApp(null); }}>
+                    我已保存，关闭
+                  </button>
+                </div>
+              </div>
             ) : (
               <form onSubmit={handleWebhookSave}>
                 <div className="form-group">
@@ -257,14 +312,17 @@ export default function Apps() {
                   />
                 </div>
                 <div className="form-group">
-                  <label className="form-label">签名密钥（留空则自动生成）</label>
+                  <label className="form-label">
+                    {webhookExists ? '签名密钥（留空则保持现有密钥不变）' : '签名密钥（留空则自动生成）'}
+                  </label>
                   <input
                     value={webhookForm.secret}
                     onChange={e => setWebhookForm(f => ({ ...f, secret: e.target.value }))}
                     placeholder={webhookExists ? '不修改请留空' : '留空自动生成'}
                   />
                   <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
-                    推送时通过 <code>X-KamiSM-Signature</code> 头携带 HMAC-SHA256 签名
+                    保存后无法再查看完整密钥（接口只返回掩码）
+                    {webhookExists && '；不修改就留空，不会覆盖已有密钥'}
                   </p>
                 </div>
                 <div className="form-group">
