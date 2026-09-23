@@ -15,6 +15,16 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
+      # 加密主密钥：必须由 .env 显式提供（openssl rand -hex 32 生成）
+      #
+      # 以前这里没有传 MASTER_KEY，后端就会在容器内「临时生成一把」并写进 /app/.env；
+      # 于是每次 `docker compose up -d --build`（README 推荐的升级方式）都会换一把新密钥，
+      # 已加密的 api_key / 邮箱 / 卡密 / 设备 ID 全部变成解不开的密文。现在：
+      #   1) 这里显式透传，.env 里配一次即可长期稳定；
+      #   2) 万一没配，后端在「库里有数据」时会拒绝启动并明确报错，而不是悄悄跑起来。
+      MASTER_KEY: ${MASTER_KEY:?请在 .env 中设置 MASTER_KEY（openssl rand -hex 32）}
+      # 单容器内 Nginx 反代到 127.0.0.1，因此信任本机
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1}
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       SMTP_HOST: ${SMTP_HOST:-}

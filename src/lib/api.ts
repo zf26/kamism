@@ -192,9 +192,8 @@ export const adminApi = {
     max_devices?: number;
     max_gen_once?: number;
   }) => api.patch(`/admin/plan-configs/${id}`, data),
-  // 管理员 API Key 管理
-  getApiKey: () => api.get('/admin/api-key'),
-  regenerateApiKey: () => api.post('/admin/api-key/regenerate'),
+  // 注：此前有 getApiKey / regenerateApiKey 两个方法，已随 /admin/api-key 接口一并移除
+  //（该接口依赖的 admins.api_key 列从未存在于任何迁移中，是半成品）
 };
 
 // ─── Apps ───────────────────────────────────────────

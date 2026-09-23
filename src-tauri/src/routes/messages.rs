@@ -16,7 +16,7 @@
 use crate::{
     middleware::auth::{admin_only, auth_middleware, AppState},
     models::message::{Message as Msg, MessageAdminView, MessageMerchantView},
-    utils::{jwt::Claims, ws::WsRegistry},
+    utils::{db_guard, jwt::Claims, ws::WsRegistry},
 };
 use axum::{
     extract::{
@@ -54,6 +54,17 @@ pub fn messages_merchant_router(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
+/// WebSocket 路由。
+///
+/// ⚠️ 注意这里**没有**（也没办法）挂 `auth_middleware`：WS 升级依赖
+/// `WebSocketUpgrade` 提取器，而 `middleware::from_fn` 拿到的是
+/// `Request<Body>`，会把该提取器吃掉使路由匹配失败。
+///
+/// 因此**鉴权必须在 `ws_handler` 内部自己完成**（验签 + 版本校验 + 角色检查，
+/// 三样都不能少）。`ws_handler` 上有详细注释说明为什么 ——
+/// 早期版本只做了验签，导致令牌吊销机制被这条路径整个绕过。
+///
+/// 以后往这个 router 里加路由时，请同样在 handler 内部做完整鉴权。
 pub fn messages_ws_router() -> Router<AppState> {
     Router::new().route("/ws/messages", get(ws_handler))
 }
@@ -127,16 +138,25 @@ async fn admin_send_message(
         if let Some(ref email) = body.target_email {
             // 按 email_hash 查找商户
             let email_hash = crate::db::encrypted_fields::EncryptedFieldsOps::generate_hash(email);
-            let row: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM merchants WHERE email_hash = $1 AND status = 'active'",
+            let row = db_guard::optional(
+                sqlx::query_as::<_, (Uuid,)>(
+                    "SELECT id FROM merchants WHERE email_hash = $1 AND status = 'active'",
+                )
+                .bind(&email_hash)
+                .fetch_optional(&state.pool),
+                "查询收件商户邮箱",
             )
-            .bind(&email_hash)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
+            .await;
+            // ⚠️ 曾用 `.unwrap_or(None)`：数据库一抖 → 走到下面那条「未找到该邮箱对应的商户」。
+            // 管理员明明在商户列表里看到这个邮箱，却被系统告知「没这个商户」——
+            // 他会反复核对邮箱拼写、怀疑自己看错了列表，运维去查 merchants 表也查不出任何异常
+            // （因为数据是好的），真正的问题（数据库/连接池）在日志里一个字都没有。
             match row {
-                Some((id,)) => Some(id),
-                None => return Json(json!({"success": false, "message": "未找到该邮箱对应的商户"})),
+                db_guard::QueryOutcome::Found((id,)) => Some(id),
+                db_guard::QueryOutcome::NotFound => {
+                    return Json(json!({"success": false, "message": "未找到该邮箱对应的商户"}))
+                }
+                db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
             }
         } else if let Some(id) = body.target_id {
             Some(id)
@@ -198,7 +218,7 @@ async fn admin_send_message(
 
             Json(json!({"success": true, "message": "发送成功", "data": {"id": new_id}}))
         }
-        Err(e) => Json(json!({"success": false, "message": format!("发送失败: {}", e)})),
+        Err(e) => db_guard::internal_error("发送消息", e),
     }
 }
 
@@ -213,15 +233,25 @@ async fn admin_list_messages(
     let offset = (page - 1) * page_size;
 
     let (total, rows): ((i64,), Vec<Msg>) = if let Some(ref t) = q.msg_type {
-        let total = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM messages WHERE type = $1",
+        // ⚠️ 曾用 `.unwrap_or((0,))`：查询失败 → total 变成 0。管理员看到「共 0 条」，
+        // 会以为消息被删光了或自己发失败了，接着会去重新群发一遍 ——
+        // 等数据库恢复，商户收到的是三份重复公告。分页组件也会显示 0 页，
+        // 列表看起来真的像空的（rows 同样被降级成空），前后台互相佐证这个假象。
+        let total = match db_guard::scalar(
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM messages WHERE type = $1")
+                .bind(t)
+                .fetch_one(&state.pool),
+            "统计指定类型消息总数",
         )
-        .bind(t)
-        .fetch_one(&state.pool)
         .await
-        .unwrap_or((0,));
+        {
+            db_guard::ScalarOutcome::Found(v) => v,
+            db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+        };
 
-        let rows = sqlx::query_as::<_, Msg>(
+        // ⚠️ 曾用 `.unwrap_or_default()`：和上面的 total 一起静默变空 ——
+        // 「消息 0 条 + 列表为空」在界面上完全自洽，看不出是故障。
+        let rows = match sqlx::query_as::<_, Msg>(
             "SELECT * FROM messages WHERE type = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
         )
         .bind(t)
@@ -229,21 +259,43 @@ async fn admin_list_messages(
         .bind(offset)
         .fetch_all(&state.pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("查询消息列表失败: type={} err={}", t, e);
+                return db_guard::server_busy();
+            }
+        };
         (total, rows)
     } else {
-        let total = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM messages")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or((0,));
-        let rows = sqlx::query_as::<_, Msg>(
+        // ⚠️ 曾用 `.unwrap_or((0,))`：数据库故障时 total 静默变 0，
+        // 而下面的 rows 也一起变成空列表 —— 于是「一条消息都没有」这个画面
+        // 在数字和列表上完全自洽，看起来就是「后台确实没发过消息」，
+        // 而不是「查不出来」。管理员的第一反应是去追责/重发，不是报故障。
+        let total = match db_guard::scalar(
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM messages").fetch_one(&state.pool),
+            "统计消息总数",
+        )
+        .await
+        {
+            db_guard::ScalarOutcome::Found(v) => v,
+            db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+        };
+        // ⚠️ 同上（全量分支）。
+        let rows = match sqlx::query_as::<_, Msg>(
             "SELECT * FROM messages ORDER BY created_at DESC LIMIT $1 OFFSET $2",
         )
         .bind(page_size)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
-        .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("查询全部消息列表失败: err={}", e);
+                return db_guard::server_busy();
+            }
+        };
         (total, rows)
     };
 
@@ -251,13 +303,23 @@ async fn admin_list_messages(
     let views: Vec<MessageAdminView> = {
         let mut out = Vec::with_capacity(rows.len());
         for m in rows {
-            let read_count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM message_reads WHERE message_id = $1",
+            // ⚠️ 曾用 `.unwrap_or((0,))`：查询失败 → 该条消息的已读数显示 0。
+            // 管理员看着「已读 0 人」，会判定商户根本没看公告，于是改用短信/电话逐个通知 ——
+            // 实际上商户早就在站内看过。对外的运营判断被一个坏掉的数字带偏了，
+            // 而这个 0 长得和真实的 0 完全一样，事后无从分辨哪些数据是假的。
+            let read_count = match db_guard::scalar(
+                sqlx::query_as::<_, (i64,)>(
+                    "SELECT COUNT(*) FROM message_reads WHERE message_id = $1",
+                )
+                .bind(m.id)
+                .fetch_one(&state.pool),
+                "统计消息已读数",
             )
-            .bind(m.id)
-            .fetch_one(&state.pool)
             .await
-            .unwrap_or((0,));
+            {
+                db_guard::ScalarOutcome::Found(v) => v,
+                db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+            };
             out.push(MessageAdminView {
                 id: m.id,
                 msg_type: m.msg_type,
@@ -292,14 +354,23 @@ async fn admin_update_message(
     Json(body): Json<UpdateMessageRequest>,
 ) -> Json<Value> {
     // 检查消息是否存在
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM messages WHERE id = $1")
+    // ⚠️ 曾用 `.unwrap_or(None)`：数据库故障 → exists 为 None → 返回「消息不存在」。
+    // 管理员明明在列表里看着这条消息、URL 里的 id 也是从那条消息点进来的，
+    // 编辑时却被告知「消息不存在」。他会去刷新页面、怀疑别人刚删了这条，
+    // 而数据库里这条记录完好无损 —— 排查方向从一开始就是错的。
+    let exists = db_guard::optional(
+        sqlx::query_as::<_, (Uuid,)>("SELECT id FROM messages WHERE id = $1")
             .bind(id)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-    if exists.is_none() {
-        return Json(json!({"success": false, "message": "消息不存在"}));
+            .fetch_optional(&state.pool),
+        "校验消息是否存在",
+    )
+    .await;
+    match exists {
+        db_guard::QueryOutcome::Found(_) => {}
+        db_guard::QueryOutcome::NotFound => {
+            return Json(json!({"success": false, "message": "消息不存在"}))
+        }
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
     }
 
     let expires_at: Option<chrono::DateTime<chrono::Utc>> = body
@@ -326,7 +397,7 @@ async fn admin_update_message(
 
     match result {
         Ok(_) => Json(json!({"success": true, "message": "更新成功"})),
-        Err(e) => Json(json!({"success": false, "message": format!("更新失败: {}", e)})),
+        Err(e) => db_guard::internal_error("更新消息", e),
     }
 }
 
@@ -344,7 +415,7 @@ async fn admin_delete_message(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "删除成功"})),
         Ok(_) => Json(json!({"success": false, "message": "消息不存在"})),
-        Err(e) => Json(json!({"success": false, "message": format!("删除失败: {}", e)})),
+        Err(e) => db_guard::internal_error("删除消息", e),
     }
 }
 
@@ -358,16 +429,26 @@ async fn merchant_list_notices(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages
-         WHERE type = 'notice'
-           AND (expires_at IS NULL OR expires_at > NOW())",
+    // ⚠️ 曾用 `.unwrap_or((0,))`：查询失败 → total 变 0，同时下面的 rows 也被降级成空，
+    // 商户端「公告」页于是显示「暂无公告」并安静地停在那里。这比报错危险得多：
+    // 平台方发了停机维护通知，商户看不到也不会察觉异常，到点直接撞上服务中断来找客服，
+    // 而客服查后台又看到公告确实发出去了（数据是好的），双方各说各话。
+    let total = match db_guard::scalar(
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages
+             WHERE type = 'notice'
+               AND (expires_at IS NULL OR expires_at > NOW())",
+        )
+        .fetch_one(&state.pool),
+        "统计有效公告总数",
     )
-    .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        db_guard::ScalarOutcome::Found(v) => v,
+        db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+    };
 
-    let rows: Vec<Msg> = sqlx::query_as(
+    let rows: Vec<Msg> = match sqlx::query_as(
         "SELECT * FROM messages
          WHERE type = 'notice'
            AND (expires_at IS NULL OR expires_at > NOW())
@@ -378,7 +459,17 @@ async fn merchant_list_notices(
     .bind(offset)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        // ⚠️ 曾用 `.unwrap_or_default()`：商户的公告列表静默变空。
+        // 商户看不到平台公告（比如「服务维护通知」「套餐规则变更」），
+        // 而他**完全不知道有公告存在** —— 这类"没看到通知"的后果
+        // 往往在几天后才以「我不知道有这回事」的形式暴露出来。
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询商户公告列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
     let views: Vec<MessageMerchantView> = rows
         .into_iter()
@@ -421,17 +512,27 @@ async fn merchant_list_messages(
     let offset = (page - 1) * page_size;
 
     // 查询：全体广播 + 发给自己的单发消息
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages
-         WHERE type = 'message'
-           AND (target_type = 'all' OR (target_type = 'single' AND target_id = $1))",
+    // ⚠️ 曾用 `.unwrap_or((0,))`：查询失败 → total 变 0，rows 也一起变空，
+    // 商户端「站内信」页显示「共 0 条 / 暂无数据」。商户会得出结论
+    // 「平台从来没给我发过消息」，而真相反而是查询本身就是坏的。
+    // 由于未读数的降级方向恰好也是 0，两个接口会一起给出「一切正常」的假象。
+    let total = match db_guard::scalar(
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages
+             WHERE type = 'message'
+               AND (target_type = 'all' OR (target_type = 'single' AND target_id = $1))",
+        )
+        .bind(merchant_id)
+        .fetch_one(&state.pool),
+        "统计商户站内信总数",
     )
-    .bind(merchant_id)
-    .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        db_guard::ScalarOutcome::Found(v) => v,
+        db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+    };
 
-    let rows: Vec<Msg> = sqlx::query_as(
+    let rows: Vec<Msg> = match sqlx::query_as(
         "SELECT * FROM messages
          WHERE type = 'message'
            AND (target_type = 'all' OR (target_type = 'single' AND target_id = $1))
@@ -443,22 +544,44 @@ async fn merchant_list_messages(
     .bind(offset)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        // ⚠️ 曾用 `.unwrap_or_default()`：用户自己的消息列表静默变空。
+        // 用户会以为「平台从没给我发过消息」，而实际上可能有未读的重要通知。
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询用户消息列表失败: merchant_id={} err={}", merchant_id, e);
+            return db_guard::server_busy();
+        }
+    };
 
     // 批量查询已读状态
     let message_ids: Vec<Uuid> = rows.iter().map(|m| m.id).collect();
     let read_ids: Vec<(Uuid,)> = if message_ids.is_empty() {
         vec![]
     } else {
-        sqlx::query_as(
-            "SELECT message_id FROM message_reads
-             WHERE merchant_id = $1 AND message_id = ANY($2)",
+        // ⚠️ 这一处归到「可降级但必须留痕」类（本文件里唯一一处），
+        // 与上面几处的处理**故意不同**，理由如下：
+        //
+        // 已读状态只影响列表上的「已读/未读」角标，不参与任何业务判定。
+        // 查不出来时**全当未读**是安全方向（收严：不会把未读显示成已读，
+        // 用户不会漏掉消息），代价只是角标不准。
+        //
+        // 而如果这里返回 503，就会因为一个角标问题让整个消息列表打不开 ——
+        // 那比"角标不准"糟得多。
+        //
+        // 关键是**必须留痕**：用 `optional_lenient`（失败记 warn 后返回 None），
+        // 而不是 `.unwrap_or_default()`（什么都不说）。
+        db_guard::lenient_all(
+            sqlx::query_as::<_, (Uuid,)>(
+                "SELECT message_id FROM message_reads
+                 WHERE merchant_id = $1 AND message_id = ANY($2)",
+            )
+            .bind(merchant_id)
+            .bind(&message_ids)
+            .fetch_all(&state.pool),
+            "批量查询消息已读状态（角标，失败时按全未读处理）",
         )
-        .bind(merchant_id)
-        .bind(&message_ids)
-        .fetch_all(&state.pool)
         .await
-        .unwrap_or_default()
     };
     let read_set: std::collections::HashSet<Uuid> = read_ids.into_iter().map(|(id,)| id).collect();
 
@@ -500,18 +623,29 @@ async fn merchant_unread_count(
         Err(_) => return Json(json!({"success": false, "message": "无效用户 ID"})),
     };
 
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM messages
-         WHERE type = 'message'
-           AND (target_type = 'all' OR (target_type = 'single' AND target_id = $1))
-           AND id NOT IN (
-               SELECT message_id FROM message_reads WHERE merchant_id = $1
-           )",
+    // ⚠️ 曾用 `.unwrap_or((0,))`：查询失败 → 未读数静默变成 0。
+    // 这是整个文件里最刺眼的一处：商户端的小红点会清空，商户以为消息已经看完了，
+    // 于是再也不会去点开站内信 —— 平台发的续费提醒、风控通知就这么躺在库里没人读。
+    // 故障的表现是「一切已读」这个最让人安心的状态，没有任何一方会觉得需要报障，
+    // 直到真的错过了截止时间。降级方向刚好指向「不需要处理」，这是最坏的方向。
+    let count = match db_guard::scalar(
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages
+             WHERE type = 'message'
+               AND (target_type = 'all' OR (target_type = 'single' AND target_id = $1))
+               AND id NOT IN (
+                   SELECT message_id FROM message_reads WHERE merchant_id = $1
+               )",
+        )
+        .bind(merchant_id)
+        .fetch_one(&state.pool),
+        "统计商户未读消息数",
     )
-    .bind(merchant_id)
-    .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        db_guard::ScalarOutcome::Found(v) => v,
+        db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+    };
 
     Json(json!({"success": true, "data": {"unread": count.0}}))
 }
@@ -541,7 +675,7 @@ async fn merchant_mark_read(
 
     match result {
         Ok(_) => Json(json!({"success": true, "message": "已标记已读"})),
-        Err(e) => Json(json!({"success": false, "message": format!("操作失败: {}", e)})),
+        Err(e) => db_guard::internal_error("消息操作", e),
     }
 }
 
@@ -588,6 +722,62 @@ async fn ws_handler(
         }
     };
 
+    // ── 令牌版本（吊销）校验：这里曾经漏掉，是个安全旁路 ────────────────────
+    //
+    // ⚠️ 这个 handler **不走 `auth_middleware`**（WebSocket 升级需要 `WebSocketUpgrade`
+    // 提取器，而 `middleware::from_fn` 的 `Request<Body>` 会把它吃掉，
+    // 所以 router 层没办法复用那套中间件）。于是 `auth_middleware` 里的
+    // 版本校验也一并漏了 —— 只做了 `verify_token`（验签）。
+    //
+    // 后果是**批次 4 刚建立的令牌吊销机制被整条绕过**：
+    // 签名的有效性是「2 小时内」的事，吊销的有效性靠的是版本号比对。
+    // 只验签意味着**改密、封号、重置 Key 都踢不掉已持有的旧 token** ——
+    // 只要攻击者拿旧 token 连 WS，就能继续收实时推送（含公告、站内信）。
+    //
+    // 实测（同一个旧 token）：
+    //   旧 token 调 /merchant/messages → 200
+    //   改密码 → 旧 token 再调 /merchant/messages → 401   ← 普通接口是对的
+    //   旧 token 连 /ws/messages → 101 Switching Protocols ← 漏洞
+    //
+    // 修复方向与 `auth_middleware` 保持一致，且**不做任何简化** —
+    // `VersionCheck` 三态必须逐个处理，理由见那个枚举的注释。
+    match crate::utils::jwt::check_token_version(
+        &state.pool,
+        &mut state.redis.clone(),
+        &claims.role,
+        &merchant_id,
+        claims.ver,
+    )
+    .await
+    {
+        crate::utils::jwt::VersionCheck::Valid => {}
+        crate::utils::jwt::VersionCheck::Revoked { token_ver, current_ver } => {
+            tracing::warn!(
+                "WebSocket 连接被拒：令牌已吊销: merchant_id={} token_ver={} current_ver={}",
+                merchant_id,
+                token_ver,
+                current_ver
+            );
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "登录状态已失效，请重新登录",
+            )
+                .into_response();
+        }
+        crate::utils::jwt::VersionCheck::Unavailable(e) => {
+            // 与 `auth_middleware` 同样选 fail-closed：无法判定授权的连接
+            // 不能被当成「已授权」。否则「把 Redis 搞挂」就成了绕过吊销的手法。
+            // 注意这里**必须 `error!`** —— 静默拒绝会让线上出现
+            // 「WebSocket 突然全连不上」而没人知道原因。
+            tracing::error!("WebSocket 令牌版本校验无法完成，拒绝连接（fail-closed）: {}", e);
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "服务暂时不可用，请稍后重试",
+            )
+                .into_response();
+        }
+    }
+
     ws.on_upgrade(move |socket| handle_ws(socket, merchant_id, state.ws_registry))
         .into_response()
 }
@@ -601,13 +791,23 @@ async fn handle_ws(socket: WebSocket, merchant_id: Uuid, registry: WsRegistry) {
     // 用 Arc<Mutex> 包裹 sink，使两个 task 均可访问
     let ws_tx = Arc::new(Mutex::new(ws_tx));
 
-    // 注册连接，获取内部消息接收端
-    let mut msg_rx = registry.register(merchant_id).await;
-    let registry_for_cleanup = registry.clone();
+    // 注册连接，获取内部消息接收端 + 本连接的发送端句柄
+    let (mut msg_rx, my_sender) = registry.register(merchant_id).await;
 
-    // 发送在线确认帧
+    // 发送在线确认帧。
+    //
+    // ⚠️ 这里失败要**先注销再返回**：早期版本直接 `return`，于是这个连接
+    // 已经写进注册表、却没有任何 task 在消费它，就永久留在 map 里
+    // （且因为当时 channel 是 unbounded，`cleanup_dead` 也不会清它）。
     let hello = serde_json::json!({"event": "connected", "merchant_id": merchant_id}).to_string();
-    if ws_tx.lock().await.send(WsMessage::Text(hello.into())).await.is_err() {
+    if ws_tx
+        .lock()
+        .await
+        .send(WsMessage::Text(hello.into()))
+        .await
+        .is_err()
+    {
+        registry.unregister(merchant_id, &my_sender).await;
         return;
     }
 
@@ -638,6 +838,13 @@ async fn handle_ws(socket: WebSocket, merchant_id: Uuid, registry: WsRegistry) {
         _ = task_b => {}
     }
 
-    registry_for_cleanup.cleanup_dead_pub(merchant_id).await;
+    // ── 显式注销本连接 ──────────────────────────────────────────────────
+    //
+    // 精确摘掉**这一个** sender（同一商户可能有多个标签页，不能整体删）。
+    // 过去这里只调 `cleanup_dead_pub`，它按 `is_closed()` 扫 —— 而当时
+    // channel 是 unbounded，sender 从不「closed」，于是什么都没清掉。
+    registry.unregister(merchant_id, &my_sender).await;
+    // 兜底：顺手清掉同商户其他已断开的连接
+    registry.cleanup_dead_pub(merchant_id).await;
 }
 

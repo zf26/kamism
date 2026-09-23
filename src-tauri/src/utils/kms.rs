@@ -13,49 +13,99 @@ use std::env;
 pub struct KmsManager {
     /// 主密钥（Master Key），从环境变量读取或生成
     master_key: [u8; 32],
+    /// 本进程是否「临时生成」了主密钥（即没有可用配置）
+    /// 启动流程用它判断「库里有加密数据、但密钥是新的」这种数据损坏场景
+    auto_generated: bool,
+}
+
+/// 解析 MASTER_KEY 文本
+///
+/// - `Ok(None)`：未配置或空串 —— 首次安装，允许自动生成
+/// - `Ok(Some(key))`：合法的 32 字节密钥
+/// - `Err(..)`：**配置了但非法** —— 调用方必须拒绝启动
+///
+/// 为什么「非法」要拒绝启动，而不是像以前那样"自动生成一把新的继续跑"：
+/// 换密钥等于已加密字段（api_key / 邮箱 / 卡密 / 设备 ID）全部解不开，而这属于
+/// 静默失败 —— 服务照常启动、接口照常 200，只是数据永远读不回来。相比之下
+/// 启动失败是可见、可修的。所以：非法就是错误，不做兜底。
+pub fn parse_master_key(raw: Option<&str>) -> Result<Option<[u8; 32]>> {
+    let raw = match raw {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let hex_part = trimmed
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+
+    let bytes = decode(hex_part).map_err(|e| {
+        anyhow!(
+            "MASTER_KEY 不是合法的十六进制字符串（{}）。\
+             请用 `openssl rand -hex 32` 生成 64 位十六进制密钥；\
+             注意不要保留 env.example 里的中文占位说明。当前值长度 {} 字符。",
+            e,
+            trimmed.chars().count()
+        )
+    })?;
+
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "MASTER_KEY 长度错误：需要 32 字节（64 个十六进制字符），实际 {} 字节（{} 个字符）",
+            bytes.len(),
+            hex_part.chars().count()
+        ));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(Some(key))
 }
 
 impl KmsManager {
     /// 初始化 KMS 管理器
-    /// 优先级：环境变量 MASTER_KEY > 生成新密钥
     pub fn new() -> Result<Self> {
-        let master_key = Self::load_or_generate_key()?;
-        Ok(KmsManager { master_key })
+        let (master_key, auto_generated) = Self::load_or_generate_key()?;
+        Ok(KmsManager {
+            master_key,
+            auto_generated,
+        })
     }
 
-    /// 加载环境变量中的密钥，或自动生成并写入 .env
-    fn load_or_generate_key() -> Result<[u8; 32]> {
-        // 尝试从环境变量读取（空字符串视为未设置）
-        if let Ok(key_hex) = env::var("MASTER_KEY") {
-            let trimmed = key_hex.trim();
-            if !trimmed.is_empty() {
-                let key_hex = trimmed.trim_start_matches("0x");
-                if let Ok(key_bytes) = decode(key_hex) {
-                    if key_bytes.len() == 32 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&key_bytes);
-                        return Ok(key);
-                    }
-                }
-                tracing::warn!("MASTER_KEY 格式无效（需要 64 位十六进制字符串），将自动生成新密钥");
-            }
+    /// 本进程的主密钥是否来自「临时生成」（而非显式配置）
+    pub fn is_auto_generated(&self) -> bool {
+        self.auto_generated
+    }
+
+    /// 加载环境变量中的密钥；未配置时自动生成并尽量持久化
+    /// 返回 (密钥, 是否为临时生成)
+    fn load_or_generate_key() -> Result<([u8; 32], bool)> {
+        if let Some(key) = parse_master_key(env::var("MASTER_KEY").ok().as_deref())? {
+            tracing::info!("MASTER_KEY 已从环境变量加载（32 字节）");
+            return Ok((key, false));
         }
 
-        // 自动生成 32 字节随机密钥
+        // 未配置：生成一把临时密钥（首次安装可直接跑起来）
         let mut rng = rand::thread_rng();
         let mut key = [0u8; 32];
         rng.fill(&mut key);
         let key_hex = encode(&key);
-        tracing::info!("已自动生成 MASTER_KEY: {}", key_hex);
 
-        // 尝试写入 .env 文件（可能不存在或只读，失败不影响启动）
-        Self::persist_key_to_env(&key_hex);
+        // 测试进程不落盘：避免 `cargo test` 在仓库里留下一个随机 .env
+        if !cfg!(test) {
+            Self::persist_key_to_env(&key_hex);
+        }
 
         tracing::warn!(
-            "请将上面的 MASTER_KEY 保存到 .env 文件中，否则重启后所有已加密的数据将无法解密！"
+            "未配置 MASTER_KEY，本进程已临时生成一把：{} —— 请立即写入环境变量（容器部署请写进 compose 的 environment）。\
+             否则进程重启（尤其是容器重建）后，所有已加密字段都无法解密。",
+            key_hex
         );
 
-        Ok(key)
+        Ok((key, true))
     }
 
     /// 将密钥写入 .env 文件（幂等，失败静默）
@@ -92,7 +142,11 @@ impl KmsManager {
             let new_content = lines.join("\n") + "\n";
             match std::fs::write(path, &new_content) {
                 Ok(_) => {
-                    tracing::info!("已自动写入 MASTER_KEY 到 {}", path);
+                    tracing::info!(
+                        "已自动写入 MASTER_KEY 到 {}（注意：容器内的 .env 会随容器重建丢失，\
+                         容器部署请改用 compose 的 environment / 宿主机的 .env 传入）",
+                        path
+                    );
                     return; // 成功写入一个即可
                 }
                 Err(e) => {
@@ -237,6 +291,58 @@ mod tests {
         // 但都能正确解密
         assert_eq!(plaintext, encryptor.decrypt(&encrypted1).unwrap());
         assert_eq!(plaintext, encryptor.decrypt(&encrypted2).unwrap());
+    }
+
+    #[test]
+    fn master_key_absent_means_first_install() {
+        assert!(parse_master_key(None).unwrap().is_none());
+        assert!(parse_master_key(Some("")).unwrap().is_none());
+        assert!(parse_master_key(Some("   ")).unwrap().is_none());
+    }
+
+    #[test]
+    fn master_key_accepts_common_valid_forms() {
+        let hex = "0f".repeat(32);
+
+        let key = parse_master_key(Some(&hex)).unwrap().unwrap();
+        assert_eq!(key, [0x0fu8; 32]);
+
+        // 0x 前缀、大写、两端空白都应被接受（复制粘贴时很常见）
+        let messy = format!("  0x{}  ", hex.to_uppercase());
+        assert_eq!(parse_master_key(Some(&messy)).unwrap().unwrap(), key);
+    }
+
+    #[test]
+    fn master_key_invalid_forms_must_be_rejected() {
+        // 这条就是 env.example 里那个中文占位串：`cp env.example .env` 之后
+        // 最常见的一种配置错误。旧实现会静默换一把新密钥继续启动，
+        // 结果所有已加密数据永久解不开 —— 现在必须直接报错。
+        assert!(parse_master_key(Some("十六进制字符串（64 个字符）")).is_err());
+        // 长度错
+        assert!(parse_master_key(Some(&"a".repeat(63))).is_err());
+        assert!(parse_master_key(Some(&"a".repeat(65))).is_err());
+        assert!(parse_master_key(Some("abcdef")).is_err());
+        // 非法字符
+        assert!(parse_master_key(Some(&"z".repeat(64))).is_err());
+    }
+
+    /// 换一把主密钥，同一明文应产出不同密文并且互相解不开（确认密钥真的参与运算）
+    #[test]
+    fn different_master_keys_produce_incompatible_ciphertext() {
+        let key_a = KmsManager {
+            master_key: [1u8; 32],
+            auto_generated: false,
+        };
+        let key_b = KmsManager {
+            master_key: [2u8; 32],
+            auto_generated: false,
+        };
+        let enc_a = Encryptor::new(key_a);
+        let enc_b = Encryptor::new(key_b);
+
+        let ciphertext = enc_a.encrypt("secret", "card_code_x").unwrap();
+        assert_eq!(enc_a.decrypt(&ciphertext).unwrap(), "secret");
+        assert!(enc_b.decrypt(&ciphertext).is_err());
     }
 }
 

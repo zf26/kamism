@@ -18,6 +18,24 @@ interface NavItem {
   badge?: number;
 }
 
+/** 把到期时间压成侧边栏能放下的一小段文字。
+ *
+ * ⚠️ 这不是装饰性提示。后端到期后走的是**异步降级** —— 先由扫描器（每 60 秒）发现到期、
+ * 经消息队列交给 worker，之后才会禁用超额的应用和卡密。在此之前商户端**完全看不到**
+ * 自己的到期时间（此前只有管理员端能看到），到期时功能被禁用，体感是「毫无预警地被砍」。
+ * 后端 `auth.rs` / `oauth.rs` 早就返回了 `plan_expires_at`，只是前端没用起来。
+ */
+function planExpiryHint(plan?: string, expiresAt?: string | null): string | null {
+  if (plan !== 'pro') return null;
+  if (!expiresAt) return '永久';
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  if (diffMs <= 0) return '已到期';
+  const days = Math.floor(diffMs / 86400000);
+  if (days > 0) return `剩余 ${days} 天`;
+  const hours = Math.floor(diffMs / 3600000);
+  return hours > 0 ? `剩余 ${hours} 小时` : '今日到期';
+}
+
 const adminPlatformNav: NavItem[] = [
   { label: '总览', path: '/admin/dashboard', icon: <LayoutDashboard size={16} /> },
   { label: '商户管理', path: '/admin/merchants', icon: <Users size={16} /> },
@@ -47,6 +65,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, role, logout } = useAuthStore();
+  const expiryHint = planExpiryHint(user?.plan, user?.plan_expires_at);
   const { theme, toggle: toggleTheme } = useThemeStore();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [unread, setUnread] = useState(0);
@@ -209,7 +228,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                   border: user?.plan === 'pro' ? 'none' : '1px solid var(--border)',
                   lineHeight: '16px',
                 }}>
-                  {user?.plan === 'pro' ? '⚡ 专业版' : '免费版'}
+                  {user?.plan === 'pro'
+                    ? `⚡ 专业版${expiryHint ? ` · ${expiryHint}` : ''}`
+                    : '免费版'}
                 </span>
               )}
             </div>

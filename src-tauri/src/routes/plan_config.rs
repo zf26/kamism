@@ -1,5 +1,6 @@
 use crate::middleware::auth::{admin_only, auth_middleware, AppState};
 use crate::models::plan_config::PlanConfig;
+use crate::utils::db_guard;
 use axum::{
     extract::{Path, State},
     middleware,
@@ -28,11 +29,19 @@ pub fn plan_config_router(state: AppState) -> Router<AppState> {
 }
 
 async fn list_plan_configs(State(state): State<AppState>) -> Json<Value> {
-    let configs: Vec<PlanConfig> =
-        sqlx::query_as("SELECT * FROM plan_configs ORDER BY plan ASC")
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default();
+    // ⚠️ 曾用 .unwrap_or_default()：查询失败时套餐配置列表变空，
+    // 管理员在「套餐配置」页看到一片空白，会以为套餐配置被删光了并去重建
+    // （而重建会覆盖真实配置）—— 实际只是数据库查不出来。
+    let configs: Vec<PlanConfig> = match sqlx::query_as("SELECT * FROM plan_configs ORDER BY plan ASC")
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询套餐配置列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
     Json(json!({ "success": true, "data": configs }))
 }
 
@@ -69,16 +78,33 @@ async fn update_plan_config(
 
     match result {
         Ok(r) if r.rows_affected() > 0 => {
-            let updated: Option<PlanConfig> =
-                sqlx::query_as("SELECT * FROM plan_configs WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .unwrap_or(None);
+            // ⚠️ 曾用 `.unwrap_or(None)`：更新**已经成功**，但回读失败 →
+            // 返回 `data: null`。前端拿到 `success: true` 却没有任何数据，
+            // 常见的处理是「把表单清空」或「显示空配置」——
+            // 管理员会以为自己刚保存的配额被重置了，然后**再保存一次**。
+            //
+            // 注意这里不能因为回读失败就返回失败：UPDATE 确实成功了，
+            // 说「更新失败」会让管理员重复操作。改成如实返回「已保存，但回读失败」。
+            let updated: Option<PlanConfig> = match sqlx::query_as(
+                "SELECT * FROM plan_configs WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&state.pool)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("套餐配置已更新但回读失败: id={} err={}", id, e);
+                    return Json(json!({
+                        "success": true,
+                        "message": "配置已保存，但读取最新数据失败，请刷新页面确认",
+                        "data": null
+                    }));
+                }
+            };
             Json(json!({ "success": true, "data": updated }))
         }
         Ok(_) => Json(json!({"success": false, "message": "套餐配置不存在"})),
-        Err(e) => Json(json!({"success": false, "message": format!("更新失败: {}", e)})),
+        Err(e) => db_guard::internal_error("更新套餐配置", e),
     }
 }
 

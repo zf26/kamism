@@ -1,5 +1,6 @@
 use crate::middleware::auth::{admin_only, auth_middleware, AppState};
 use crate::models::subscription_plan::{CreatePlanRequest, SubscriptionPlan, UpdatePlanRequest};
+use crate::utils::db_guard;
 use axum::{
     extract::{Path, Query, State},
     middleware,
@@ -35,22 +36,37 @@ async fn list_plans(
 ) -> Json<Value> {
     let plans: Vec<SubscriptionPlan> = match q.enabled_only {
         Some(true) => {
-            sqlx::query_as(
+            // ⚠️ 曾用 .unwrap_or_default()：查询失败时只过滤了启用项的套餐列表变空，
+            // 管理员看到「暂无套餐」，会以为套餐被删光了并去重新创建。
+            match sqlx::query_as(
                 "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, badge, highlight, sort_order, enabled, created_at, updated_at \
                  FROM subscription_plans WHERE enabled = TRUE ORDER BY sort_order ASC"
             )
                 .fetch_all(&state.pool)
                 .await
-                .unwrap_or_default()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("查询已启用套餐列表失败: err={}", e);
+                    return db_guard::server_busy();
+                }
+            }
         }
         _ => {
-            sqlx::query_as(
+            // ⚠️ 曾用 .unwrap_or_default()：同上，管理端套餐列表静默变空。
+            match sqlx::query_as(
                 "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, badge, highlight, sort_order, enabled, created_at, updated_at \
                  FROM subscription_plans ORDER BY sort_order ASC"
             )
                 .fetch_all(&state.pool)
                 .await
-                .unwrap_or_default()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("查询套餐列表失败: err={}", e);
+                    return db_guard::server_busy();
+                }
+            }
         }
     };
     Json(json!({ "success": true, "data": plans }))
@@ -60,13 +76,22 @@ async fn list_plans(
 async fn list_enabled_plans(
     State(state): State<AppState>,
 ) -> Json<Value> {
-    let plans: Vec<SubscriptionPlan> = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or_default()：商户端购买页套餐列表查询失败时变空，
+    // 商户看到「暂无可购买套餐」，会以为平台停售了，无法下单；
+    // 运维只看到「没人买」，看不到源头是数据库查询失败。
+    let plans: Vec<SubscriptionPlan> = match sqlx::query_as(
         "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, badge, highlight, sort_order, enabled, created_at, updated_at \
          FROM subscription_plans WHERE enabled = TRUE ORDER BY sort_order ASC"
     )
         .fetch_all(&state.pool)
         .await
-        .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询可购买套餐列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
     Json(json!({ "success": true, "data": plans }))
 }
 
@@ -106,10 +131,24 @@ async fn create_plan(
         Ok(Some(p)) => Json(json!({ "success": true, "data": p })),
         Ok(None) => Json(json!({"success": false, "message": "创建失败"})),
         Err(e) => {
-            if e.to_string().contains("duplicate key") {
-                Json(json!({"success": false, "message": "plan 标识已存在"}))
+            // ⚠️ 唯一冲突必须用 **SQLSTATE** 判，不能用错误文本。
+            //
+            // 原先这里是 `e.to_string().contains("duplicate key")` —— 而 sqlx 的
+            // Display 是数据库自己那句话，随 `lc_messages` 变化。本机 PG（中文）
+            // 实测报「重复键违反唯一约束"uq_subscription_plans_plan_days"」，
+            // 于是那个判断**永远不成立**，管理员建重复套餐看到的是
+            // 「服务器繁忙，请稍后重试」：一个输入错误被报成了服务器故障。
+            //
+            // 文案也一并改准：唯一约束是 `UNIQUE (plan, days)`（007 迁移把
+            // 原来的 `UNIQUE(plan)` 换掉了），所以冲突的粒度是「组合」，
+            // 不是「plan 标识」——原文案即使能命中也是错的。
+            if db_guard::is_unique_violation(&e) {
+                Json(json!({
+                    "success": false,
+                    "message": "该套餐已存在（同一个 plan 下的 days 不能重复）"
+                }))
             } else {
-                Json(json!({"success": false, "message": format!("创建失败: {}", e)}))
+                db_guard::internal_error("创建套餐", e)
             }
         }
     }
@@ -151,7 +190,7 @@ async fn update_plan(
     match result {
         Ok(Some(p)) => Json(json!({ "success": true, "data": p })),
         Ok(None) => Json(json!({"success": false, "message": "套餐不存在"})),
-        Err(e) => Json(json!({"success": false, "message": format!("更新失败: {}", e)})),
+        Err(e) => db_guard::internal_error("更新套餐", e),
     }
 }
 
@@ -167,17 +206,24 @@ async fn delete_plan(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({ "success": true })),
         Ok(_) => Json(json!({"success": false, "message": "套餐不存在"})),
-        Err(e) => Json(json!({"success": false, "message": format!("删除失败: {}", e)})),
+        Err(e) => db_guard::internal_error("删除套餐", e),
     }
 }
 
 /// 供 payments.rs 内部调用：查询所有已启用的套餐
+///
+/// ⚠️ 返回类型是 `Vec` 而非 `Result`，签名由 payments.rs 决定，这里不能单方面改成
+/// 报错。曾用 `.unwrap_or_default()`（无日志）：上游下单流程拿到空列表后会走到
+/// 「套餐不存在」分支，商户看到的是「套餐已下架」这种业务话术，
+/// 而真相是数据库故障 —— 排查方向被彻底带偏。故降级留痕（warn 日志）。
 pub async fn get_enabled_plans(pool: &sqlx::PgPool) -> Vec<SubscriptionPlan> {
-    sqlx::query_as(
-        "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, badge, highlight, sort_order, enabled, created_at, updated_at \
-         FROM subscription_plans WHERE enabled = TRUE ORDER BY sort_order ASC"
+    db_guard::lenient_all(
+        sqlx::query_as(
+            "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, badge, highlight, sort_order, enabled, created_at, updated_at \
+             FROM subscription_plans WHERE enabled = TRUE ORDER BY sort_order ASC"
+        )
+            .fetch_all(pool),
+        "查询已启用套餐（给下单流程用，失败按空列表降级）",
     )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default()
+    .await
 }

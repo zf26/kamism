@@ -13,7 +13,7 @@
 use crate::{
     db::encrypted_fields::EncryptedFieldsOps,
     middleware::auth::{auth_middleware, AppState},
-    utils::jwt::Claims,
+    utils::{db_guard, jwt::Claims, mask},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -104,7 +104,15 @@ async fn list_ip(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let rows: Vec<IpBlacklistEntry> = sqlx::query_as(
+    // ⚠️ 这里曾用 `.unwrap_or_default()` —— 查询失败 → **空列表**。
+    //
+    // 这比「数字显示错」严重得多：页面上会干净地显示「暂无黑名单记录」，
+    // 而实际上库里可能躺着几十条。用户（或运维）据此判断「风控没被触发过」，
+    // 这个结论是**反的**。而且它和下一行的 `total` 失败默认值 0 互相印证，
+    // 界面上完全看不出异常。
+    //
+    // 列表查询失败没有「合理的降级」：要么给真数据，要么明确报错。
+    let rows: Vec<IpBlacklistEntry> = match sqlx::query_as(
         "SELECT id, ip, reason, created_at FROM ip_blacklist
          WHERE merchant_id = $1
          ORDER BY created_at DESC LIMIT $2 OFFSET $3"
@@ -114,15 +122,25 @@ async fn list_ip(
     .bind(offset)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询 IP 黑名单列表失败: merchant_id={} err={}", merchant_id, e);
+            return db_guard::server_busy();
+        }
+    };
 
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM ip_blacklist WHERE merchant_id = $1"
+    let total = match db_guard::scalar(
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM ip_blacklist WHERE merchant_id = $1")
+            .bind(merchant_id)
+            .fetch_one(&state.pool),
+        "统计 IP 黑名单条数",
     )
-    .bind(merchant_id)
-    .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        db_guard::ScalarOutcome::Found(t) => t,
+        db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+    };
 
     Json(json!({
         "success": true,
@@ -159,7 +177,7 @@ async fn add_ip(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "已添加到 IP 黑名单"})),
         Ok(_) => Json(json!({"success": false, "message": "该 IP 已在黑名单中"})),
-        Err(e) => Json(json!({"success": false, "message": format!("添加失败: {}", e)})),
+        Err(e) => db_guard::internal_error("添加黑名单", e),
     }
 }
 
@@ -183,7 +201,7 @@ async fn remove_ip(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "已移除"})),
         Ok(_) => Json(json!({"success": false, "message": "记录不存在或无权限"})),
-        Err(e) => Json(json!({"success": false, "message": format!("删除失败: {}", e)})),
+        Err(e) => db_guard::internal_error("删除黑名单", e),
     }
 }
 
@@ -202,7 +220,10 @@ async fn list_device(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let rows: Vec<DeviceBlacklistEntry> = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or_default()：设备黑名单查询失败时返回空列表，
+    // 商户看到「该应用没有任何被拉黑的设备」，会误判封禁已生效/无需处理，
+    // 实际列表根本没查出来。
+    let rows: Vec<DeviceBlacklistEntry> = match sqlx::query_as(
         "SELECT id, device_hint, reason, created_at FROM device_blacklist
          WHERE merchant_id = $1
          ORDER BY created_at DESC LIMIT $2 OFFSET $3"
@@ -212,15 +233,29 @@ async fn list_device(
     .bind(offset)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询设备黑名单列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
-    let total: (i64,) = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or((0,))：合计条数静默变 0，配合上面的空列表，
+    // 界面显示「共 0 条黑名单记录」，商户会怀疑自己的封禁数据被清了。
+    let total: (i64,) = match sqlx::query_as(
         "SELECT COUNT(*) FROM device_blacklist WHERE merchant_id = $1"
     )
     .bind(merchant_id)
     .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("统计设备黑名单条数失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
     Json(json!({
         "success": true,
@@ -245,11 +280,11 @@ async fn add_device(
         Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
     };
     let device_id_hash = EncryptedFieldsOps::generate_hash(&device_id);
-    let device_hint = if device_id.len() >= 4 {
-        format!("{}****", &device_id[..4])
-    } else {
-        "****".to_string()
-    };
+    // ⚠️ 这里原先写的是 `if device_id.len() >= 4 { format!("{}****", &device_id[..4]) }`
+    // —— `isize` 索引按**字节**走，`device_id = "中文"` 时 byte 4 落在「文」中间，
+    // 直接 panic（已实机坐实：`end byte index 4 is not a char boundary`）。
+    // 改走按字符切的 `mask::hint`，纯 ASCII 下输出与旧写法完全一致。
+    let device_hint = mask::hint(&device_id, 4);
 
     let result = sqlx::query(
         "INSERT INTO device_blacklist (merchant_id, device_id_hash, device_hint, reason)
@@ -266,7 +301,7 @@ async fn add_device(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "已添加到设备黑名单"})),
         Ok(_) => Json(json!({"success": false, "message": "该设备已在黑名单中"})),
-        Err(e) => Json(json!({"success": false, "message": format!("添加失败: {}", e)})),
+        Err(e) => db_guard::internal_error("添加黑名单", e),
     }
 }
 
@@ -290,7 +325,7 @@ async fn remove_device(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "已移除"})),
         Ok(_) => Json(json!({"success": false, "message": "记录不存在或无权限"})),
-        Err(e) => Json(json!({"success": false, "message": format!("删除失败: {}", e)})),
+        Err(e) => db_guard::internal_error("删除黑名单", e),
     }
 }
 
@@ -309,7 +344,10 @@ async fn list_alerts(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let rows: Vec<AlertEntry> = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or_default()：异常告警列表查询失败时返回空列表，
+    // 商户在安全页看到「无异常告警」，会直接关掉页面，而风控告警其实
+    // 正在积压（这是安全相关的列表，伪装成「无事发生」尤其危险）。
+    let rows: Vec<AlertEntry> = match sqlx::query_as(
         "SELECT id, alert_type, card_id, device_hint, ip_address, detail, is_read, created_at
          FROM activation_alerts
          WHERE merchant_id = $1
@@ -320,15 +358,29 @@ async fn list_alerts(
     .bind(offset)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询异常告警列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
-    let total: (i64,) = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or((0,))：告警总数静默变 0，与空列表一起显示成
+    // 「共 0 条告警」，商户会以为风控一切正常。
+    let total: (i64,) = match sqlx::query_as(
         "SELECT COUNT(*) FROM activation_alerts WHERE merchant_id = $1"
     )
     .bind(merchant_id)
     .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("统计异常告警条数失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
     Json(json!({
         "success": true,
@@ -347,13 +399,21 @@ async fn alerts_unread_count(
         Ok(id) => id,
         Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
     };
-    let count: (i64,) = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or((0,))：未读告警计数静默变 0，菜单上的红点消失，
+    // 商户会以为「告警都处理完了」，于是不再去查风控页面。
+    let count: (i64,) = match sqlx::query_as(
         "SELECT COUNT(*) FROM activation_alerts WHERE merchant_id = $1 AND is_read = FALSE"
     )
     .bind(merchant_id)
     .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("统计未读异常告警数失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
     Json(json!({"success": true, "data": {"unread": count.0}}))
 }
@@ -378,7 +438,7 @@ async fn mark_alert_read(
     match result {
         Ok(r) if r.rows_affected() > 0 => Json(json!({"success": true, "message": "已标记已读"})),
         Ok(_) => Json(json!({"success": false, "message": "记录不存在或无权限"})),
-        Err(e) => Json(json!({"success": false, "message": format!("操作失败: {}", e)})),
+        Err(e) => db_guard::internal_error("黑名单操作", e),
     }
 }
 

@@ -23,7 +23,7 @@ function getPlanExpiry(plan?: string, expiresAt?: string | null): string | null 
 }
 
 export default function Settings() {
-  const { user, setAuth, role } = useAuthStore();
+  const { user, setAuth, role, updateToken } = useAuthStore();
   const [pwForm, setPwForm] = useState({ old_password: '', new_password: '', confirm: '' });
   const [pwLoading, setPwLoading] = useState(false);
   const [apiLoading, setApiLoading] = useState(false);
@@ -45,7 +45,26 @@ export default function Settings() {
         new_password: pwForm.new_password,
       });
       if (res.data.success) {
-        toast.success('密码已修改，请重新登录');
+        // ── 接住服务端补发的新令牌 ────────────────────────────────────────
+        //
+        // 后端改密码时会**吊销该商户的全部令牌**（token_version + 1），
+        // 包括当前这台设备手里的 —— 这是安全上必须的（不吊销等于改密码没意义，
+        // 攻击者偷到的 token 还能用 2 小时、refresh 还能续 7 天）。
+        //
+        // 为了不让操作者自己莫名掉线，后端在响应里补发了一对新令牌。
+        // **这里必须把它存下来**，否则「其他设备需重新登录」这句提示是假的 ——
+        // 当前设备自己也在「其他设备」之列，下一次请求就会 401。
+        //
+        // 用 updateToken 而不是 setAuth：user 信息没变，只需要换令牌。
+        const { token, refresh_token } = res.data;
+        if (token && refresh_token) {
+          updateToken(token, refresh_token);
+          toast.success('密码已修改，其他设备需重新登录');
+        } else {
+          // 后端没补发（比如补发时签名失败）—— 此时当前设备确实已掉线，
+          // 如实告知并要求重新登录，而不是显示「其他设备需重新登录」骗人。
+          toast.success('密码已修改，请重新登录');
+        }
         setPwForm({ old_password: '', new_password: '', confirm: '' });
       } else toast.error(res.data.message);
     } catch { toast.error('操作失败'); }

@@ -55,7 +55,7 @@ KamiSM 是一个面向个人开发者和企业的卡密管理平台，支持多�
 | 层级 | 技术 |
 |------|------|
 | 桌面客户端 | [Tauri 2.0](https://tauri.app/)（纯前端壳，无内嵌服务） |
-| 前端 UI | React 18 + TypeScript + Vite |
+| 前端 UI | React 19 + TypeScript + Vite |
 | 后端服务 | Rust + [Axum](https://github.com/tokio-rs/axum)（独立部署） |
 | 数据库 | PostgreSQL + [SQLx](https://github.com/launchbadge/sqlx) |
 | 缓存 | Redis（验证码存储、Rate Limiting、分布式锁，TTL 自动过期） |
@@ -118,8 +118,15 @@ nano .env
 POSTGRES_PASSWORD=强密码
 RABBITMQ_PASSWORD=强密码
 JWT_SECRET=随机32位以上字符串
+# 加密主密钥（64 位十六进制字符），生成：openssl rand -hex 32
+# 必须固定保存、永不变更：换密钥/丢密钥 = 已加密字段（API Key、邮箱、卡密、设备 ID）永久读不出来
+MASTER_KEY=
 ADMIN_EMAIL=admin@example.com
 ADMIN_PASSWORD=Admin@123456
+# 反向代理信任范围（逗号分隔 CIDR）。部署在 Nginx 之后必须配，否则限流会退化成
+# 「全站共用一个 IP 的额度」、IP 黑名单也认不出真实客户端。
+# Docker Compose：172.16.0.0/12；Nginx 与后端同机：127.0.0.1
+TRUSTED_PROXIES=172.16.0.0/12,127.0.0.1
 ```
 
 **支付通道配置**（二选一，默认 MbdPay）：
@@ -335,16 +342,25 @@ npm run build
 **Nginx 关键配置：**
 
 ```nginx
+# WebSocket 升级头映射（必须放在 http 上下文，不能写进 server/location）
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
 # API 反向代理（去掉 /api 前缀转发给后端）
 location /api/ {
     proxy_pass http://127.0.0.1:9527/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # 实时推送走 WebSocket，必须带这两个头；用 map 而不是写死 "upgrade"，
+    # 否则普通请求也会被声明成长连接（keep-alive 失效）
     proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 300s;
-    proxy_buffering off;   # SSE 必须关闭缓冲
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 3600s;   # 长连接空闲 60s 会被默认超时掐断
+    proxy_buffering off;        # 长连接/SSE 必须关闭缓冲
 }
 
 # 前端控制台（SPA fallback）
@@ -353,6 +369,11 @@ location / {
     try_files $uri $uri/ /kamism/index.html;
 }
 ```
+
+> ⚠️ 这种部署下后端看到的对端地址是 `127.0.0.1`，所以 `.env` 里的
+> `TRUSTED_PROXIES` 必须包含 `127.0.0.1`，否则后端会**忽略**转发头：
+> 表现是「所有用户共用一个限流额度」并且 IP 黑名单不认真实客户端。
+> 服务启动日志会打印实际生效的策略（`客户端 IP 策略: ...`），部署后确认那一行。
 
 ### 三、打包桌面客户端
 
@@ -594,15 +615,22 @@ KamiSM 实现了**字段级 AES-256-GCM 加密 + SHA256 哈希索引**的双层�
 ### 快速配置
 
 ```bash
-# 1. 生成主密钥（64位16进制字符串）
+# 1. 生成主密钥（64 位十六进制字符串，即 32 字节）
 MASTER_KEY=$(openssl rand -hex 32)
 echo "MASTER_KEY=$MASTER_KEY" >> .env
 
-# 2. 数据库迁移会自动创建加密字段和哈希索引
-# 迁移脚本：
-#   - 008_remove_plaintext_fields.sql  # 删除明文字段
-#   - 009_add_hash_indexes.sql         # 添加哈希索引
+# 2. 表结构与哈希索引都在 001_init_complete.sql 里（幂等，可重复执行），
+#    服务启动时会自动跑迁移，无需手工执行 SQL。
 ```
+
+> 如果你是从「明文字段」的旧版本升级上来，额外执行一次字段加密迁移：
+>
+> ```bash
+> cargo run --bin encrypt_migration
+> ```
+>
+> 注意：这个二进制会用当前 `MASTER_KEY` 把明文重新加密写入。执行前先确认
+> `MASTER_KEY` 已经固定下来 —— 迁移之后再换密钥，等于把所有数据锁死。
 
 ### 数据库架构
 

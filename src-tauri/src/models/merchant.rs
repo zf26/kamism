@@ -24,6 +24,11 @@ pub struct Merchant {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub created_by_admin: bool,
+    /// 令牌版本号（吊销机制，见 `migrations/009_token_version.sql`）。
+    /// 理由同 `models::admin::Admin::token_version`：只用于服务端校验，
+    /// 不参与序列化输出。
+    #[serde(skip_serializing)]
+    pub token_version: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

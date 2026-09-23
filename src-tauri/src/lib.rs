@@ -13,6 +13,7 @@ use axum::http::Method;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
 use axum::middleware as axum_middleware;
 use crate::middleware::auth::AppState;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -101,10 +102,21 @@ pub async fn start_server() -> anyhow::Result<()> {
     tracing::info!("正在初始化 KMS...");
     let kms = utils::kms::KmsManager::new()
         .map_err(|e| anyhow::anyhow!("KMS 初始化失败: {}", e))?;
+    // 禁止「拿着新密钥去读旧数据」：库里有加密数据时必须用原来那把密钥启动
+    ensure_master_key_matches_data(&pool, &kms).await?;
     let encryptor = Arc::new(utils::kms::Encryptor::new(kms));
     tracing::info!("KMS 初始化成功");
 
-    init_admin(&pool).await;
+    // 客户端 IP 策略：决定限流与 IP 黑名单到底认哪个地址（默认不信任任何代理）
+    let trusted_proxies = utils::client_ip::TrustedProxies::from_env();
+    tracing::info!(
+        "客户端 IP 策略: {}（TRUSTED_PROXIES={:?}）",
+        trusted_proxies.describe(),
+        env::var("TRUSTED_PROXIES").unwrap_or_default()
+    );
+
+    // 建不出管理员就拒绝启动（理由见 init_admin 的注释）—— 这里**不能**吞掉返回值
+    init_admin(&pool).await?;
     let ws_registry = crate::utils::ws::WsRegistry::new();
     let oauth_config_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let payment_config_cache = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -121,22 +133,69 @@ pub async fn start_server() -> anyhow::Result<()> {
         oauth_config_cache,
         payment_config_cache,
         app_url,
+        trusted_proxies,
     };
 
-    // 启动降级消费者（独立 task，传入独立 Redis 连接）
+    // ── 启动降级 / 升级消费者：必须包一层「退避重启」──
+    //
+    // 两个 worker 的消费循环在 MQ 断连（`consumer.next()` 返回 Err）或消费者创建失败时会
+    // **直接 return**。如果只是裸的 `tokio::spawn(run_xxx_worker(...))`，这次 task 结束之后
+    // 就再没有任何东西把它拉起来 —— 而扫描器用的是**另一个 channel**，会继续每 60 秒
+    // 照常投递、照常打「N 个到期商户已投递」。结果是：消息堆在队列里无人消费，
+    // 日志看起来完全正常，所有到期商户永久保持 pro，平台持续漏收。
+    //
+    // 所以每个 worker 都放进一个循环，退出后带退避重启。
+    // 退避策略：连续快速失败 → 1/2/4/8/16/32/60 秒递增；一旦稳定运行超过 60 秒，
+    // 说明上次失败只是抖动，把退避重置回 1 秒，避免长时间故障恢复后重连变慢。
     let worker_pool = pool.clone();
     let worker_channel = (*mq_channel).clone();
     let worker_redis = redis_conn.clone();
     tokio::spawn(async move {
-        workers::downgrade::run_downgrade_worker(worker_pool, worker_channel, worker_redis).await;
+        let mut backoff_secs = 1u64;
+        loop {
+            let started = std::time::Instant::now();
+            workers::downgrade::run_downgrade_worker(
+                worker_pool.clone(),
+                worker_channel.clone(),
+                worker_redis.clone(),
+            )
+            .await;
+            if started.elapsed() >= std::time::Duration::from_secs(60) {
+                backoff_secs = 1;
+            }
+            tracing::error!(
+                "降级 Worker 已退出（MQ 连接中断或消费者创建失败），{} 秒后重启",
+                backoff_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(60);
+        }
     });
 
-    // 启动升级恢复消费者（独立 task，传入独立 Redis 连接）
+    // 启动升级恢复消费者（同上：带退避重启的循环）
     let upgrade_pool = pool.clone();
     let upgrade_channel = (*mq_channel).clone();
     let upgrade_redis = redis_conn.clone();
     tokio::spawn(async move {
-        workers::downgrade::run_upgrade_worker(upgrade_pool, upgrade_channel, upgrade_redis).await;
+        let mut backoff_secs = 1u64;
+        loop {
+            let started = std::time::Instant::now();
+            workers::downgrade::run_upgrade_worker(
+                upgrade_pool.clone(),
+                upgrade_channel.clone(),
+                upgrade_redis.clone(),
+            )
+            .await;
+            if started.elapsed() >= std::time::Duration::from_secs(60) {
+                backoff_secs = 1;
+            }
+            tracing::error!(
+                "升级 Worker 已退出（MQ 连接中断或消费者创建失败），{} 秒后重启",
+                backoff_secs
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(60);
+        }
     });
 
     // 启动定时扫描任务：每 60 秒扫描一次到期商户，发布降级消息
@@ -197,6 +256,48 @@ pub async fn start_server() -> anyhow::Result<()> {
         // 请求体大小限制：保护上传最大 ~100MB，通用 API 2MB
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024)) // 100MB
         .layer(cors)
+        // 🛡️ 兜底：handler（或任何内层中间件）panic 时回 500，而不是**掐断连接**。
+        //
+        // 为什么必须有：axum 默认**不装** CatchPanicLayer，一次 panic 会让这条连接的
+        // task 直接结束 —— 客户端拿到的是**空回复**（curl 的 http_code=000），
+        // 连个 5xx 都没有，前后端都只能猜「是不是网络断了」。
+        // 第十二批实测到的三个可达 panic 造成的正是这个现象（见 utils::mask 与
+        // routes::oauth::redirect_to 的注释）。
+        //
+        // ⚠️ 这一层**不能替代**修 panic 本身：它是最后一道网，不是第一道。
+        // 局部修复（`utils::mask::*`、`redirect_to`、`is_unique_violation`）负责让
+        // 已知 panic 不再发生；这一层负责让**将来任何**漏网 panic 的对外表现变成
+        // 「500 + 可读文案」而不是「连接没了」。
+        //
+        // 放在最外层（`.layer()` 是后加的包在外层），这样内层中间件里的 panic 也能兜住。
+        .layer(CatchPanicLayer::custom(
+            |err: Box<dyn std::any::Any + Send + 'static>| {
+                let detail = if let Some(s) = err.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "(非字符串 panic payload)".to_string()
+                };
+                // 与 panic hook 的分工：hook 往 stderr 打「[PANIC] msg at file:line:col」，
+                // 这里补上「这次请求的对外结果」。两条要一起看才完整 ——
+                // 所以这里刻意把 hook 指出来，免得排查的人只看到其中一条。
+                tracing::error!(
+                    "handler panic 已被兜住，本次请求回 500（具体位置见同一次的 [PANIC] 行）: {}",
+                    detail
+                );
+
+                let mut resp = axum::response::Response::new(axum::body::Body::from(
+                    r#"{"success":false,"message":"服务器繁忙，请稍后重试"}"#,
+                ));
+                *resp.status_mut() = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+                );
+                resp
+            },
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await
@@ -212,9 +313,20 @@ pub async fn start_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 扫描到期商户，将商户 ID 投递到降级队列（带内存去重）
+/// 扫描到期商户，将商户 ID 投递到降级队列。
+///
+/// **去重不发生在这一层。** 本轮扫描可能与上一轮、或另一个实例重叠，重复投递由下游兜住：
+/// worker 侧的 Redis 分布式锁（`kamism:plan_lock:downgrade:*`）挡并发执行，
+/// `merchants.updated_at > issued_at` 的乱序校验挡过期消息。
+///
+/// （此前这里的注释写着「带内存去重」，但函数里从来没有去重逻辑。
+/// 错误的注释比没有注释更危险 —— 它会让后来的人以为这层保护存在，从而放心删掉下游的校验。）
 async fn scan_and_enqueue(pool: &db::DbPool, channel: &Arc<lapin::Channel>) {
-    let expired: Vec<(uuid::Uuid,)> = sqlx::query_as(
+    // ⚠️ 曾用 `.unwrap_or_default()`：查询失败被当成「没有到期商户」，而且因为
+    // `published == 0` 时下面不打印日志，**整件事完全没有输出**。
+    // 单次失败会在下个 tick 自愈，但**持续失败**（列不存在、连接池耗尽、PG 不可达）
+    // 会让所有到期商户永久保持 pro —— 运维在日志里看不到任何线索。
+    let expired: Vec<(uuid::Uuid,)> = match sqlx::query_as(
         "SELECT id FROM merchants
          WHERE plan = 'pro'
            AND plan_expires_at IS NOT NULL
@@ -223,7 +335,16 @@ async fn scan_and_enqueue(pool: &db::DbPool, channel: &Arc<lapin::Channel>) {
     )
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                "扫描到期商户失败：本轮到期的商户不会被降级，需等下一个周期重试: {}",
+                e
+            );
+            return;
+        }
+    };
 
     let mut published = 0u32;
     for (merchant_id,) in &expired {
@@ -238,29 +359,104 @@ async fn scan_and_enqueue(pool: &db::DbPool, channel: &Arc<lapin::Channel>) {
     }
 }
 
-async fn init_admin(pool: &db::DbPool) {
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id::text FROM admins LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
+/// 启动前置检查：禁止「拿着新密钥去读旧数据」
+///
+/// 没有配置 MASTER_KEY 时进程会临时生成一把密钥。如果数据库里已经有加密数据
+/// （商户的 api_key / 邮箱、卡密的 code、激活记录的 device_id 都是 AES-256-GCM
+/// 加密存储），说明存量数据用的是另一把密钥 —— 继续启动只会让这些字段全部解不开，
+/// 而且表现为「接口 200 但字段读不出来」这种最难查的形态。
+/// 所以这里直接拒绝启动：把安静的数据损坏，换成启动时的大声报错。
+async fn ensure_master_key_matches_data(
+    pool: &db::DbPool,
+    kms: &utils::kms::KmsManager,
+) -> anyhow::Result<()> {
+    if !kms.is_auto_generated() {
+        return Ok(());
+    }
+
+    let (merchants,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM merchants")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("无法确认存量数据规模（MASTER_KEY 校验失败）: {}", e))?;
+    let (cards,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cards")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("无法确认存量数据规模（MASTER_KEY 校验失败）: {}", e))?;
+
+    if merchants > 0 || cards > 0 {
+        anyhow::bail!(
+            "拒绝启动：数据库已有 {} 个商户、{} 张卡密（敏感字段为加密存储），\
+但当前进程没有可用的 MASTER_KEY（未设置，已临时生成一把新密钥）。\
+继续启动会让这些字段永久无法解密（api_key、邮箱、卡密、设备 ID 全部读不出来）。\
+请把原来的 MASTER_KEY 配到环境变量里再重启；若是全新部署，请先固定一个 MASTER_KEY 再写入数据。\
+生成方式：openssl rand -hex 32",
+            merchants,
+            cards
+        );
+    }
+
+    Ok(())
+}
+
+/// 确保库里至少有一个管理员账号。
+///
+/// ⚠️ 这个函数曾经有**三层静默叠加**，任何一层出问题都会造成
+/// 「没有任何管理员、登录不了、而日志说一切正常」的死局：
+///
+/// ```ignore
+/// let exists = sqlx::query_as("SELECT id::text FROM admins LIMIT 1")
+///     .fetch_optional(pool).await
+///     .unwrap_or(None);          // ① 库故障被压成「还没有管理员」→ 继续去建
+/// if exists.is_some() { return; }
+/// let _ = sqlx::query("INSERT INTO admins ...")
+///     .execute(pool).await;      // ② 建账号失败被丢弃
+/// tracing::info!("初始管理员账号已创建: {}", admin_email);  // ③ 无条件声称成功
+/// ```
+///
+/// 其中 ③ 最要命：它把「没建成」也报成了「建成」。运维看到这行日志就会
+/// 停止排查权限问题，转头去查密码错在哪 —— 而库里其实一个管理员都没有。
+///
+/// 现在的取舍与 `ensure_master_key_matches_data` 一致：**拒绝启动**。
+/// 理由：没有管理员账号 = 后台完全进不去，属于「不可用」状态；
+/// 带着它继续跑只会让问题在更靠后的地方以更难查的形式出现。
+/// 启动失败会打印明确的错误，编排器重启即可重试（真·全新建库时这是幂等的）。
+async fn init_admin(pool: &db::DbPool) -> anyhow::Result<()> {
+    // 「查不到」和「查不了」必须分开：前者是全新部署（继续去建），
+    // 后者是数据库故障（拒绝启动）。这正是 `unwrap_or(None)` 抹掉的那条分支。
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id::text FROM admins LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "检查管理员账号失败（这是数据库错误，不是「还没有管理员」）: {}",
+                e
+            )
+        })?;
 
     if exists.is_some() {
-        return;
+        return Ok(());
     }
 
     let admin_email = env::var("ADMIN_EMAIL").unwrap_or_else(|_| "admin@kamism.com".to_string());
     let admin_password = env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "Admin@123456".to_string());
-    let password_hash = bcrypt::hash(&admin_password, bcrypt::DEFAULT_COST).unwrap();
+    let password_hash = bcrypt::hash(&admin_password, bcrypt::DEFAULT_COST)
+        .map_err(|e| anyhow::anyhow!("初始管理员密码哈希失败: {}", e))?;
 
-    let _ = sqlx::query(
-        "INSERT INTO admins (username, email, password_hash) VALUES ($1, $2, $3)",
-    )
-    .bind("admin")
-    .bind(&admin_email)
-    .bind(&password_hash)
-    .execute(pool)
-    .await;
+    sqlx::query("INSERT INTO admins (username, email, password_hash) VALUES ($1, $2, $3)")
+        .bind("admin")
+        .bind(&admin_email)
+        .bind(&password_hash)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "初始管理员账号创建失败（库里当前没有任何管理员，继续启动会导致无法登录，因此拒绝启动）: \
+                 email={} err={}。请修复数据库后重启；或设置 ADMIN_EMAIL / ADMIN_PASSWORD 后重试。",
+                admin_email,
+                e
+            )
+        })?;
 
     tracing::info!("初始管理员账号已创建: {}", admin_email);
+    Ok(())
 }

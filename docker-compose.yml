@@ -77,7 +77,13 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:1420}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
-      MASTER_KEY: ${MASTER_KEY}
+      # 加密主密钥：必须显式提供。留空会让后端「临时生成一把」，容器一重建就换密钥，
+      # 已加密字段（api_key / 邮箱 / 卡密 / 设备 ID）全部读不出来。要求必填 = 让问题
+      # 在启动时就暴露，而不是等数据读不出来才发现。
+      MASTER_KEY: ${MASTER_KEY:?请在 .env 中设置 MASTER_KEY（openssl rand -hex 32）}
+      # 可信代理范围：必须与文件末尾 networks.default 里固定的网段一致。
+      # 配错/留空的后果是限流退化成「全站共用一个 IP 的额度」，IP 黑名单也失效。
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.28.0.0/16}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-465}
       SMTP_USER: ${SMTP_USER:-}
@@ -106,3 +112,13 @@ volumes:
   postgres_data:
   redis_data:
   rabbitmq_data:
+
+# 固定默认网段：TRUSTED_PROXIES 的可信范围必须是一个确定的网段，
+# 而 Docker 默认地址池（172.17/16、172.18/16…）是不确定的 —— 一旦实际网段
+# 与配置不符，就会「看起来配了、其实没生效」（限流退化 + IP 黑名单失效）。
+# 这里把网段钉死，两边的配置才对得上。
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

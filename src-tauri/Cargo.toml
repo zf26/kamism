@@ -8,7 +8,20 @@ default-run = "kamism"
 
 [lib]
 name = "kamism_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 只保留 rlib。
+#
+# 原值是 Tauri 模板默认的 ["staticlib", "cdylib", "rlib"]，其中 staticlib / cdylib
+# 只服务于 iOS / Android 移动端；Windows 桌面端（src/main.rs 调 kamism_lib::run()）
+# 与 server crate 都只链接 rlib（见 server/Cargo.toml 的 default-features = false）。
+#
+# 在 Windows + GNU 工具链（x86_64-pc-windows-gnu）下构建 cdylib 必然失败：
+# MinGW 的 ld 默认对 DLL 开启「导出全部符号」，而 kamism 链接了 sqlx / aws-lc-rs /
+# ring / lettre 等大量依赖，导出符号数达到 15 万，远超 PE 格式 DLL 的 ordinal
+# 上限 65535，报错：
+#     ld.exe: error: export ordinal too large: 150371
+# 因此移除 cdylib 与 staticlib。将来要出移动端时再加回来
+# （移动端只在 macOS / Linux 上构建，不会撞到这个 Windows-only 的限制）。
+crate-type = ["rlib"]
 
 [features]
 default = []
@@ -28,7 +41,7 @@ tauri-plugin-shell = { version = "2", optional = true }
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-br", "limit"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-br", "limit", "catch-panic"] }
 futures-util = { version = "0.3", features = ["sink"] }
 
 # 数据库

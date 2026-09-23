@@ -15,7 +15,6 @@ applyStoredTheme();
 
 // 其余页面懒加载
 const AdminDashboard    = lazy(() => import('./pages/admin/Dashboard'));
-const AdminApiDocs      = lazy(() => import('./pages/admin/ApiDocs'));
 const Merchants         = lazy(() => import('./pages/admin/Merchants'));
 const PlanConfigs       = lazy(() => import('./pages/admin/PlanConfigs'));
 const AdminMessages     = lazy(() => import('./pages/admin/Messages'));
@@ -84,7 +83,7 @@ function AppRoutes() {
 
           {/* Admin */}
           <Route path="/admin/dashboard"    element={<RequireAuth role="admin"><Layout><AdminDashboard    key={pageKey} /></Layout></RequireAuth>} />
-          <Route path="/admin/api-docs"     element={<RequireAuth role="admin"><Layout><AdminApiDocs      key={pageKey} /></Layout></RequireAuth>} />
+          {/* /admin/api-docs 已移除：它依赖的 admins.api_key 列从未存在，且没有菜单入口 */}
           <Route path="/admin/merchants"    element={<RequireAuth role="admin"><Layout><Merchants         key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/plan-configs" element={<RequireAuth role="admin"><Layout><PlanConfigs       key={pageKey} /></Layout></RequireAuth>} />
           <Route path="/admin/messages"     element={<RequireAuth role="admin"><Layout><AdminMessages     key={pageKey} /></Layout></RequireAuth>} />

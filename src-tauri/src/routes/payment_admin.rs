@@ -1,6 +1,7 @@
 use crate::{
     middleware::auth::{admin_only, auth_middleware, AppState},
     models::payment_config::{PaymentConfig, PaymentConfigPublic, UpdatePaymentConfig},
+    utils::db_guard,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -35,12 +36,21 @@ fn config_public(c: &PaymentConfig) -> PaymentConfigPublic {
 }
 
 async fn list_payment_configs(State(state): State<AppState>) -> Json<Value> {
-    let configs: Vec<PaymentConfig> = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or_default()：查询失败时支付渠道列表变空，
+    // 管理员看到「暂无支付渠道」以为支付配置全丢了，可能重新录入密钥；
+    // 实际只是数据库故障，且这个页面本来也是收款链路配置的唯一视图。
+    let configs: Vec<PaymentConfig> = match sqlx::query_as(
         "SELECT * FROM payment_configs ORDER BY channel",
     )
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询支付渠道配置列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
     let data: Vec<PaymentConfigPublic> = configs.iter().map(config_public).collect();
 
@@ -54,13 +64,21 @@ async fn get_payment_config(
     State(state): State<AppState>,
     Path(channel): Path<String>,
 ) -> Json<Value> {
-    let config: Option<PaymentConfig> = sqlx::query_as(
-        "SELECT * FROM payment_configs WHERE channel = $1",
+    // ⚠️ 曾用 `.unwrap_or(None)`：查询失败 → 前端显示「该渠道未配置」。
+    // 管理员去配置页看到空的，会以为配置被清掉了，于是重新填一遍密钥 ——
+    // 而真正的问题（数据库不可用）从没浮出来。
+    let config = match db_guard::optional(
+        sqlx::query_as::<_, PaymentConfig>("SELECT * FROM payment_configs WHERE channel = $1")
+            .bind(&channel)
+            .fetch_optional(&state.pool),
+        "查询支付渠道配置",
     )
-    .bind(&channel)
-    .fetch_optional(&state.pool)
     .await
-    .unwrap_or(None);
+    {
+        db_guard::QueryOutcome::Found(c) => Some(c),
+        db_guard::QueryOutcome::NotFound => None,
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+    };
 
     match config {
         Some(c) => Json(json!({
@@ -157,10 +175,7 @@ async fn update_payment_config(
             "success": false,
             "message": "配置不存在"
         })),
-        Err(e) => Json(json!({
-            "success": false,
-            "message": format!("更新失败: {}", e)
-        })),
+        Err(e) => db_guard::internal_error("更新支付渠道配置", e),
     }
 }
 
@@ -178,38 +193,98 @@ async fn toggle_payment_config(
     };
 
     if enabled {
-        // 启用前先禁用所有渠道（单选模式）
-        sqlx::query("UPDATE payment_configs SET enabled = FALSE")
-            .execute(&state.pool)
+        // ── 启用：这两条 UPDATE 必须**同生同死** ──────────────────────────
+        //
+        // 「单选模式」是这张表的不变量：任何时刻最多一个渠道 enabled，
+        // 它靠「先全禁用，再启用目标」这两条语句共同维护。
+        // 原来的写法没有事务，于是有两个洞：
+        //
+        // 1. 第一条的失败被 `.ok()` 吞掉 → 「全禁用」没生效，
+        //    第二条照样把目标置为 enabled → **两个渠道同时生效**，
+        //    接口却返回「已启用」。这不是「多一个可选项」那么轻：
+        //    下单时用哪个通道取决于调用方拼的 channel 参数，
+        //    「哪个通道真的在收钱」变得不确定。
+        // 2. `channel` 不存在时更隐蔽：第一条**成功**禁用了全部渠道，
+        //    第二条影响 0 行 → 返回「配置不存在」，但此刻**所有渠道都已被禁用**，
+        //    线上支付静默全灭，管理员看到的只是一句无关痛痒的提示。
+        //
+        // 放进一个事务，两个洞一起消失：要么完整地变，要么完整地不变。
+        let mut tx = match state.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                return db_guard::internal_error("支付渠道操作", e)
+            }
+        };
+
+        if let Err(e) = sqlx::query("UPDATE payment_configs SET enabled = FALSE")
+            .execute(&mut *tx)
             .await
-            .ok();
+        {
+            // 不 commit → tx 在作用域结束时自动回滚
+            tracing::error!("启用支付渠道前禁用其他渠道失败，已回滚: channel={} err={}", channel, e);
+            return db_guard::internal_error("支付渠道操作", e);
+        }
+
+        let activated = sqlx::query(
+            "UPDATE payment_configs SET enabled = TRUE, updated_at = NOW() WHERE channel = $1",
+        )
+        .bind(&channel)
+        .execute(&mut *tx)
+        .await;
+
+        let rows = match activated {
+            Ok(r) => r.rows_affected(),
+            Err(e) => {
+                tracing::error!("启用支付渠道失败，已回滚: channel={} err={}", channel, e);
+                return db_guard::internal_error("支付渠道操作", e);
+            }
+        };
+
+        if rows == 0 {
+            // 目标渠道不存在 → 不 commit，前面那条「禁用所有」随之回滚
+            return Json(json!({
+                "success": false,
+                "message": "配置不存在"
+            }));
+        }
+
+        if let Err(e) = tx.commit().await {
+            tracing::error!("启用支付渠道提交失败: channel={} err={}", channel, e);
+            return db_guard::internal_error("支付渠道操作", e);
+        }
+
+        state.invalidate_payment_cache(None).await;
+
+        return Json(json!({
+            "success": true,
+            "message": "已启用"
+        }));
     }
 
+    // ── 禁用：单条 UPDATE，本身就是原子的 ──
     let result = sqlx::query(
         "UPDATE payment_configs SET enabled = $1, updated_at = NOW() WHERE channel = $2",
     )
-    .bind(enabled)
+    .bind(false)
     .bind(&channel)
     .execute(&state.pool)
     .await;
 
-    state.invalidate_payment_cache(None).await;
-
+    // 缓存只在**确实改动过**之后失效：失败和「配置不存在」都没有改库，
+    // 缓存里的内容仍然是对的，清掉反而多一次无谓的加载。
     match result {
         Ok(r) if r.rows_affected() > 0 => {
+            state.invalidate_payment_cache(None).await;
             Json(json!({
                 "success": true,
-                "message": if enabled { "已启用" } else { "已禁用" }
+                "message": "已禁用"
             }))
         }
         Ok(_) => Json(json!({
             "success": false,
             "message": "配置不存在"
         })),
-        Err(e) => Json(json!({
-            "success": false,
-            "message": format!("操作失败: {}", e)
-        })),
+        Err(e) => db_guard::internal_error("支付渠道操作", e),
     }
 }
 
@@ -245,7 +320,10 @@ async fn list_all_orders(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
-    let orders: Vec<AdminOrderRow> = sqlx::query_as(
+    // ⚠️ 曾用 `.unwrap_or_default()` + `.unwrap_or((0,))`：管理端的订单总览
+    // 静默变成「一笔订单都没有」——运维据此判断「今天没人下单」，
+    // 这个结论是反的，而且数字（0）看起来完全合理。
+    let orders: Vec<AdminOrderRow> = match sqlx::query_as(
         r#"
         SELECT p.order_id, p.merchant_id::text, COALESCE(m.username, '(已删除)') AS username,
                p.pay_channel, p.pay_type, p.amount::text, p.status,
@@ -264,16 +342,28 @@ async fn list_all_orders(
     .bind(offset)
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询管理端订单列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
-    let total: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM payments WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR pay_channel = $2)"
+    let total = match db_guard::scalar(
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM payments WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR pay_channel = $2)"
+        )
+        .bind(&q.status)
+        .bind(&q.channel)
+        .fetch_one(&state.pool),
+        "统计管理端订单总数",
     )
-    .bind(&q.status)
-    .bind(&q.channel)
-    .fetch_one(&state.pool)
     .await
-    .unwrap_or((0,));
+    {
+        db_guard::ScalarOutcome::Found(t) => t,
+        db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+    };
 
     let data: Vec<Value> = orders.into_iter().map(|(
         order_id, merchant_id, username, pay_channel, pay_type,

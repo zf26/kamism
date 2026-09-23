@@ -1,6 +1,7 @@
 use crate::{
     middleware::auth::{admin_only, auth_middleware, AppState},
     models::oauth_config::{CreateOAuthProvider, OAuthConfig, OAuthConfigPublic, UpdateOAuthConfig},
+    utils::db_guard,
 };
 use axum::{
     extract::{Path, State},
@@ -55,12 +56,21 @@ pub fn oauth_admin_router(state: AppState) -> Router<AppState> {
 
 /// 获取所有 OAuth 配置列表
 async fn list_oauth_configs(State(state): State<AppState>) -> Json<Value> {
-    let configs: Vec<OAuthConfigPublic> = sqlx::query_as(
+    // ⚠️ 曾用 .unwrap_or_default()：查询失败时 OAuth 配置列表变空，
+    // 管理员看到「暂无 OAuth 配置」，会以为登录渠道全被删了并去重新初始化，
+    // 实际是数据库没查出来 —— 初始化还会把真实配置覆盖掉。
+    let configs: Vec<OAuthConfigPublic> = match sqlx::query_as(
         "SELECT id, provider, name, enabled, scopes FROM oauth_configs ORDER BY provider"
     )
     .fetch_all(&state.pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询 OAuth 配置列表失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
 
     Json(json!({
         "success": true,
@@ -73,13 +83,21 @@ async fn get_oauth_config(
     State(state): State<AppState>,
     Path(provider): Path<String>,
 ) -> Json<Value> {
-    let config: Option<OAuthConfig> = sqlx::query_as(
-        "SELECT * FROM oauth_configs WHERE provider = $1"
+    // ⚠️ 曾用 `.unwrap_or(None)`：查询失败 → 前端显示「该 Provider 未配置」。
+    // 管理员看到空的表单，会以为配置丢了并重新填一遍 —— 真正的问题（数据库）
+    // 从来没被暴露。
+    let config = match db_guard::optional(
+        sqlx::query_as::<_, OAuthConfig>("SELECT * FROM oauth_configs WHERE provider = $1")
+            .bind(&provider)
+            .fetch_optional(&state.pool),
+        "查询 OAuth Provider 配置",
     )
-    .bind(&provider)
-    .fetch_optional(&state.pool)
     .await
-    .unwrap_or(None);
+    {
+        db_guard::QueryOutcome::Found(c) => Some(c),
+        db_guard::QueryOutcome::NotFound => None,
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+    };
 
     match config {
         Some(c) => {
@@ -113,19 +131,43 @@ async fn get_oauth_config(
 async fn init_oauth_configs(State(state): State<AppState>) -> Json<Value> {
     let defaults = get_default_oauth_configs();
     let mut created = 0;
+    let mut failed = 0;
 
     for (provider, name, auth_url, token_url, userinfo_url, scopes) in defaults {
-        let exists: Option<(String,)> = sqlx::query_as(
-            "SELECT id::text FROM oauth_configs WHERE provider = $1"
+        // ⚠️ 曾用 `.unwrap_or(None)`：查询失败 → 判定「不存在」→ **执行 INSERT**。
+        // 这条路是初始化默认配置用的，重复插入会撞 UNIQUE 约束；
+        // 但更糟的是「因为查不到就去创建」这个逻辑本身 —— 把「查不了」
+        // 当成了「没有」，然后**写库**。
+        let exists = match db_guard::optional(
+            sqlx::query_as::<_, (String,)>("SELECT id::text FROM oauth_configs WHERE provider = $1")
+                .bind(provider)
+                .fetch_optional(&state.pool),
+            "检查 OAuth Provider 是否已配置（初始化默认值）",
         )
-        .bind(provider)
-        .fetch_optional(&state.pool)
         .await
-        .unwrap_or(None);
+        {
+            db_guard::QueryOutcome::Found(v) => Some(v),
+            db_guard::QueryOutcome::NotFound => None,
+            db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+        };
 
         if exists.is_none() {
             let redirect_uri = format!("{}/oauth/{}/callback", state.app_url, provider);
-            sqlx::query(
+            // ⚠️ 曾经这里是 `.execute(...).await.ok(); created += 1;` —— 两处都错：
+            //
+            // 1. 失败被 `.ok()` 吞掉（INSERT 撞 UNIQUE、连接断开、字段超长…都算）；
+            // 2. 计数写在 match 外面 —— **失败也照样 `created += 1`**。
+            //
+            // 合起来的效果：管理员点「初始化」，界面显示「已初始化 4 个 OAuth 配置」，
+            // 而后台可能一个都没建出来。这是最坏的一类报错 ——
+            // 它不只是不说真话，而是**说了一句让人放心的话**，管理员看到之后
+            // 就不会再去查了。
+            //
+            // 这里不做整体回滚（不开事务）：每个 provider 的插入互相独立，
+            // 部分成功是有意义的状态 —— 更关键的是这个接口**天然幂等可重入**，
+            // 已存在的会被上面的 `exists` 检查跳过，再点一次就能把漏掉的补上。
+            // 前提是计数如实反映结果，否则管理员不知道自己该不该再点一次。
+            let insert = sqlx::query(
                 "INSERT INTO oauth_configs (provider, name, client_id, client_secret, redirect_uri, auth_url, token_url, userinfo_url, scopes, enabled)
                  VALUES ($1, $2, 'your_client_id', 'your_client_secret', $3, $4, $5, $6, $7, FALSE)"
             )
@@ -137,10 +179,28 @@ async fn init_oauth_configs(State(state): State<AppState>) -> Json<Value> {
             .bind(userinfo_url)
             .bind(scopes)
             .execute(&state.pool)
-            .await
-            .ok();
-            created += 1;
+            .await;
+            match insert {
+                Ok(_) => created += 1,
+                Err(e) => {
+                    tracing::error!(
+                        "初始化 OAuth 配置失败（该 provider 未创建，可重试）: provider={} err={}",
+                        provider,
+                        e
+                    );
+                    failed += 1;
+                }
+            }
         }
+    }
+
+    // 有失败就不能报 success —— 上面的 message 已经把数量说清楚了，
+    // 这里只是不让前端把「部分失败」渲染成一个绿色的成功提示。
+    if failed > 0 {
+        return Json(json!({
+            "success": false,
+            "message": format!("已初始化 {} 个 OAuth 配置，{} 个失败（详见服务端日志，可重试）", created, failed)
+        }));
     }
 
     Json(json!({
@@ -198,12 +258,20 @@ async fn create_oauth_provider(
     }
 
     // 检查是否已存在
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id::text FROM oauth_configs WHERE provider = $1")
+    // ⚠️ 曾用 `.unwrap_or(None)`：查询失败 → 判定「可以创建」→ 继续往下 INSERT。
+    // 与 auth.rs 的注册查重同一类问题：绕过了唯一性检查。
+    let exists = match db_guard::optional(
+        sqlx::query_as::<_, (String,)>("SELECT id::text FROM oauth_configs WHERE provider = $1")
             .bind(&provider_key)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
+            .fetch_optional(&state.pool),
+        "检查 OAuth Provider ID 是否已存在",
+    )
+    .await
+    {
+        db_guard::QueryOutcome::Found(v) => Some(v),
+        db_guard::QueryOutcome::NotFound => None,
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+    };
 
     if exists.is_some() {
         return Json(json!({
@@ -236,10 +304,7 @@ async fn create_oauth_provider(
                 "message": "创建成功"
             }))
         }
-        Err(e) => Json(json!({
-            "success": false,
-            "message": format!("创建失败: {}", e)
-        })),
+        Err(e) => db_guard::internal_error("创建 OAuth 提供商", e),
         _ => Json(json!({
             "success": false,
             "message": "创建失败"
@@ -323,10 +388,7 @@ async fn update_oauth_config(
             "success": false,
             "message": "配置不存在"
         })),
-        Err(e) => Json(json!({
-            "success": false,
-            "message": format!("更新失败: {}", e)
-        }))
+        Err(e) => db_guard::internal_error("更新 OAuth 配置", e)
     }
 }
 
@@ -366,10 +428,7 @@ async fn toggle_oauth_config(
             "success": false,
             "message": "配置不存在"
         })),
-        Err(e) => Json(json!({
-            "success": false,
-            "message": format!("操作失败: {}", e)
-        }))
+        Err(e) => db_guard::internal_error("OAuth 配置操作", e)
     }
 }
 

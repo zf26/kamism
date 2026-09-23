@@ -1,4 +1,5 @@
 use crate::middleware::auth::{auth_middleware, AppState};
+use crate::utils::db_guard;
 use crate::utils::jwt::Claims;
 use crate::models::payment_config::PaymentConfig;
 use axum::{
@@ -595,7 +596,33 @@ pub fn payments_router(state: AppState) -> Router<AppState> {
     Router::new()
         .nest("/pay/auth", authed_payment_router(pay_state.clone()))
         .route("/pay/notify", post(pay_notify))
-        .route("/pay/query/{order_id}", get(pay_query))
+        // ── 已删除：`GET /pay/query/:order_id` ──────────────────────────────
+        //
+        // 这里原本注册的是一条**永远无法工作**的路由，两个独立的缺陷叠在一起：
+        //
+        // 1. 路径参数写成了 `{order_id}`（axum 0.8 语法）。本项目用 axum 0.7，
+        //    它只认 `:order_id`，花括号会被当成**字面量** → 注册出的是
+        //    `/pay/query/%7Border_id%7D`，任何真实路径都匹配不上。
+        //    实测：`GET /pay/query/X` → 404 且无 `allow` 头（= 路由不存在），
+        //    而 `/pay/notify` → 405 带 `allow: POST`（= 路由存在、方法不对）。
+        //    两种状态码的区别就是判别「路由到底注册上没有」的依据。
+        //
+        // 2. 它挂在 `/pay` 根上，而 `auth_middleware` 只作用于 `nest("/pay/auth", ...)`
+        //    内部。所以 handler 的 `Extension<Claims>` 永远没有来源。
+        //    把路径语法改对之后立刻实测到 500，响应体是：
+        //      `Missing request extension: Extension of type Claims was not found.
+        //       Perhaps you forgot to add it?`
+        //    —— 带合法 token 也一样 500，因为中间件根本没机会跑。
+        //
+        // 为什么删而不是修：功能上与 `GET /pay/auth/status?order_id=` 完全重复，
+        // 且后者是它的**严格超集**（8 个字段 vs 3 个字段）并且有正确的 auth。
+        // 全仓库（前端 / 文档 / 测试）**零调用**。
+        // 一个没人用、功能重复、且自身坏掉的接口，删掉比修好更有价值 ——
+        // 修好它等于凭空多维护一个与 authed 版语义重叠的入口。
+        //
+        // ⚠️ 若将来要恢复无前缀的查询口，必须同时解决「谁往请求里塞 Claims」。
+        // 直接加 `.route_layer(auth_middleware)` 是最小改法，但要先想清楚
+        // 为什么需要两个查询口。
         .with_state(pay_state)
 }
 
@@ -629,6 +656,24 @@ fn get_plan_price(expires_days: Option<i32>) -> (String, String) {
             format!("KamiSM 专业版 {} 天续费", days),
         ),
         _ => ("365.00".to_string(), "KamiSM 专业版（永久）".to_string()),
+    }
+}
+
+/// 核对通道回调的实付金额与订单金额是否一致。
+///
+/// 三个通道给的金额**都是「元」**（MbdPay 的 `verify_notify` 已把分除以 100 并格式化成
+/// 两位小数；XorPay 的 `pay_price`、支付宝的 `total_amount` 本身就是元），
+/// 但字符串形态不统一（`"365"` / `"365.0"` / `"365.00"`），所以按**数值**比较。
+///
+/// 解析失败（含金额字段缺失被上游兜底成 `"0.00"` 的情况）一律判为不匹配：
+/// 在无法核对金额时宁可拒绝入账，也不要把订单标成已支付。
+fn amounts_match(order_amount: &str, notified: &str) -> bool {
+    match (
+        order_amount.trim().parse::<f64>(),
+        notified.trim().parse::<f64>(),
+    ) {
+        (Ok(a), Ok(b)) => (a - b).abs() < 0.005,
+        _ => false,
     }
 }
 
@@ -684,18 +729,45 @@ async fn create_order(
     };
 
     // 优先从 subscription_plans 表查套餐，否则按 expires_days 兜底
+    //
+    // ⚠️⚠️ 这里曾经用 `.unwrap_or(None)`，是**整个仓库里方向最危险的一处**，
+    // 因为它把「基础设施故障」直接变成了「按客户端说的价格算」：
+    //
+    //   1. 正常路径：`plan_id` → 查 `subscription_plans` → 价格由**服务端**决定
+    //   2. 出错路径（旧代码）：查询失败 → `None` → 走 `get_plan_price(body.expires_days)`
+    //      —— 而 `body.expires_days` 是**请求体里客户端自己传的**
+    //
+    // 也就是说：数据库抖一下，下单价格就从「套餐价 30 天」变成「客户端说多少天就多少天」。
+    // 这不是理论风险 —— 攻击者只要挑服务抖动的窗口下单（或者更直接：想办法让这条
+    // 查询超时），就能用任意价格买到套餐。而且**日志上什么都没有**。
+    //
+    // 所以这里不能 fallback：查不出来就拒绝下单。宁可用户点不了「立即支付」，
+    // 也不能按不可信的价格生成订单。
+    //
+    // 注意 `None => { get_plan_price(...) }` 那个分支是**另一种情况**：
+    // 请求里根本没传 `plan_id`（老客户端 / /pay 的简单模式），
+    // 那条路径的价格本来就不是从表里查的，属于正常的业务分支，保持不变。
     let (price, name, plan_days) = match body.plan_id {
         Some(plan_id) => {
-            let plan: Option<crate::models::subscription_plan::SubscriptionPlan> =
-                sqlx::query_as(
+            let plan = match db_guard::optional(
+                sqlx::query_as::<_, crate::models::subscription_plan::SubscriptionPlan>(
                     "SELECT id, plan, name, days, price::float8 AS price, original_price::float8 AS original_price, \
                      badge, highlight, sort_order, enabled, created_at, updated_at \
                      FROM subscription_plans WHERE id = $1 AND enabled = TRUE"
                 )
                     .bind(plan_id)
-                    .fetch_optional(&state.app_state.pool)
-                    .await
-                    .unwrap_or(None);
+                    .fetch_optional(&state.app_state.pool),
+                "查询订阅套餐（下单定价）",
+            )
+            .await
+            {
+                // 查到套餐 —— 价格由服务端决定
+                db_guard::QueryOutcome::Found(p) => Some(p),
+                // 套餐不存在或已下架 —— 这是正常的业务结论，可以走 expires_days 兜底
+                db_guard::QueryOutcome::NotFound => None,
+                // 查询失败 —— **绝不能**当成「套餐不存在」去走客户端传的 expires_days
+                db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+            };
             match plan {
                 Some(p) => {
                     let (price, name) = (
@@ -725,15 +797,30 @@ async fn create_order(
     let now = chrono::Utc::now();
 
     // 渠道选择：优先用请求指定的，其次查 DB 中已启用的，再 fallback 到 env
+    //
+    // ⚠️ 曾用 `.unwrap_or(None)`：查询失败 → 当成「没有任何启用的渠道」→
+    // fallback 到硬编码的 `"alipay"`。后果是**创建出渠道错误的订单**：
+    // 用户在界面上点了微信支付，生成的却是支付宝订单，付款时会一头雾水。
+    // 而且这条失败路径没有日志，运维只会看到「有用户说支付渠道不对」。
+    //
+    // 只有当请求**明确指定了渠道**时才允许继续（那是客户端的明确意图，
+    // 不需要查库）；否则查不出来就拒绝。
     let channel_str = match body.channel.clone() {
         Some(c) => c,
         None => {
-            let enabled: Option<(String,)> = sqlx::query_as(
-                "SELECT channel FROM payment_configs WHERE enabled = TRUE LIMIT 1",
+            let enabled = match db_guard::optional(
+                sqlx::query_as::<_, (String,)>("SELECT channel FROM payment_configs WHERE enabled = TRUE LIMIT 1")
+                    .fetch_optional(&state.app_state.pool),
+                "查询已启用的支付渠道",
             )
-            .fetch_optional(&state.app_state.pool)
             .await
-            .unwrap_or(None);
+            {
+                db_guard::QueryOutcome::Found(c) => Some(c),
+                // 确实一个都没启用 —— 这是配置问题，走下面的 alipay 兜底保持原有行为
+                db_guard::QueryOutcome::NotFound => None,
+                // 查询失败 —— 不能拿一个"猜"的渠道去下单
+                db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+            };
             enabled.map(|r| r.0).unwrap_or_else(|| "alipay".to_string())
         }
     };
@@ -821,7 +908,13 @@ async fn create_order(
             "alipay" => "alipay_trade_no",
             _ => "xorpay_aoid",
         };
-        let _ = sqlx::query(&format!(
+        // ⚠️ 这里曾经是 `let _ =`，写失败没有任何痕迹。
+        // 这一行是**唯一**记录支付渠道流水号的地方（三列目前全仓库只写不读，
+        // 是人工对账/查单用的）—— 写失败就只剩 order_id 能对，等于对账能力降级。
+        //
+        // 不能因为这里失败就返回失败：订单在渠道侧**已经创建**，pay_url 必须交给用户，
+        // 否则用户付了钱却拿不到跳转地址。所以取舍是「照常返回 + error 留痕」。
+        let recorded = sqlx::query(&format!(
             "UPDATE payments SET {} = $1 WHERE order_id = $2",
             col
         ))
@@ -829,6 +922,22 @@ async fn create_order(
         .bind(&order_id)
         .execute(&state.app_state.pool)
         .await;
+
+        match recorded {
+            Ok(r) if r.rows_affected() > 0 => {}
+            // 订单行是本函数上面刚 INSERT 成功的，为 0 说明它被并发删掉了 —— 罕见但要留痕
+            Ok(_) => tracing::error!(
+                "记录支付渠道流水号失败：没有匹配的订单行（rows_affected=0），该订单无法用流水号人工对账: order_id={} col={}",
+                order_id,
+                col
+            ),
+            Err(e) => tracing::error!(
+                "记录支付渠道流水号失败，该订单无法用流水号人工对账: order_id={} col={} err={}",
+                order_id,
+                col,
+                e
+            ),
+        }
     }
 
     tracing::info!(
@@ -883,8 +992,11 @@ async fn list_orders(
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
 
+    // ⚠️ 曾用 `.unwrap_or_default()` + `.unwrap_or((0,))`。
+    // 订单历史是最不该"静默变空"的一类页面：用户打开「我的订单」看到一片空白，
+    // 第一反应是**「我的付款记录丢了？」**——这比一个明确的错误提示糟糕得多。
     let orders: Vec<OrderRow> = {
-        sqlx::query_as::<_, OrderRow>(
+        match sqlx::query_as::<_, OrderRow>(
             "SELECT order_id, pay_channel, pay_type, amount::text, status, expires_days, created_at, pay_time \
              FROM payments WHERE merchant_id = $1 \
              AND ($2::text IS NULL OR pay_channel = $2) \
@@ -896,14 +1008,26 @@ async fn list_orders(
             .bind(offset)
             .fetch_all(&state.app_state.pool)
             .await
-            .unwrap_or_default()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("查询订单列表失败: merchant_id={} err={}", merchant_id, e);
+                return db_guard::server_busy();
+            }
+        }
     };
 
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payments WHERE merchant_id = $1")
-        .bind(merchant_id)
-        .fetch_one(&state.app_state.pool)
-        .await
-        .unwrap_or((0,));
+    let total = match db_guard::scalar(
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM payments WHERE merchant_id = $1")
+            .bind(merchant_id)
+            .fetch_one(&state.app_state.pool),
+        "统计订单总数",
+    )
+    .await
+    {
+        db_guard::ScalarOutcome::Found(t) => t,
+        db_guard::ScalarOutcome::Failed => return db_guard::server_busy(),
+    };
 
     let data: Vec<Value> = orders
         .into_iter()
@@ -955,15 +1079,31 @@ async fn get_order_status(
         Err(e) => return e,
     };
 
-    let row: Option<OrderRow> = sqlx::query_as(
-        "SELECT order_id, pay_channel, pay_type, amount::text, status, expires_days, created_at, pay_time
-         FROM payments WHERE order_id = $1 AND merchant_id = $2",
+    // ⚠️ 曾用 `.unwrap_or(None)`。这个接口是**前端支付后的轮询口**（通常是每秒一次），
+    // 静默失败的后果特别糟：
+    //   用户刚在支付宝里付完钱 → 前端开始轮询 → 恰好这几次查询失败 →
+    //   前端收到「订单不存在」→ 界面显示**支付失败**。
+    //   而钱其实已经扣了，订单也会被回调改成已支付 ——
+    //   用户看到的是"钱没了、订单也没了"，会立刻来投诉。
+    //
+    // 把 `NotFound`（订单号真的不对）和 `Failed`（查不了）分开，
+    // 前端就至少能区分「这个订单号不存在」和「状态暂时查不到，再等等」。
+    let row = match db_guard::optional(
+        sqlx::query_as::<_, OrderRow>(
+            "SELECT order_id, pay_channel, pay_type, amount::text, status, expires_days, created_at, pay_time
+             FROM payments WHERE order_id = $1 AND merchant_id = $2",
+        )
+        .bind(&q.order_id)
+        .bind(merchant_id)
+        .fetch_optional(&state.app_state.pool),
+        "查询订单状态",
     )
-    .bind(&q.order_id)
-    .bind(merchant_id)
-    .fetch_optional(&state.app_state.pool)
     .await
-    .unwrap_or(None);
+    {
+        db_guard::QueryOutcome::Found(r) => Some(r),
+        db_guard::QueryOutcome::NotFound => None,
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+    };
 
     match row {
         Some((
@@ -1123,26 +1263,15 @@ async fn pay_notify(
         ("XorPay", order_id.to_string(), pay_price.to_string())
     };
 
-    // 幂等检查
-    let row: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id::text, status FROM payments WHERE order_id = $1")
-            .bind(&order_id)
-            .fetch_optional(&state.app_state.pool)
-            .await
-            .unwrap_or(None);
-
-    let payment_id = match row {
-        Some((id, s)) if s != "paid" => id,
-        Some(_) => return "ok",
-        None => {
-            tracing::warn!("[{}] 回调订单不存在: {}", channel_name, order_id);
-            return "order_not_found";
-        }
-    };
-
-    // ── 使用 DB 事务：支付状态更新 + 套餐升级原子操作 ──
-    let tx_result = state.app_state.pool.begin().await;
-    let mut tx = match tx_result {
+    // ── 事务内完成「锁行 → 幂等判定 → 金额核对 → 更新 → 升级」全流程 ──
+    //
+    // 为什么必须在事务内、且要 FOR UPDATE：
+    // 支付通道会重复投递回调（网络重试、通道自身的重推策略），同一笔订单可能有两个
+    // 请求几乎同时到达。旧写法是「事务外查一次 status，事务里不带条件地 UPDATE」——
+    // 两个并发请求都能通过事务外那次检查，然后各自给商户加一遍套餐时长。
+    // FOR UPDATE 把同一订单的并发回调串行化：后到的会阻塞到前者提交，
+    // 再读到的就是 status = 'paid'，于是走幂等分支直接确认返回。
+    let mut tx = match state.app_state.pool.begin().await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("[{}] 开启事务失败: {}", channel_name, e);
@@ -1150,60 +1279,114 @@ async fn pay_notify(
         }
     };
 
+    // 一次查询同时充当：行锁 + 幂等判定 + 金额核对 + 升级所需字段。
+    // amount 用 ::text 取回，避免为了一个字段给 sqlx 打开 bigdecimal feature。
+    let order: Result<Option<(Uuid, String, String, Option<i32>, Uuid, String)>, sqlx::Error> =
+        sqlx::query_as(
+            "SELECT id, status, amount::text, expires_days, merchant_id, plan
+             FROM payments WHERE order_id = $1 FOR UPDATE",
+        )
+        .bind(&order_id)
+        .fetch_optional(&mut *tx)
+        .await;
+
+    let (payment_id, order_amount, expires_days, merchant_id, plan) = match order {
+        Err(e) => {
+            tracing::error!("[{}] 查询订单失败: {}", channel_name, e);
+            let _ = tx.rollback().await;
+            return "error";
+        }
+        Ok(None) => {
+            tracing::warn!("[{}] 回调订单不存在: {}", channel_name, order_id);
+            let _ = tx.rollback().await;
+            return "order_not_found";
+        }
+        Ok(Some((_, ref status, _, _, _, _))) if status == "paid" => {
+            // 幂等：这笔订单已经处理过（通常是通道重复投递）—— 确认收到，但不重复加时长
+            tracing::info!(
+                "[{}] 重复回调，订单已支付，幂等跳过: order_id={}",
+                channel_name,
+                order_id
+            );
+            let _ = tx.rollback().await;
+            return "ok";
+        }
+        Ok(Some((id, _, amount, days, mch, p))) => (id, amount, days, mch, p),
+    };
+
+    // 金额核对：实付金额必须与下单时的订单金额一致
+    if !amounts_match(&order_amount, &pay_price) {
+        tracing::error!(
+            "[{}] 回调金额与订单金额不符，拒绝入账: order_id={}, 订单金额={}, 回调金额={}",
+            channel_name,
+            order_id,
+            order_amount,
+            pay_price
+        );
+        let _ = tx.rollback().await;
+        return "amount_mismatch";
+    }
+
     let notify_json = serde_json::to_string(&body).unwrap_or_default();
-    if let Err(e) = sqlx::query(
-        "UPDATE payments SET status = 'paid', pay_price = $1, pay_time = $2, notify_data = $3, updated_at = NOW() WHERE id = $4",
+    // WHERE 再带一次 status 条件作双保险：即使 FOR UPDATE 因故没锁住，
+    // 也不会把已支付的订单再写一遍（此时 rows_affected 为 0）。
+    let updated = sqlx::query(
+        "UPDATE payments SET status = 'paid', pay_price = $1, pay_time = $2, notify_data = $3, updated_at = NOW()
+         WHERE id = $4 AND status <> 'paid'",
     )
     .bind(&pay_price)
     .bind(chrono::Utc::now())
     .bind(&notify_json)
     .bind(payment_id)
     .execute(&mut *tx)
-    .await
-    {
-        tracing::error!("[{}] 更新支付状态失败: {}", channel_name, e);
-        let _ = tx.rollback().await;
-        return "error";
+    .await;
+
+    match updated {
+        Err(e) => {
+            tracing::error!("[{}] 更新支付状态失败: {}", channel_name, e);
+            let _ = tx.rollback().await;
+            return "error";
+        }
+        Ok(ref r) if r.rows_affected() == 0 => {
+            // 并发回调抢先完成，本次视为重复投递
+            tracing::info!(
+                "[{}] 订单状态已被并发回调置为已支付，幂等跳过: order_id={}",
+                channel_name,
+                order_id
+            );
+            let _ = tx.rollback().await;
+            return "ok";
+        }
+        Ok(_) => {}
     }
 
-    // 查询订单信息用于套餐升级
-    let merchant_plan_info: Option<(Uuid, String, Option<i32>)> = sqlx::query_as(
-        "SELECT merchant_id::text, plan, expires_days FROM payments WHERE order_id = $1",
-    )
-    .bind(&order_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .unwrap_or(None);
-
+    // 套餐升级：只有 pro 套餐才需要动商户
     let mut need_upgrade_msg = false;
+    if plan == "pro" {
+        let update_result = if let Some(days) = expires_days {
+            sqlx::query(
+                "UPDATE merchants SET plan = 'pro', plan_expires_at = COALESCE(plan_expires_at, NOW()) + ($1 || ' days')::INTERVAL, updated_at = NOW() WHERE id = $2",
+            )
+            .bind(days.to_string())
+            .bind(merchant_id)
+            .execute(&mut *tx)
+            .await
+        } else {
+            sqlx::query(
+                "UPDATE merchants SET plan = 'pro', plan_expires_at = NULL, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(merchant_id)
+            .execute(&mut *tx)
+            .await
+        };
 
-    if let Some((merchant_id, ref plan, expires_days)) = merchant_plan_info {
-        if plan == "pro" {
-            let update_result = if let Some(days) = expires_days {
-                sqlx::query(
-                    "UPDATE merchants SET plan = 'pro', plan_expires_at = COALESCE(plan_expires_at, NOW()) + ($1 || ' days')::INTERVAL, updated_at = NOW() WHERE id = $2",
-                )
-                .bind(days.to_string())
-                .bind(merchant_id)
-                .execute(&mut *tx)
-                .await
-            } else {
-                sqlx::query(
-                    "UPDATE merchants SET plan = 'pro', plan_expires_at = NULL, updated_at = NOW() WHERE id = $1",
-                )
-                .bind(merchant_id)
-                .execute(&mut *tx)
-                .await
-            };
-
-            if let Err(e) = update_result {
-                tracing::error!("[{}] 更新商户套餐失败: {}", channel_name, e);
-                let _ = tx.rollback().await;
-                return "error";
-            }
-
-            need_upgrade_msg = true;
+        if let Err(e) = update_result {
+            tracing::error!("[{}] 更新商户套餐失败: {}", channel_name, e);
+            let _ = tx.rollback().await;
+            return "error";
         }
+
+        need_upgrade_msg = true;
     }
 
     if let Err(e) = tx.commit().await {
@@ -1213,15 +1396,13 @@ async fn pay_notify(
 
     // ── 事务成功后发布升级消息（避免事务回滚但消息已发出）──
     if need_upgrade_msg {
-        if let Some((merchant_id, _, _)) = merchant_plan_info {
-            if let Err(e) = crate::utils::mq::publish_upgrade(
-                &state.app_state.mq_channel,
-                &merchant_id.to_string(),
-            )
-            .await
-            {
-                tracing::error!("[{}] 发布升级恢复消息失败: {}", channel_name, e);
-            }
+        if let Err(e) = crate::utils::mq::publish_upgrade(
+            &state.app_state.mq_channel,
+            &merchant_id.to_string(),
+        )
+        .await
+        {
+            tracing::error!("[{}] 发布升级恢复消息失败: {}", channel_name, e);
         }
     }
 
@@ -1236,34 +1417,11 @@ async fn pay_notify(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 主动查询（商户前端轮询兜底）
+//
+// `pay_query` 已删除 —— 理由见 `payments_router` 里的注释。
+// 这个功能由 `GET /pay/auth/status?order_id=` 承担（`authed_payment_router` 内，
+// 字段是这里的超集，且 auth 正确）。
 // ─────────────────────────────────────────────────────────────────────────────
-
-async fn pay_query(
-    State(state): State<PayState>,
-    Extension(claims): Extension<Claims>,
-    axum::extract::Path(order_id): axum::extract::Path<String>,
-) -> Json<Value> {
-    let merchant_id = match get_merchant_id(&claims) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    let row: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT order_id, status, pay_channel FROM payments WHERE order_id = $1 AND merchant_id = $2",
-    )
-    .bind(&order_id)
-    .bind(merchant_id)
-    .fetch_optional(&state.app_state.pool)
-    .await
-    .unwrap_or(None);
-
-    match row {
-        Some((order_id, status, pay_channel)) => Json(
-            json!({"success": true, "data": { "order_id": order_id, "status": status, "pay_channel": pay_channel }}),
-        ),
-        None => Json(json!({"success": false, "message": "订单不存在"})),
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 取消订单
@@ -1299,5 +1457,46 @@ async fn cancel_order(
             tracing::error!("取消订单失败: {}", e);
             Json(json!({"success": false, "message": "取消失败"}))
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 测试
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::amounts_match;
+
+    #[test]
+    fn amounts_match_accepts_equivalent_formats() {
+        // 订单侧是 DECIMAL(10,2) 取出的 "365.00"，回调侧小数位数可能不同
+        assert!(amounts_match("365.00", "365"));
+        assert!(amounts_match("365.00", "365.0"));
+        assert!(amounts_match("365.00", "365.00"));
+        assert!(amounts_match("0.01", "0.01"));
+        // form-urlencoded 解析后可能残留空白
+        assert!(amounts_match("365.00", " 365.00 "));
+    }
+
+    #[test]
+    fn amounts_match_rejects_mismatch_and_garbage() {
+        // 少付不该入账
+        assert!(!amounts_match("365.00", "0.01"));
+        // 多付同样不该 —— 金额对不上说明订单与回调不是同一笔
+        assert!(!amounts_match("365.00", "3650.00"));
+        // MbdPay 回调缺 data[amount] 时，上游兜底成 0 分 → "0.00"
+        assert!(!amounts_match("365.00", "0.00"));
+        // 通道完全没给金额字段
+        assert!(!amounts_match("365.00", ""));
+        assert!(!amounts_match("365.00", "abc"));
+    }
+
+    #[test]
+    fn amounts_match_tolerates_sub_cent_rounding() {
+        // 半分钱以内视为相等，避免浮点表示差异造成误拒
+        assert!(amounts_match("365.00", "365.004"));
+        // 但差一分钱就是不一致
+        assert!(!amounts_match("365.00", "365.01"));
     }
 }
