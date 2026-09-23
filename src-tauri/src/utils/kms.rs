@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Result};
 use hex::{decode, encode};
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -184,6 +185,54 @@ impl KmsManager {
     pub fn get_master_key_hex(&self) -> String {
         encode(&self.master_key)
     }
+
+    /// 派生「查找哈希」用的 pepper（给 `EncryptedFieldsOps::generate_hash` 用）
+    ///
+    /// ── 为什么查找哈希需要 pepper ──────────────────────────────────────────
+    ///
+    /// 那些 `*_hash` 列的作用是精确匹配（`WHERE api_key_hash = $1`），
+    /// 所以**必须确定性**（同输入同输出），用不了随机 salt。确定性 + 无 pepper
+    /// 就等于：拿到库的人可以对任意候选值离线算哈希。而这些列的输入常常是低熵的
+    /// —— 最短的卡密只有 32² = 1024 种组合，枚举 1024 次就能把 `code_hash`
+    /// **还原成明文卡密**，而旁边那条 `code_encrypted`（AES-256-GCM）根本没被碰。
+    /// 换句话说：**哈希列把加密废掉了**。
+    ///
+    /// ── 为什么不能直接复用 `derive_dek` ─────────────────────────────────
+    ///
+    /// `derive_dek(key_id)` 是 `SHA256(master_key || key_id)`。如果这里也写成
+    /// `derive_dek("lookup-hash-pepper")`，两条派生路径就是**同一个构造**
+    /// （只是字符串常量不同），一旦哪天有人把某个 `key_id` 取成相同的串，
+    /// 同一个 32 字节输出就会同时充当「加密密钥」和「哈希 pepper」。
+    /// 所以这里换的是**构造本身** —— `HMAC-SHA256(master_key, label)`，
+    /// 不只是换个标签字符串，而是结构性地区分开。
+    ///
+    /// ── 副作用，必须知道 ────────────────────────────────────────────────
+    ///
+    /// **换 MASTER_KEY = 换 pepper = 所有按哈希查行的路径一行都查不到。**
+    /// 这与「换 MASTER_KEY = 所有加密字段解不开」是同一把密钥的两个后果，
+    /// 所以这里没有引入新的失效场景，只是把既有的约束扩大到了哈希列。
+    ///
+    /// ⚠️ 但**别指望启动守卫替你把这件事挡住**。`lib.rs::ensure_master_key_matches_data`
+    /// 只在 `kms.is_auto_generated()`（进程**没有配** MASTER_KEY、临时生成了一把）时
+    /// 才生效，否则第一行就 `return Ok(())`。也就是说：
+    /// **配了另一把 MASTER_KEY**（最常见的轮换场景）它拦不住 —— 启动会正常通过，
+    /// 直到有请求去读加密字段、或按哈希查行时才暴露出来。
+    /// 轮换密钥前请自觉确认库里有没有数据。
+    pub fn derive_lookup_pepper(&self) -> [u8; 32] {
+        type HmacSha256 = Hmac<Sha256>;
+        // ⚠️ 必须写成 `<HmacSha256 as Mac>::new_from_slice` —— 本文件顶部
+        // `use aes_gcm::aead::KeyInit` 也提供了同名方法，直接写
+        // `HmacSha256::new_from_slice(...)` 会因为「两个 trait 都在作用域内」而编译失败。
+        // HMAC 接受任意长度密钥，这里密钥恒为 32 字节，不可能失败
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.master_key)
+            .expect("HMAC-SHA256 接受任意长度密钥");
+        mac.update(b"kamism/lookup-hash-pepper/v1");
+        let out = mac.finalize().into_bytes();
+
+        let mut pepper = [0u8; 32];
+        pepper.copy_from_slice(&out);
+        pepper
+    }
 }
 
 /// 加密器：处理字段级加密和解密
@@ -343,6 +392,62 @@ mod tests {
         let ciphertext = enc_a.encrypt("secret", "card_code_x").unwrap();
         assert_eq!(enc_a.decrypt(&ciphertext).unwrap(), "secret");
         assert!(enc_b.decrypt(&ciphertext).is_err());
+    }
+
+    // ── lookup pepper 的三条契约 ─────────────────────────────────────────
+    // 这个值决定「能不能查到库里那些按哈希存的行」，所以三条都要钉住：
+    // 稳定（否则查不到自己刚写的行）、随主密钥变（否则不是密钥材料）、
+    // 且不与任何 DEK 重合（否则同一个 32 字节同时是加密密钥和哈希 pepper）。
+
+    fn kms_with(byte: u8) -> KmsManager {
+        KmsManager {
+            master_key: [byte; 32],
+            auto_generated: false,
+        }
+    }
+
+    #[test]
+    fn lookup_pepper_is_stable_for_the_same_master_key() {
+        // 同一把主密钥两次派生必须一致 —— 这是「按哈希查行」能工作的前提。
+        assert_eq!(
+            kms_with(7).derive_lookup_pepper(),
+            kms_with(7).derive_lookup_pepper()
+        );
+    }
+
+    #[test]
+    fn lookup_pepper_changes_with_the_master_key() {
+        // 换主密钥必须换 pepper，否则 pepper 就不是密钥材料，离线枚举者可以
+        // 完全忽略主密钥直接算哈希。
+        assert_ne!(
+            kms_with(7).derive_lookup_pepper(),
+            kms_with(8).derive_lookup_pepper()
+        );
+    }
+
+    /// 这条是**针对一个具体的未来误用**：如果哪天有人把 pepper 改成
+    /// `derive_dek("lookup-hash-pepper")`（看起来更省事、也「更对称」），
+    /// 两条派生路径就变成同一个构造，同一个 32 字节会同时充当
+    /// 加密密钥与哈希 pepper。这里把「两者永不相等」钉成断言。
+    #[test]
+    fn lookup_pepper_never_collides_with_a_dek() {
+        let kms = kms_with(7);
+        let pepper = kms.derive_lookup_pepper();
+
+        for key_id in [
+            "lookup-hash-pepper",
+            "kamism/lookup-hash-pepper/v1",
+            "card_code_00000000-0000-0000-0000-000000000000",
+            "merchant_api_key_00000000-0000-0000-0000-000000000000",
+            "",
+        ] {
+            assert_ne!(
+                pepper,
+                kms.derive_dek(key_id).unwrap(),
+                "pepper 与 derive_dek({:?}) 撞上了 —— 说明两条派生路径用了同一个构造",
+                key_id
+            );
+        }
     }
 }
 

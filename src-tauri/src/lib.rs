@@ -104,6 +104,18 @@ pub async fn start_server() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("KMS 初始化失败: {}", e))?;
     // 禁止「拿着新密钥去读旧数据」：库里有加密数据时必须用原来那把密钥启动
     ensure_master_key_matches_data(&pool, &kms).await?;
+
+    // 查找哈希的 pepper：由主密钥做**域分隔**派生（HMAC-SHA256(master_key, label)，
+    // 与 derive_dek 的 `SHA256(master_key || key_id)` 构造不同，不会撞）。
+    // ⚠️ 必须在任何 generate_hash 调用之前注入，否则会 panic。
+    db::encrypted_fields::init_lookup_pepper(kms.derive_lookup_pepper());
+    tracing::info!(
+        "查找哈希算法: HMAC-SHA256(pepper, value)，pepper 指纹 {}（不打印 pepper 本身）",
+        db::encrypted_fields::lookup_pepper_fingerprint()
+    );
+    // 禁止「算法换了、存量行还是旧哈希」：那会让所有按哈希查行的路径静默查不到行
+    ensure_lookup_hash_version(&pool).await?;
+
     let encryptor = Arc::new(utils::kms::Encryptor::new(kms));
     tracing::info!("KMS 初始化成功");
 
@@ -396,6 +408,64 @@ async fn ensure_master_key_matches_data(
     }
 
     Ok(())
+}
+
+/// 启动前置检查：禁止「查询哈希的算法换了、存量行还是旧哈希」
+///
+/// 查找哈希列（`merchants.api_key_hash` / `email_hash`、`cards.code_hash`、
+/// `activations.device_id_hash`）是用来做 `WHERE xxx_hash = $1` 精确匹配的。
+/// 这批把算法从裸 SHA-256（v1）换成了 `HMAC-SHA256(pepper, value)`（v2），
+/// **算法一换，存量行就一个都查不到** —— 表现为「用户拿着正确的卡密被告知不存在」
+/// 「登录说邮箱没注册过」，而库连着、接口 200、日志干净。
+///
+/// 所以这里用 `encryption_keys` 里的一行标记来判断回填跑没跑过
+/// （判定逻辑见 `db::lookup_hash::startup_decision`，那边有单测；这里只负责执行）：
+///   - 标记已是 v2        → 放行
+///   - 库里一行数据都没有  → 全新库，写入 v2 标记后放行
+///   - 有数据但没有 v2 标记 → **拒绝启动**，并告诉你怎么修
+///
+/// 取舍与 `ensure_master_key_matches_data` 一致：**把静默的查询失效，
+/// 换成启动时的一条明确指令。**
+async fn ensure_lookup_hash_version(pool: &db::DbPool) -> anyhow::Result<()> {
+    use db::lookup_hash::{self, StartupDecision, V2_HMAC_SHA256};
+
+    let marker = lookup_hash::read_marker(pool).await?;
+    let counts = lookup_hash::row_counts(pool).await?;
+
+    match lookup_hash::startup_decision(marker, &counts) {
+        StartupDecision::Ok => {
+            tracing::info!(
+                "查找哈希版本: v{V2_HMAC_SHA256}（回填已完成，当前 {}）",
+                counts.describe()
+            );
+            Ok(())
+        }
+        StartupDecision::MarkFresh => {
+            lookup_hash::write_marker(pool, V2_HMAC_SHA256).await?;
+            tracing::info!(
+                "查找哈希版本: 全新库（{}），已标记为 v{V2_HMAC_SHA256}",
+                counts.describe()
+            );
+            Ok(())
+        }
+        StartupDecision::NeedsRehash => anyhow::bail!(
+            "拒绝启动：库里有数据（{}），但没有「查找哈希已回填到 v{}」的标记。\n\
+             这批把按哈希查行的算法从裸 SHA-256 换成了 HMAC-SHA256(pepper, value)，\
+             存量行的哈希还是旧算法 —— 继续启动会让**所有**按哈希查行的路径都查不到行：\n\
+             · 用户拿着正确的卡密被告知「卡密不存在」\n\
+             · 登录时说「邮箱没注册过」\n\
+             · 解绑/删除路径删不到本该删的行\n\
+             而这些都不会报错。修复只需一条命令（可反复跑，幂等）：\n\
+             \n\
+             \x20   cargo run --bin rehash_lookup_columns            # 先看要动多少行\n\
+             \x20   cargo run --bin rehash_lookup_columns -- --apply  # 确认后写库\n\
+             \n\
+             注意 `device_blacklist.device_id_hash` 无法回填（那张表没有明文可回收），\
+             运行时已按新旧两种哈希同时匹配，不需要人工处理。",
+            counts.describe(),
+            V2_HMAC_SHA256
+        ),
+    }
 }
 
 /// 确保库里至少有一个管理员账号。

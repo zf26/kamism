@@ -4,6 +4,7 @@ use sqlx::PgPool;
 use std::time::Duration;
 
 pub mod encrypted_fields;
+pub mod lookup_hash;
 
 pub type DbPool = PgPool;
 

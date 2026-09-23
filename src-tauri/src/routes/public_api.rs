@@ -149,15 +149,32 @@ async fn activate(
     }
 
     // ── 设备黑名单检查（全局 + 商户级）────────────────────────────────────
+    //
+    // ⚠️ 这里是**全仓库唯一**需要拿旧算法哈希去查的地方，原因见
+    // `db::encrypted_fields::generate_hash_legacy_sha256` 的文档：
+    // `device_blacklist` 表只有 `device_id_hash` + `device_hint`（掩码展示用），
+    // **没有 `*_encrypted` 列** —— 明文从来没落过库，哈希不可逆，
+    // 所以 `rehash_lookup_columns` 回填不了这张表。
+    //
+    // 只查新哈希的后果不是「少拦一个设备」，而是**被封设备静默解封**：
+    // 管理员看得见黑名单里有记录，接口却一条都匹配不上。
+    // 所以这里同时查两种哈希（`= ANY($3)` 一次查询搞定，不是两次往返）。
+    //
+    // 为什么用「一次查询 + 数组」而不是「查不到再查一次」：后者会在
+    // 新哈希命中时也照样多打一次库，而这是每请求都要走的热路径。
     let device_id_hash = EncryptedFieldsOps::generate_hash(&body.device_id);
+    let device_id_hash_legacy =
+        EncryptedFieldsOps::generate_hash_legacy_sha256(&body.device_id);
+    let blacklist_probe: Vec<String> = vec![device_id_hash.clone(), device_id_hash_legacy];
     match db_guard::optional(
         sqlx::query_as::<_, (i64,)>(
             "SELECT 1 FROM device_blacklist
-             WHERE device_id_hash = $1 AND (merchant_id IS NULL OR merchant_id = $2)
+             WHERE device_id_hash = ANY($3) AND (merchant_id IS NULL OR merchant_id = $2)
              LIMIT 1",
         )
         .bind(&device_id_hash)
         .bind(merchant_id)
+        .bind(&blacklist_probe)
         .fetch_optional(&state.pool),
         "查询设备黑名单",
     )
