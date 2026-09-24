@@ -11,3 +11,4 @@ pub mod redis_guard;
 pub mod ws;
 pub mod oauth;
 pub mod ip_region;
+pub mod config;

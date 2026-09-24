@@ -68,6 +68,11 @@ pub async fn start_server() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/kamism".to_string());
     let jwt_secret = env::var("JWT_SECRET")
         .expect("JWT_SECRET 环境变量未设置 — 请设置一个随机密钥，例如：openssl rand -hex 32");
+    // 光「设了」还不够：env.example 里那个 `change_me_...` 是可预测的，
+    // 照抄部署等于把签名密钥公开，而运行时完全看不出来（签发/校验都正常）。
+    // 这种错误只能在启动时拦。理由与规则见 utils::config。
+    utils::config::validate_jwt_secret(&jwt_secret)
+        .map_err(|e| anyhow::anyhow!("JWT_SECRET 不可用：{}", e))?;
     let redis_url = env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let amqp_url = env::var("AMQP_URL")
@@ -508,7 +513,24 @@ async fn init_admin(pool: &db::DbPool) -> anyhow::Result<()> {
     }
 
     let admin_email = env::var("ADMIN_EMAIL").unwrap_or_else(|_| "admin@kamism.com".to_string());
-    let admin_password = env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "Admin@123456".to_string());
+
+    // 走到这里说明库里**一个管理员都没有**，必须现建一个（否则部署完没人能登录）。
+    //
+    // ⚠️ 这里原来有一句 `.unwrap_or_else(|_| "Admin@123456".to_string())`：
+    // 没配 ADMIN_PASSWORD 就**静默**建一个公开的默认口令账号。这是最坏的组合 ——
+    // 部署者会以为自己「没配就是没建」，实际上是建了个全世界都知道密码的管理员。
+    // 所以现在改成：必须显式配置，且要通过强度校验。
+    // （已有管理员的部署根本不会走到这里，不受影响。）
+    let admin_password = env::var("ADMIN_PASSWORD").map_err(|_| {
+        anyhow::anyhow!(
+            "库里没有任何管理员，需要创建初始管理员，但没有设置 ADMIN_PASSWORD。\
+             请设置一个至少 {} 位的强口令后重启（不要用 Admin@123456 这类公开默认口令）。",
+            utils::config::MIN_ADMIN_PASSWORD_LEN
+        )
+    })?;
+    utils::config::validate_admin_password(&admin_password, &admin_email)
+        .map_err(|e| anyhow::anyhow!("ADMIN_PASSWORD 不可用：{}", e))?;
+
     let password_hash = bcrypt::hash(&admin_password, bcrypt::DEFAULT_COST)
         .map_err(|e| anyhow::anyhow!("初始管理员密码哈希失败: {}", e))?;
 
