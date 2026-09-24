@@ -10,6 +10,7 @@ import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
 import { useWs } from '../hooks/useWs';
 import { useWsEventStore } from '../stores/wsEvent';
+import OnboardingGuide from './OnboardingGuide';
 
 interface NavItem {
   label: string;
@@ -70,6 +71,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [unread, setUnread] = useState(0);
   const [noticeQueue, setNoticeQueue] = useState<{id:string;title:string;content:string;created_at:string}[]>([]);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const setLastEvent = useWsEventStore((s) => s.setLastEvent);
 
   // 商户端：拉取未读站内信数
@@ -106,6 +108,22 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     // 管理员完全禁用 WS（-1 = 不建立初始连接）
     reconnectInterval: role === 'merchant' ? 3000 : -1,
   });
+
+  // 商户端：首次使用引导。只在「总览」页弹出，判定「每商户每浏览器一次」。
+  // 引导优先级高于公告（zIndex 1100 > 1050），首次登录时先看引导。
+  useEffect(() => {
+    if (role !== 'merchant') return;
+    if (location.pathname !== '/dashboard') return;
+    if (!user?.id) return;
+    const key = `merchant_onboarded_${user.id}`;
+    if (localStorage.getItem(key)) return;
+    setShowOnboarding(true);
+  }, [role, location.pathname, user?.id]);
+
+  const handleOnboardingDone = () => {
+    if (user?.id) localStorage.setItem(`merchant_onboarded_${user.id}`, '1');
+    setShowOnboarding(false);
+  };
 
   // 确认当前公告已读（localStorage 永久记录），弹出下一条
   const handleNoticeConfirm = () => {
@@ -308,8 +326,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       </main>
 
       {/* ── 公告弹窗（session 内每条只弹一次）── */}
-      {noticeQueue.length > 0 && (
-        <div className="modal-overlay" style={{ zIndex: 1050 }}>
+      {noticeQueue.length > 0 && (        <div className="modal-overlay" style={{ zIndex: 1050 }}>
           <div className="modal" style={{ maxWidth: 640, width: '90vw' }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
               <div style={{
@@ -349,6 +366,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       )}
+
+      {/* ── 商户首次使用引导（每商户每浏览器一次）── */}
+      {showOnboarding && <OnboardingGuide onDone={handleOnboardingDone} />}
     </div>
   );
 }

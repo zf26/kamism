@@ -16,12 +16,62 @@ const shieldApi: AxiosInstance = axios.create({
   timeout: 600_000, // 10min，超大 APK 上传需要更长时间
 });
 
-// ── 请求去重：防止相同 GET 请求并发重复发送（例如切换页面时的竞态）──────────
-// key = method + url + params 序列化，value = AbortController
+// ── 请求去重：防止「同一接口的旧请求」覆盖「新请求」（翻页 / 搜索竞态）────────
+//
+// key = method + url（**不含 params**）。为什么不能含 params：
+//   翻页时 `page=1` → `page=2`、搜索时 `card_code=a` → `card_code=ab`，params 不同则
+//   key 不同，旧的慢请求不会被取消，会乱序覆盖新结果（列表页「搜到的还是上一页」）。
+//   同一 url 的连续请求语义上是「同一份数据的最新查询」，旧的理应作废。
+//
+// 为什么不担心「同 url 不同资源」误伤：
+//   - 详情/资源接口 url 自带 id（如 `/cards/:id`、`/activations/:id`），天然不同 key；
+//   - 少数 `?order_id=x` 这类「同 url 不同参数」的 GET，前端都是串行调用（查完一个
+//     再查下一个），不存在并发在途；即便极少数并发，被 abort 的也只是该作废的旧请求。
+//
+// value = AbortController，同时回挂到 config 的 `__controller` 上。
+// 判断「这次响应/错误是否还属于当前在途请求」用 **controller 同一性**，而不是仅凭 key：
+//   旧请求的回调可能在「新请求已经接管该 key」之后才回来，此时按 key 直接 delete 会
+//   误删新请求的记录，让它失去被取消的能力（去重形同虚设，旧数据仍可能覆盖新数据）。
+//
+// 🚨 「被放弃的请求」必须**对调用方完全透明**（这是踩过的坑）：
+//   放弃有两种来源 —— ① 被新请求 abort（错误回调收到 CanceledError）；
+//   ② abort 没赶上，响应已在途（回来时 controller 已不是当前值）。
+//   两者在响应拦截器里一律返回一个**永不 settle 的 promise**：调用方的 then / catch /
+//   finally 全都不执行，等于这次请求从未发生。
+//   反面教材：若在这里 `Promise.reject`，调用方的 `.catch()` 会把「旧请求被自己人
+//   取消」误报成业务失败 —— 现象是**数据明明加载成功、却弹出「加载失败」**。开发模式
+//   下 React.StrictMode 会让每个 useEffect 跑两次，第二次必然取消第一次，所以每次进
+//   页面必现；生产环境翻页 / 搜索 / 防抖同样会命中。
+//   loading 由接替它的新请求收尾（取消永远发生在「新请求即将发出」时，必有新请求收尾）。
 const pendingRequests = new Map<string, AbortController>();
 
+type TrackedRequestConfig = InternalAxiosRequestConfig & { __controller?: AbortController };
+
 function buildRequestKey(config: InternalAxiosRequestConfig): string {
-  return `${config.method?.toUpperCase()}:${config.url}:${JSON.stringify(config.params ?? {})}`;
+  return `${config.method?.toUpperCase()}:${config.url}`;
+}
+
+/** 请求是否被主动取消（AbortController.abort()）。覆盖 axios 与原生两种错误形态。 */
+function isCanceledError(err: unknown): boolean {
+  const e = err as { name?: string; code?: string } | undefined;
+  return (
+    axios.isCancel(err) ||
+    e?.name === 'CanceledError' ||
+    e?.name === 'AbortError' ||
+    e?.code === 'ERR_CANCELED'
+  );
+}
+
+/** 该 GET 请求是否已被更新的同 url 请求接管（abort 没赶上时的兜底判断）。 */
+function isSuperseded(config: InternalAxiosRequestConfig | undefined): boolean {
+  if (!config || config.method?.toUpperCase() !== 'GET') return false;
+  const controller = (config as TrackedRequestConfig).__controller;
+  return !!controller && pendingRequests.get(buildRequestKey(config)) !== controller;
+}
+
+/** 永不 settle 的 promise：用于「静默作废」一次请求，调用方无感。 */
+function neverSettle(): Promise<never> {
+  return new Promise<never>(() => {});
 }
 
 // 保留函数签名兼容性，无需异步初始化
@@ -50,12 +100,13 @@ api.interceptors.request.use((config) => {
     const key = buildRequestKey(config);
     const existing = pendingRequests.get(key);
     if (existing) {
-      // 取消上一个相同请求
+      // 取消上一个相同请求（它对应的错误回调会静默作废，不会打扰调用方）
       existing.abort();
-      pendingRequests.delete(key);
     }
     const controller = new AbortController();
     config.signal = controller.signal;
+    (config as TrackedRequestConfig).__controller = controller;
+    // 直接覆盖：新请求即刻接管该 key
     pendingRequests.set(key, controller);
   }
   return config;
@@ -73,25 +124,32 @@ api.interceptors.request.use((config) => {
 // ── 响应拦截器：清除 pending 记录 + 401 自动续期 ─────────────────────────────
 api.interceptors.response.use(
   (res) => {
-    // 请求完成，从 pending map 中移除
+    // 已被更新的同 url 请求接管 → 这次结果作废，静默丢弃（不打扰调用方）
+    if (isSuperseded(res.config)) {
+      return neverSettle();
+    }
+    // 请求完成，从 pending map 中移除（此刻自己仍是该 key 的当前在途请求）
     if (res.config.method?.toUpperCase() === 'GET') {
-      const key = buildRequestKey(res.config);
-      pendingRequests.delete(key);
+      pendingRequests.delete(buildRequestKey(res.config));
     }
     return res;
   },
   async (err) => {
-    // 忽略主动取消的请求（AbortController.abort() 触发）
-    if (axios.isCancel(err) || err.name === 'CanceledError') {
-      return Promise.reject(err);
+    // 被放弃的请求（主动取消 / 已被更新的同 url 请求接管）→ **静默作废**。
+    // 绝不能 reject：调用方的 .catch() 会把「旧请求被自己人取消」误报成业务失败。
+    if (isCanceledError(err) || isSuperseded(err.config)) {
+      return neverSettle();
     }
 
     const original = err.config;
 
-    // 清除 pending 记录
+    // 清除 pending 记录（仅当自己仍是该 key 的当前在途请求时才删，
+    // 避免误删已被新请求接管的记录 —— 那会让新请求失去被取消的能力）
     if (original?.method?.toUpperCase() === 'GET') {
       const key = buildRequestKey(original);
-      pendingRequests.delete(key);
+      if (pendingRequests.get(key) === (original as TrackedRequestConfig).__controller) {
+        pendingRequests.delete(key);
+      }
     }
 
     // 只处理 401，且不重试 refresh 接口本身，且没有重试过
@@ -209,7 +267,7 @@ export const appsApi = {
 
 // ─── Cards ──────────────────────────────────────────
 export const cardsApi = {
-  list: (params?: { app_id?: string; status?: string; page?: number; page_size?: number }) =>
+  list: (params?: { app_id?: string; status?: string; card_code?: string; page?: number; page_size?: number }) =>
     api.get('/cards', { params }),
   exportCsv: (params?: { app_id?: string; status?: string }) =>
     api.get('/cards/export', { params, responseType: 'blob' }),

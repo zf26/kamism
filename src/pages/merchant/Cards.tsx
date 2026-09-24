@@ -3,6 +3,7 @@ import { cardsApi, appsApi } from '../../lib/api';
 import { Plus, Ban, Trash2, RefreshCw, Copy, CheckCircle, Download, Clock, BarChart2, Edit2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useConfirm } from '../../stores/confirm';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 
 interface Card {
   id: string;
@@ -60,15 +61,25 @@ export default function Cards() {
   const [searchCode, setSearchCode] = useState('');
   const [filterAppId, setFilterAppId] = useState('');
   const [filterExpireDate, setFilterExpireDate] = useState('');
+  // 激活与否过滤：走后端 status 参数（全量过滤，分页总数也正确）。
+  // 取值：'' = 全部，'unused' = 未激活，'active' = 已激活，'expired' = 已过期
+  const [filterStatus, setFilterStatus] = useState('');
+  // 搜索词防抖：停止输入 300ms 后才真正触发查询，避免每敲一个字符打一次后端
+  const debouncedSearch = useDebouncedValue(searchCode, 300);
 
   const load = (p = page, ps = pageSize) => {
     setLoading(true);
     setCards([]);
-    cardsApi.list({ page: p, page_size: ps }).then(res => {
+    // status / app_id / card_code 过滤都下推到后端（SQL / 解密层），
+    // 避免「只过滤当前分页页」的假过滤 —— 尤其是 card_code，加密存储没法前端精确匹配。
+    cardsApi.list({
+      page: p, page_size: ps,
+      app_id: filterAppId || undefined,
+      status: filterStatus || undefined,
+      card_code: debouncedSearch || undefined,
+    }).then(res => {
       if (res.data.success) {
         let filtered = res.data.data;
-        if (searchCode) filtered = filtered.filter((c: Card) => c.code.toLowerCase().includes(searchCode.toLowerCase()));
-        if (filterAppId) filtered = filtered.filter((c: Card) => c.app_id === filterAppId);
         if (filterExpireDate) {
           const fd = new Date(filterExpireDate);
           filtered = filtered.filter((c: Card) => c.expires_at && new Date(c.expires_at).toDateString() === fd.toDateString());
@@ -76,6 +87,8 @@ export default function Cards() {
         setCards(filtered);
         setTotal(res.data.total);
       }
+    }).catch(() => {
+      toast.error('加载卡密失败');
     }).finally(() => setLoading(false));
   };
 
@@ -83,13 +96,14 @@ export default function Cards() {
   const getAppName = (appId: string) => apps.find(a => a.id === appId)?.app_name || '—';
 
   useEffect(() => {
-    appsApi.list().then(res => { if (res.data.success) setApps(res.data.data); });
+    appsApi.list().then(res => { if (res.data.success) setApps(res.data.data); })
+      .catch(() => toast.error('加载应用列表失败'));
   }, []);
 
   useEffect(() => {
     load(page, pageSize);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page, pageSize, searchCode, filterAppId, filterExpireDate]);
+  }, [page, pageSize, debouncedSearch, filterAppId, filterExpireDate, filterStatus]);
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -258,13 +272,22 @@ export default function Cards() {
           </select>
         </div>
         <div className="form-group" style={{ margin: 0 }}>
+          <label className="form-label" style={{ fontSize: 12 }}>激活状态</label>
+          <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ fontSize: 13 }}>
+            <option value="">全部状态</option>
+            <option value="unused">未激活</option>
+            <option value="active">已激活</option>
+            <option value="expired">已过期</option>
+          </select>
+        </div>
+        <div className="form-group" style={{ margin: 0 }}>
           <label className="form-label" style={{ fontSize: 12 }}>按到期日期过滤</label>
           <input type="date" value={filterExpireDate} onChange={e => setFilterExpireDate(e.target.value)} style={{ fontSize: 13 }} />
         </div>
-        {(searchCode || filterAppId || filterExpireDate) && (
+        {(searchCode || filterAppId || filterExpireDate || filterStatus) && (
           <div style={{ display: 'flex', alignItems: 'flex-end' }}>
             <button className="btn btn-ghost" style={{ fontSize: 12 }}
-              onClick={() => { setSearchCode(''); setFilterAppId(''); setFilterExpireDate(''); }}>
+              onClick={() => { setSearchCode(''); setFilterAppId(''); setFilterExpireDate(''); setFilterStatus(''); }}>
               清除过滤
             </button>
           </div>

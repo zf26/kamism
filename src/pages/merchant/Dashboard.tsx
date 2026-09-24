@@ -8,11 +8,15 @@ import {
   BarChart, Bar,
 } from 'recharts';
 import { useThemeStore } from '../../stores/theme';
+import ActivationTicker, { RecentActivation } from '../../components/ActivationTicker';
+import ActivationMap, { IpDistributionItem } from '../../components/ActivationMap';
 
 interface DashboardStats {
   card_stats: { status: string; count: number }[];
   activation_trend: { date: string; count: number }[];
   device_dist: { app: string; count: number }[];
+  recent_activations: RecentActivation[];
+  ip_distribution: IpDistributionItem[];
 }
 
 const STATUS_LABEL: Record<string, string> = {
@@ -35,6 +39,8 @@ export default function MerchantDashboard() {
     card_stats: [],
     activation_trend: [],
     device_dist: [],
+    recent_activations: [],
+    ip_distribution: [],
   });
   const [loading, setLoading] = useState(true);
   const [range, setRange] = useState<Range>('week');
@@ -99,10 +105,10 @@ export default function MerchantDashboard() {
       {loading ? (
         <div style={{ textAlign: 'center', padding: 60 }}><span className="spinner" /></div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: 20 }}>
+        <div className="dashboard-charts">
 
           {/* 激活趋势折线图 */}
-          <div className="card" style={{ gridColumn: '1 / -1' }}>
+          <div className="card dashboard-chart-full">
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
               <p style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14, letterSpacing: '-0.2px', margin: 0 }}>
                 激活趋势
@@ -230,6 +236,22 @@ export default function MerchantDashboard() {
                 </BarChart>
               </ResponsiveContainer>
             )}
+          </div>
+
+          {/* 滚屏实时激活记录 */}
+          <ActivationTicker items={stats.recent_activations} />
+
+          {/* 卡密激活地图（客户 IP 分布） */}
+          <div className="card dashboard-chart-full">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <p style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14, letterSpacing: '-0.2px', margin: 0 }}>
+                客户 IP 分布
+              </p>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                按激活 IP 归属地（省份）聚合
+              </span>
+            </div>
+            <ActivationMap data={stats.ip_distribution} />
           </div>
 
         </div>

@@ -3,6 +3,7 @@ import { activationsApi } from '../../lib/api';
 import { Unlink, RefreshCw } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useConfirm } from '../../stores/confirm';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 
 interface Activation {
   id: string;
@@ -24,19 +25,23 @@ export default function Activations() {
   const [total, setTotal] = useState(0);
   const [searchCode, setSearchCode] = useState('');
   const PAGE_SIZE_OPTIONS = [10, 20, 50];
+  // 搜索词防抖：停止输入 300ms 后才真正触发查询
+  const debouncedSearch = useDebouncedValue(searchCode, 300);
 
-  const load = (p = page, ps = pageSize, code = searchCode) => {
+  const load = (p = page, ps = pageSize, code = debouncedSearch) => {
     setLoading(true);
     setList([]);
     activationsApi.list({ page: p, page_size: ps, card_code: code || undefined }).then(res => {
       if (res.data.success) { setList(res.data.data); setTotal(res.data.total); }
+    }).catch(() => {
+      toast.error('加载激活记录失败');
     }).finally(() => setLoading(false));
   };
 
   const handlePageSize = (ps: number) => { setPage(1); setPageSize(ps); };
 
-  // 统一用 page/pageSize/searchCode 变化驱动加载，避免挂载时重复触发
-  useEffect(() => { load(page, pageSize, searchCode); }, [page, pageSize, searchCode]);
+  // 统一用 page/pageSize/debouncedSearch 变化驱动加载，避免挂载时重复触发
+  useEffect(() => { load(page, pageSize, debouncedSearch); }, [page, pageSize, debouncedSearch]);
 
   const confirm = useConfirm();
 

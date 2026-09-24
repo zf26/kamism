@@ -104,8 +104,53 @@ pub struct UpdateNoteRequest {
 pub struct CardQuery {
     pub app_id: Option<Uuid>,
     pub status: Option<String>,
+    /// 按卡密代码**子串**搜索（大小写不敏感）。
+    /// 卡密 code 是加密存储的（`code_encrypted`），SQL 里没法 LIKE ——
+    /// 所以带这个参数时走「全量解密 + 内存过滤 + 内存分页」路径（见 list_cards）。
+    pub card_code: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+}
+
+/// 卡密「激活与否」过滤的归一化结果。
+///
+/// 为什么不是直接把 `status` 字符串拼进 SQL：
+///   卡密的 `status='expired'` 是**懒标记**的 —— 只有「过期后再次尝试激活」才会
+///   把它 UPDATE 成 expired（见 public_api.rs）。一张激活后到期、但没再被激活过
+///   的卡，status 仍是 `active`，只是 `expires_at` 已经过去了。
+///   所以「已过期」必须实时按 `expires_at <= NOW()` 判断，而不是 `status='expired'`，
+///   否则这类卡会从「已过期」过滤里漏掉。
+///
+/// 三分类（互斥、无重叠）：
+///   - 未激活：从没激活过（status='unused'）
+///   - 已激活：激活了且还没到期（status='active' 且 expires_at 为空或未到）
+///   - 已过期：激活过但已经到期（expires_at 不为空且已过，不管 status 是 active 还是 expired）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardStatusFilter {
+    Unused,
+    Active,
+    Expired,
+}
+
+impl CardStatusFilter {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "unused" => Some(Self::Unused),
+            "active" => Some(Self::Active),
+            "expired" => Some(Self::Expired),
+            _ => None, // 非法值 → None，调用方决定「不过滤」还是「报参数错误」
+        }
+    }
+
+    /// 生成对应的 WHERE 条件片段（不含前导 AND，调用方自己接）。
+    /// 片段内**没有**绑定参数，都是字面量，可安全拼进静态 SQL。
+    fn sql_fragment(self) -> &'static str {
+        match self {
+            Self::Unused => "status = 'unused'",
+            Self::Active => "status = 'active' AND (expires_at IS NULL OR expires_at > NOW())",
+            Self::Expired => "expires_at IS NOT NULL AND expires_at <= NOW()",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -167,12 +212,107 @@ async fn list_cards(
         total_count: i64,
     }
 
+    // status 过滤：归一化成枚举后取字面量条件片段（见 CardStatusFilter 注释）。
+    // 非法 status 值 → 视为「不过滤」（返回全部），与 app_id 的宽松语义一致；
+    // 枚举保证片段只可能是三个受控字符串，无注入面。
+    let status_filter = q.status.as_deref().and_then(CardStatusFilter::parse);
+
+    // 卡密代码搜索词（trim + 小写，供解密后 contains 匹配）。
+    let card_code_filter = q.card_code.as_deref().unwrap_or("").trim().to_lowercase();
+
+    // ── 搜索路径：code 是加密存储的，SQL 无法 LIKE ─────────────────────────
+    // 先按 app_id/status 把该商户的卡**全量**拉出来（不分页），解密后在内存里
+    // contains 过滤，再做内存分页。这样搜索结果是**全量**的，而不是「只搜当前页」。
+    // 代价是全量解密（单商户卡密量级通常几百到几千，毫秒级，可接受）。
+    if !card_code_filter.is_empty() {
+        #[derive(sqlx::FromRow)]
+        struct CardRow {
+            id: Uuid,
+            app_id: Uuid,
+            merchant_id: Uuid,
+            #[sqlx(rename = "code_encrypted")]
+            code: String,
+            duration_days: i32,
+            max_devices: i32,
+            status: String,
+            note: Option<String>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            activated_at: Option<chrono::DateTime<chrono::Utc>>,
+            expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let mut filter_sql = format!("SELECT {} FROM cards WHERE merchant_id = $1", CARD_COLS);
+        if q.app_id.is_some() {
+            filter_sql.push_str(" AND app_id = $2");
+        }
+        if let Some(f) = status_filter {
+            filter_sql.push_str(" AND ");
+            filter_sql.push_str(f.sql_fragment());
+        }
+        filter_sql.push_str(" ORDER BY created_at DESC");
+
+        let mut fq = sqlx::query_as::<_, CardRow>(&filter_sql).bind(merchant_id);
+        if q.app_id.is_some() {
+            fq = fq.bind(q.app_id.unwrap());
+        }
+        let all: Vec<CardRow> = match fq.fetch_all(&state.pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("查询卡密列表失败: err={}", e);
+                return db_guard::server_busy();
+            }
+        };
+
+        // 解密 + contains 过滤
+        let mut matched: Vec<Card> = Vec::new();
+        for r in all {
+            let plain = match EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &r.code) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("解密卡密 {} 失败: {}", r.id, e);
+                    continue; // 解不开的卡无法匹配搜索词，跳过
+                }
+            };
+            if !plain.to_lowercase().contains(&card_code_filter) {
+                continue;
+            }
+            matched.push(Card {
+                id: r.id, app_id: r.app_id, merchant_id: r.merchant_id,
+                code: plain, duration_days: r.duration_days, max_devices: r.max_devices,
+                status: r.status, note: r.note, created_at: r.created_at,
+                activated_at: r.activated_at, expires_at: r.expires_at,
+            });
+        }
+
+        let total = matched.len() as i64;
+        let start = offset as usize;
+        let end = (start + page_size as usize).min(matched.len());
+        let page_cards = if start < matched.len() {
+            matched[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        return Json(json!({
+            "success": true,
+            "data": page_cards,
+            "total": total,
+            "page": page,
+            "page_size": page_size
+        }));
+    }
+
+    // ── 非搜索路径：SQL 分页（带 COUNT(*) OVER()）──────────────────────────
     let mut query_sql = format!(
         "SELECT {}, COUNT(*) OVER() AS total_count FROM cards WHERE merchant_id = $1",
         CARD_COLS
     );
     if q.app_id.is_some() {
         query_sql.push_str(" AND app_id = $4");
+    }
+    if let Some(f) = status_filter {
+        query_sql.push_str(" AND ");
+        query_sql.push_str(f.sql_fragment());
     }
     query_sql.push_str(" ORDER BY created_at DESC LIMIT $2 OFFSET $3");
 
@@ -276,6 +416,9 @@ async fn export_cards_csv(
     let encryptor = Arc::new(state.encryptor);
     let app_id = q.app_id;
     let status = q.status.clone();
+    // 与 list_cards 一致：把 status 归一化成枚举，取受控的字面量条件片段，
+    // 使「已过期」在导出与列表里的口径相同（都是实时按 expires_at 判断）。
+    let status_filter = status.as_deref().and_then(CardStatusFilter::parse);
 
     // 表头 + BOM 单独作为 stream 的第一个 chunk
     let header = futures_util::stream::once(async move {
@@ -288,15 +431,15 @@ async fn export_cards_csv(
         let pool = pool.clone();
         let encryptor = Arc::clone(&encryptor);
         let app_id = app_id;
-        let status = status.clone();
+        let status_filter = status_filter;
         async move {
             let mut qb = sqlx::QueryBuilder::new("SELECT * FROM cards WHERE merchant_id = ");
             qb.push_bind(merchant_id);
             if let Some(app) = app_id {
                 qb.push(" AND app_id = ").push_bind(app);
             }
-            if let Some(st) = &status {
-                qb.push(" AND status = ").push_bind(st);
+            if let Some(f) = status_filter {
+                qb.push(" AND ").push(f.sql_fragment());
             }
             qb.push(" ORDER BY created_at DESC LIMIT ")
                 .push_bind(BATCH)
@@ -781,8 +924,12 @@ async fn extend_card(
     .bind(id)
     .bind(merchant_id)
     .execute(&state.pool)
-    .await
-    .unwrap_or_default();
+    .await;
+
+    let r1 = match r1 {
+        Ok(r) => r,
+        Err(e) => return db_guard::internal_error("卡密延期", e),
+    };
 
     let r2 = sqlx::query(
         "UPDATE cards SET expires_at = GREATEST(NOW(), expires_at + ($1 || ' days')::INTERVAL)
@@ -792,8 +939,12 @@ async fn extend_card(
     .bind(id)
     .bind(merchant_id)
     .execute(&state.pool)
-    .await
-    .unwrap_or_default();
+    .await;
+
+    let r2 = match r2 {
+        Ok(r) => r,
+        Err(e) => return db_guard::internal_error("卡密延期", e),
+    };
 
     let affected = r1.rows_affected() + r2.rows_affected();
     if affected > 0 {
@@ -903,8 +1054,12 @@ async fn batch_extend_cards(
     .bind(&body.ids)
     .bind(merchant_id)
     .execute(&state.pool)
-    .await
-    .unwrap_or_default();
+    .await;
+
+    let r_unused = match r_unused {
+        Ok(r) => r,
+        Err(e) => return db_guard::internal_error("批量卡密延期", e),
+    };
 
     let r_active = sqlx::query(
         "UPDATE cards
@@ -915,8 +1070,12 @@ async fn batch_extend_cards(
     .bind(&body.ids)
     .bind(merchant_id)
     .execute(&state.pool)
-    .await
-    .unwrap_or_default();
+    .await;
+
+    let r_active = match r_active {
+        Ok(r) => r,
+        Err(e) => return db_guard::internal_error("批量卡密延期", e),
+    };
 
     let total = r_unused.rows_affected() + r_active.rows_affected();
     let action = if body.days > 0 { "延期" } else { "缩短" };
@@ -1055,5 +1214,45 @@ mod tests {
         // used + need 若用 i32 相加会溢出成负数 → 被判「在配额内」
         let verdict = judge_agent_quota(100, i64::from(i32::MAX), i64::from(i32::MAX));
         assert!(matches!(verdict, QuotaVerdict::Deny(_)), "大数相加必须仍然拒绝");
+    }
+
+    // ── CardStatusFilter 归一化 ──
+
+    /// 三个合法值都能正确归一化；非法值返回 None（由调用方视为不过滤）
+    #[test]
+    fn status_filter_parse_known_values() {
+        assert_eq!(CardStatusFilter::parse("unused"), Some(CardStatusFilter::Unused));
+        assert_eq!(CardStatusFilter::parse("active"), Some(CardStatusFilter::Active));
+        assert_eq!(CardStatusFilter::parse("expired"), Some(CardStatusFilter::Expired));
+        assert_eq!(CardStatusFilter::parse("bogus"), None);
+        assert_eq!(CardStatusFilter::parse(""), None);
+    }
+
+    /// 「已过期」必须实时按 expires_at 判断，而不是 `status='expired'`（懒标记）。
+    /// 这个测试钉住的是语义：片段里必须出现 `expires_at <= NOW()`，
+    /// 否则一张「到期但没再激活、status 仍是 active」的卡会从过期过滤里漏掉。
+    #[test]
+    fn expired_filter_uses_expires_at_not_status() {
+        let fragment = CardStatusFilter::Expired.sql_fragment();
+        assert!(
+            fragment.contains("expires_at <= NOW()"),
+            "过期过滤必须实时判断 expires_at，实际片段: {fragment}"
+        );
+        // 不能出现 `status = 'expired'`（那会漏掉懒标记场景）
+        assert!(
+            !fragment.contains("status = 'expired'"),
+            "过期过滤不应依赖懒标记的 status，实际片段: {fragment}"
+        );
+    }
+
+    /// 「已激活」必须排除已到期的卡（expires_at 已过但 status 仍是 active 的）
+    #[test]
+    fn active_filter_excludes_expired() {
+        let fragment = CardStatusFilter::Active.sql_fragment();
+        assert!(fragment.contains("status = 'active'"));
+        assert!(
+            fragment.contains("expires_at IS NULL OR expires_at > NOW()"),
+            "已激活过滤必须排除到期卡，实际片段: {fragment}"
+        );
     }
 }

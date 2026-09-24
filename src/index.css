@@ -192,6 +192,16 @@ tbody tr:hover { background: var(--bg-hover); }
   gap: 16px;
   margin-bottom: 24px;
 }
+
+/* ══ 控制台图表区：响应式网格 ══
+   大屏三列（饼图 / 柱状图 / 滚屏卡），中屏两列，小屏单列；
+   「整行」卡片（激活趋势折线、客户 IP 地图）始终占满一行。 */
+.dashboard-charts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+.dashboard-chart-full { grid-column: 1 / -1; }
 .stat-card {
   background: var(--bg-card);
   border: 1px solid var(--border);
@@ -441,6 +451,9 @@ tbody tr:hover { background: var(--bg-hover); }
   }
   .stat-value { font-size: 24px; }
 
+  /* 移动端图表单列，避免三个图表挤在窄屏里看不清 */
+  .dashboard-charts { grid-template-columns: 1fr; gap: 16px; }
+
   .modal-overlay { align-items: flex-end; padding: 0; }
   .modal { border-radius: 16px 16px 0 0; max-height: 85vh; padding: 24px 20px; }
 
@@ -454,6 +467,9 @@ tbody tr:hover { background: var(--bg-hover); }
 @media (min-width: 769px) and (max-width: 1024px) {
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .layout-main { padding: 24px !important; }
+  /* 平板两列：滚屏卡跨两列占满（它需要纵向空间滚动） */
+  .dashboard-charts { grid-template-columns: repeat(2, 1fr); }
+  .dashboard-chart-full { grid-column: 1 / -1; }
 }
 
 /* ══ >= 1280px 大屏 ══ */

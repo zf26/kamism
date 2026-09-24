@@ -74,6 +74,9 @@ export default function Agents() {
   const confirm = useConfirm();
   const PAGE_SIZE = 10;
 
+  // 注：同 url 的旧请求被去重取消时，api.ts 的响应拦截器会「静默作废」该请求
+  //（既不 resolve 也不 reject），不会进入下面的 catch —— 所以无需再判断
+  // CanceledError / ERR_CANCELED（历史补丁已移除，取消不该被当成加载失败）。
   const loadAgents = (p = agentPage) => {
     setAgentLoading(true); setAgents([]);
     agentApi.listAgents({ page: p, page_size: PAGE_SIZE })
@@ -84,7 +87,7 @@ export default function Agents() {
           setPendingInvites(r.data.pending_invites || []);
         }
       })
-      .catch(e => { if (e?.name !== 'CanceledError' && e?.code !== 'ERR_CANCELED') throw e; })
+      .catch(() => toast.error('加载代理列表失败'))
       .finally(() => setAgentLoading(false));
   };
 
@@ -94,17 +97,7 @@ export default function Agents() {
       .then(r => {
         if (r.data.success) { setCommissions(r.data.data); setCommTotal(r.data.total); }
       })
-      .catch(e => {
-        if (e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED') {
-          // 被去重取消，延迟重试一次
-          setTimeout(() => {
-            agentApi.listCommissions({ page: p, page_size: PAGE_SIZE })
-              .then(r => { if (r.data.success) { setCommissions(r.data.data); setCommTotal(r.data.total); } })
-              .finally(() => setCommLoading(false));
-          }, 100);
-          return;
-        }
-      })
+      .catch(() => toast.error('加载佣金记录失败'))
       .finally(() => setCommLoading(false));
   };
 
@@ -121,12 +114,7 @@ export default function Agents() {
       }
     });
     doLoad()
-      .catch(e => {
-        if (e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED') {
-          setTimeout(() => doLoad().finally(() => setMyRelLoading(false)), 100);
-          return;
-        }
-      })
+      .catch(() => toast.error('加载代理关系失败'))
       .finally(() => setMyRelLoading(false));
   };
 

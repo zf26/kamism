@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ActivationWithCode {
     pub id: Uuid,
     pub card_id: Uuid,
@@ -60,6 +60,58 @@ async fn list_activations(
     let offset = (page - 1) * page_size;
     let card_code_filter = q.card_code.as_deref().unwrap_or("").trim().to_lowercase();
 
+    // 搜索路径：card_code 是加密存储的（cards.code_encrypted），SQL 无法 LIKE。
+    // 先全量拉出该商户的激活记录（不分页），解密后在内存 contains 过滤，再内存分页。
+    // 否则会出现「先 LIMIT 再过滤」的假搜索：结果只出现在当前页，翻页就漏。
+    if !card_code_filter.is_empty() {
+        let all: Vec<(Uuid, Uuid, String, Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)> = match sqlx::query_as(
+            r#"SELECT a.id, a.card_id, c.code_encrypted, a.app_id, a.device_id_encrypted,
+                      a.device_name, a.ip_address, a.activated_at, a.last_verified_at
+               FROM activations a
+               JOIN cards c ON c.id = a.card_id
+               WHERE c.merchant_id = $1
+               ORDER BY a.activated_at DESC"#,
+        )
+        .bind(merchant_id)
+        .fetch_all(&state.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("查询激活记录列表失败: err={}", e);
+                return db_guard::server_busy();
+            }
+        };
+
+        let mut matched: Vec<ActivationWithCode> = Vec::new();
+        for (id, card_id, encrypted_code, app_id, encrypted_device_id, device_name, ip_address, activated_at, last_verified_at) in all {
+            let card_code = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &encrypted_code)
+                .unwrap_or_else(|_| "[解密失败]".to_string());
+            if !card_code.to_lowercase().contains(&card_code_filter) {
+                continue;
+            }
+            let device_id = EncryptedFieldsOps::decrypt_device_id(&state.encryptor, &encrypted_device_id)
+                .unwrap_or_else(|_| "[解密失败]".to_string());
+            matched.push(ActivationWithCode {
+                id, card_id, card_code, app_id, device_id,
+                device_name, ip_address, activated_at, last_verified_at,
+            });
+        }
+
+        let total = matched.len() as i64;
+        let start = offset as usize;
+        let end = (start + page_size as usize).min(matched.len());
+        let page_acts = if start < matched.len() { matched[start..end].to_vec() } else { Vec::new() };
+
+        return Json(json!({
+            "success": true,
+            "data": page_acts,
+            "total": total,
+            "page": page,
+            "page_size": page_size
+        }));
+    }
+
     // ⚠️ 曾用 .unwrap_or_default()：激活记录查询失败时列表变空，
     // 商户在「激活记录」页看到「暂无数据」，会以为卡密从未被使用过，
     // 于是把卡密当成异常（未激活）处理 —— 而真正的问题是数据库查不到。
@@ -91,10 +143,6 @@ async fn list_activations(
             .unwrap_or_else(|_| "[解密失败]".to_string());
         let device_id = EncryptedFieldsOps::decrypt_device_id(&state.encryptor, &encrypted_device_id)
             .unwrap_or_else(|_| "[解密失败]".to_string());
-
-        if !card_code_filter.is_empty() && !card_code.to_lowercase().contains(&card_code_filter) {
-            continue;
-        }
 
         activations.push(ActivationWithCode {
             id, card_id, card_code, app_id, device_id,

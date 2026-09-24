@@ -13,6 +13,7 @@ use axum::{
     Extension, Json, Router,
 };
 use bcrypt::{hash, DEFAULT_COST};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -155,12 +156,107 @@ async fn dashboard_stats(
         }
     };
 
+    // 4. 最新激活记录（滚屏展示用）：卡密码需解密，IP 需解析归属地
+    let recent_raw: Vec<(String, Option<String>, Option<String>, DateTime<Utc>)> = match sqlx::query_as(
+        r#"SELECT c.code_encrypted, a.device_name, a.ip_address, a.activated_at
+           FROM activations a
+           JOIN cards c ON c.id = a.card_id
+           WHERE c.merchant_id = $1
+           ORDER BY a.activated_at DESC
+           LIMIT 5"#,
+    )
+    .bind(merchant_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询仪表盘最新激活记录失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
+
+    // 解密 + 解析归属地。解密失败不能静默吞成空 —— 但这里与列表页一致，
+    // 解不开就标记 [解密失败]，让商户能看见而不是看到一片空白。
+    let mut recent_activations = Vec::with_capacity(recent_raw.len());
+    for (encrypted_code, device_name, ip_address, activated_at) in recent_raw {
+        let card_code = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &encrypted_code)
+            .unwrap_or_else(|_| "[解密失败]".to_string());
+        // 归属地解析：查不到就 None（前端显示「未知」），不 panic、不吞错到日志刷屏。
+        // ip2region 对内网/未收录 IP 返回 None 是正常业务结果，不是故障。
+        let ip_region = ip_address
+            .as_deref()
+            .and_then(crate::utils::ip_region::lookup)
+            .and_then(|r| r.display());
+
+        recent_activations.push(json!({
+            "card_code": card_code,
+            "device_name": device_name,
+            "ip_address": ip_address,
+            "ip_region": ip_region,
+            "activated_at": activated_at.to_rfc3339(),
+        }));
+    }
+
+    // 5. 客户 IP 地理分布（激活地图用）：对每条激活记录的 IP 解析归属地后按省市聚合。
+    // 归属地在 SQL 里算不了（依赖离线 IP 库），所以先取出全部 IP，再在内存聚合。
+    // ⚠️ 这里只取「有 IP 的记录」，IP 为 NULL 的激活（老数据 / 未采集）不计入地图。
+    let ip_rows: Vec<(Option<String>,)> = match sqlx::query_as(
+        r#"SELECT a.ip_address
+           FROM activations a
+           JOIN cards c ON c.id = a.card_id
+           WHERE c.merchant_id = $1
+             AND a.ip_address IS NOT NULL"#,
+    )
+    .bind(merchant_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("查询仪表盘 IP 分布失败: err={}", e);
+            return db_guard::server_busy();
+        }
+    };
+
+    // 按「省」聚合（供中国地图着色），境外 IP 单独归入「境外」计数。
+    // 用 BTreeMap 保证输出稳定有序（便于前端与测试断言）。
+    //
+    // 为什么区分境内外：
+    //   地图边界只有中国省级行政区（含台湾、港澳），国外 IP 的 province 是
+    //   州名（如 California），在地图上没有对应区域，硬塞进去会变成「无匹配」点。
+    //   所以境内按省着色，境外统一算一个「境外」桶，前端用图例/文字单独展示。
+    let mut geo_counter: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for (ip,) in ip_rows {
+        if let Some(ip) = ip {
+            if let Some(region) = crate::utils::ip_region::lookup(&ip) {
+                let is_cn = matches!(region.country.as_deref(), Some("中国"));
+                let key = if is_cn {
+                    // 中国境内：按「省」聚合（港澳台在 xdb 里也是「省」级）
+                    region.province.clone()
+                } else {
+                    // 境外：统一一个桶
+                    Some("境外".to_string())
+                };
+                if let Some(k) = key {
+                    *geo_counter.entry(k).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let ip_distribution: Vec<_> = geo_counter
+        .into_iter()
+        .map(|(name, value)| json!({"name": name, "value": value}))
+        .collect();
+
     Json(json!({
         "success": true,
         "data": {
             "card_stats": card_stats.iter().map(|(s, c)| json!({"status": s, "count": c})).collect::<Vec<_>>(),
             "activation_trend": activation_trend.iter().map(|(d, c)| json!({"date": d.to_string(), "count": c})).collect::<Vec<_>>(),
             "device_dist": device_dist.iter().map(|(app, c)| json!({"app": app, "count": c})).collect::<Vec<_>>(),
+            "recent_activations": recent_activations,
+            "ip_distribution": ip_distribution,
         }
     }))
 }
