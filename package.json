@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:kamism": "node -e \"process.env.VITE_BASE='/kamism/';process.env.VITE_API_URL='/api';require('child_process').execSync('npm run build',{stdio:'inherit',env:process.env})\"",
     "preview": "vite preview",
     "tauri": "tauri"
   },

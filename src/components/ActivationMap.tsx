@@ -1,6 +1,12 @@
 import { useEffect, useRef } from 'react';
 import * as echarts from 'echarts';
 import { useThemeStore } from '../stores/theme';
+// 用 `?url` 导入而不是放在 public/ 里用绝对路径 fetch：
+// public/ 的文件不会被 Vite 改写、也不会进 assets 清单，部署时只上传 index.html + assets/
+// 就会漏掉它。此时 Nginx 的 SPA 回落会把请求替换成 index.html（200 + text/html），
+// fetch 拿到 HTML 再 .json() 只会抛 "Unexpected token '<'"，从报错完全看不出是缺文件。
+// 走 assets 管道后文件带 hash 输出，和 JS/CSS 一起部署，不会再漏。
+import chinaMapUrl from '../assets/china-map.json?url';
 
 export interface IpDistributionItem {
   name: string;
@@ -41,10 +47,19 @@ export default function ActivationMap({ data }: { data: IpDistributionItem[] }) 
     // 用 cancelled 标志让「已作废的那一次 effect」的后续回调全部短路。
     let cancelled = false;
 
-    // 加载中国地图 GeoJSON（放在 public/，Vite 直接 serve）
-    fetch('/china-map.json')
+    // 加载中国地图 GeoJSON（由 Vite 打进 assets，见文件顶部的导入说明）
+    fetch(chinaMapUrl)
       .then(r => {
-        if (!r.ok) throw new Error(`加载地图数据失败: ${r.status}`);
+        if (!r.ok) throw new Error(`加载地图数据失败: HTTP ${r.status}`);
+        // 显式校验类型：被 SPA 回落到 index.html 时状态码是 200，
+        // 直接 r.json() 只会得到「Unexpected token '<'」，看不出真正原因。
+        const contentType = r.headers.get('content-type') || '';
+        if (!contentType.includes('json')) {
+          throw new Error(
+            `地图数据返回了 ${contentType || '未知类型'} 而不是 JSON，` +
+            `通常是静态文件未正确部署（${chinaMapUrl}）`
+          );
+        }
         return r.json();
       })
       .then(geoJson => {

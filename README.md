@@ -178,6 +178,10 @@ docker compose up -d --build
 > ⚠️ 这种方式 `.env` 里的 `TRUSTED_PROXIES` 必须是 `172.28.0.0/16`（或包含它），
 > 因为 `docker-compose.yml` 末尾把容器网段钉死成了 `172.28.0.0/16`。若你改动了该网段，
 > 两处必须同步修改，否则后端看不到真实客户端 IP，限流会退化成「全站共用一个额度」。
+>
+> ✅ 验收：重启后日志里应出现 `客户端 IP 策略: 已信任 N 条代理网段`。若看到
+> `未配置 TRUSTED_PROXIES` 的 WARN，或激活记录里的 IP 是 `127.0.0.1`、商户后台
+> 「客户 IP 分布」一直是空的，按 [docs/fix-client-ip.md](./docs/fix-client-ip.md) 排查。
 
 ---
 
@@ -350,12 +354,21 @@ sudo journalctl -u kamism -n 40 --no-pager   # 看到「数据库迁移完成」
 **构建前端：**
 
 ```bash
-# 前端控制台：VITE_API_URL 是**编译期**注入的，换域名必须重新 build
-# 同域部署推荐相对路径 /api（写成 https://yourdomain.com/api 也可以）
+# 前端控制台：VITE_API_URL 与 VITE_BASE 都是**编译期**注入的，换域名或换部署路径必须重新 build
+# VITE_API_URL：同域部署推荐相对路径 /api（写成 https://yourdomain.com/api 也可以）
+# VITE_BASE：资源 URL 的前缀，必须与「部署到 URL 的哪一层」一致
+#            —— 站点根路径用 /；子路径（https://host/kamism/）用 /kamism/
+#            不一致的典型症状：白屏 + 一堆 404，或静态文件被 SPA 回落成 HTML
 # 注意仓库自带的 .env.production 存的是别的域名，下面这行前置变量会覆盖它
-VITE_API_URL=/api npm run build
-# 上传 dist/ 到服务器 /www/wwwroot/yourdomain.com
+VITE_BASE=/ VITE_API_URL=/api npm run build
+# 上传 dist/ 全部内容到服务器 /www/wwwroot/yourdomain.com
+# （不要只传 index.html + assets/：public/ 目录里的文件同样要传）
 ```
+
+> PowerShell 不支持 `VAR=x cmd` 这种前置写法（会报「术语 … 不会被识别为 cmdlet」），
+> 改成 `$env:VITE_BASE='/kamism/'; $env:VITE_API_URL='/api'; npm run build`，
+> 或者直接用内置脚本 `npm run build:kamism`（任意 shell 都能跑，等价于上面那行子路径构建）。
+> 构建日志会打印 `[vite] base = …`，发版前对一下就知道前缀有没有生效。
 
 **Nginx 关键配置：**
 

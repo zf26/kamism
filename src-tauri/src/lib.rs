@@ -140,12 +140,26 @@ pub async fn start_server() -> anyhow::Result<()> {
     tracing::info!("KMS 初始化成功");
 
     // 客户端 IP 策略：决定限流与 IP 黑名单到底认哪个地址（默认不信任任何代理）
+    //
+    // 漏配这条的后果是「静默降级」而不是报错：限流退化成全站共用一个 IP 桶
+    // （一个客户端打满就把所有人打成 429）、IP 黑名单认不出真实客户端、
+    // 激活记录里的地址一律是反向代理的 127.0.0.1（地图因此永远没有数据）。
+    // 这些现象看起来都像「功能坏了」，很难反查到是一行配置没写，所以用 WARN。
     let trusted_proxies = utils::client_ip::TrustedProxies::from_env();
-    tracing::info!(
-        "客户端 IP 策略: {}（TRUSTED_PROXIES={:?}）",
-        trusted_proxies.describe(),
-        env::var("TRUSTED_PROXIES").unwrap_or_default()
-    );
+    if trusted_proxies.is_empty() {
+        tracing::warn!(
+            "客户端 IP 策略: {}。若部署在 Nginx 等反向代理之后，必须把代理地址写入 \
+             TRUSTED_PROXIES（Nginx 与后端同机用 127.0.0.1，多容器用 compose 的 subnet），\
+             否则限流、IP 黑名单与激活记录里的 IP 全部不可信",
+            trusted_proxies.describe()
+        );
+    } else {
+        tracing::info!(
+            "客户端 IP 策略: {}（TRUSTED_PROXIES={:?}）",
+            trusted_proxies.describe(),
+            env::var("TRUSTED_PROXIES").unwrap_or_default()
+        );
+    }
 
     // 建不出管理员就拒绝启动（理由见 init_admin 的注释）—— 这里**不能**吞掉返回值
     init_admin(&pool).await?;

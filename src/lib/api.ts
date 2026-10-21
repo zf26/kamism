@@ -226,7 +226,8 @@ export function logout() {
   localStorage.removeItem('refreshToken');
   localStorage.removeItem('role');
   localStorage.removeItem('user');
-  window.location.href = '/login';
+  // 用 BASE_URL 拼，子路径部署（如 /kamism/）时不会跳到站点根目录的登录页
+  window.location.href = `${import.meta.env.BASE_URL}login`;
 }
 
 /** 写入新 token 并同步 axios 默认头（续期成功后唯一的落盘点）。 */

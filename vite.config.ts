@@ -1,17 +1,29 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
-export default defineConfig(async () => {
+export default defineConfig(async ({ mode }) => {
+  // 读 .env.<mode>（含非 VITE_ 前缀的变量），用于取 VITE_BASE
+  // @ts-expect-error process is a nodejs global
+  const env = loadEnv(mode, process.cwd(), '');
+  // @ts-expect-error process is a nodejs global
+  const base = process.env.VITE_BASE || env.VITE_BASE || '/';
+  // 构建日志里打一行，避免「以为配了、其实没生效」
+  console.log(`[vite] base = ${base}`);
+
   return {
     plugins: [
       react(),
     ],
-    // Docker/web 部署用 '/'，Tauri 桌面端打包时 tauri-cli 会自动覆盖
-    base: '/',
+    // 资源 URL 前缀，必须和「前端部署到 URL 的哪一层」一致：
+    //   站点根目录        → '/'（默认）
+    //   子路径 /kamism/   → 构建时前置 VITE_BASE=/kamism/
+    // 不要写进 .env.production：`npm run build` 同时被 Tauri 打包复用，桌面端会跟着变成 /kamism/。
+    // 路由 basename、登出跳转、地图数据 URL 都由 import.meta.env.BASE_URL 推导，改这一处即可。
+    base,
 
     // ── 构建优化 ──────────────────────────────────────────────────────────
     build: {

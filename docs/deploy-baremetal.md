@@ -117,7 +117,7 @@ sudo chown kamism:kamism /opt/kamism/kamism-server
 ```bash
 cd ~/kamism-src
 npm ci
-VITE_API_URL=/api npm run build
+VITE_BASE=/ VITE_API_URL=/api npm run build
 sudo rsync -a --delete dist/ /var/www/kamism/
 sudo chown -R www-data:www-data /var/www/kamism
 ```
@@ -125,8 +125,22 @@ sudo chown -R www-data:www-data /var/www/kamism
 要点：
 
 - **`VITE_API_URL` 是编译期注入的**，改域名必须重新 build，重启 Nginx 没用。
+- **`VITE_BASE` 决定静态资源 URL 的前缀**，必须和部署位置一致：本项目 Nginx 配置把前端放在站点根路径，
+  所以这里写 `VITE_BASE=/`；若你放在 `https://yourdomain.com/kamism/` 这样的子路径，就改成 `VITE_BASE=/kamism/`。
+  两者不一致时页面会白屏、控制台一堆 404，或者静态文件被 SPA 回落成 `index.html`
+  （典型报错：`Unexpected token '<', "<!DOCTYPE "... is not valid JSON`）。
+  构建时控制台会打印 `[vite] base = …`，发版前扫一眼就能确认。
+  Windows PowerShell 不支持 `VAR=x cmd` 前置写法，用 `$env:VITE_BASE='/kamism/'; npm run build`，
+  或直接跑内置脚本 `npm run build:kamism`（任意 shell 通用）。
+- 路由 basename、登出跳转都从 `import.meta.env.BASE_URL` 推导，**只需要配 `VITE_BASE` 一处**，
+  不用再改 `src/App.tsx`。子路径部署时 Nginx 要写 `location /kamism/ { try_files $uri $uri/ /kamism/index.html; }`，
+  否则刷新子路由会 404。
 - 仓库里的 `.env.production` 存的是别的域名，命令行前置的 `VITE_API_URL=/api` 优先级更高，会覆盖它。
   用相对路径 `/api` 的好处是同域、不担心 http/https 混用；写绝对地址 `https://yourdomain.com/api` 也行。
+- **`rsync dist/` 要传全部内容**，不要只挑 `index.html` + `assets/`。`public/` 下的文件（如 `vite.svg`）同样在
+  `dist/` 根目录，漏传时会被 SPA 回落成 HTML，排查起来很费劲。
+- 中国地图数据（`china-map.json`）走 `import … ?url` 打进 assets，输出为 `assets/china-map-<hash>.json`，
+  跟着 JS/CSS 一起部署。它以前放在 `public/` 里、代码写死 `fetch('/china-map.json')`，子路径部署时必然取不到。
 - `VITE_SHIELD_URL` 是 APK 加固服务的独立地址（默认指向外部服务）。没部署加固服务就别配，或改成你自己的地址，否则相关页面会请求一个不存在的路径。
 
 ## 8. 写 `/opt/kamism/.env`
@@ -333,7 +347,7 @@ sudo systemctl restart kamism
 sudo journalctl -u kamism -n 30 --no-pager     # 确认「数据库迁移完成」，无报错
 
 # 前端有改动时
-VITE_API_URL=/api npm run build
+VITE_BASE=/ VITE_API_URL=/api npm run build
 sudo rsync -a --delete dist/ /var/www/kamism/
 sudo chown -R www-data:www-data /var/www/kamism
 ```

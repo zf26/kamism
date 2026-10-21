@@ -119,8 +119,9 @@ function AppRoutes() {
 }
 
 export default function App() {
+  // basename 跟随 Vite 的 base（VITE_BASE），子路径部署时无需再改这里
   return (
-    <BrowserRouter basename="/">
+    <BrowserRouter basename={import.meta.env.BASE_URL}>
       <AppRoutes />
     </BrowserRouter>
   );
