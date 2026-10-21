@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { adminApi } from '../../lib/api';
-import { CheckCircle, XCircle, RefreshCw, Search, Crown, Gift, Clock, UserPlus, Trash2 } from 'lucide-react';
+import { CheckCircle, XCircle, RefreshCw, Search, Crown, Gift, Clock, UserPlus, Trash2, CalendarPlus } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 interface Merchant {
@@ -30,6 +30,13 @@ interface UpgradeModal {
   username: string;
 }
 
+// 续期弹窗（仅「专业版且非永久」才有意义）
+interface RenewModal {
+  merchantId: string;
+  username: string;
+  planExpiresAt: string;
+}
+
 // 创建商户弹窗
 interface CreateModal {
   username: string;
@@ -49,6 +56,22 @@ function displayVal(v: number) {
   return v === -1 ? '无限' : String(v);
 }
 
+function formatDate(iso: string | null | undefined) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
+}
+
+// 续期后的到期时间：基准取「原到期时间」与「现在」的较大值。
+// 必须与后端 SQL 的 GREATEST(plan_expires_at, NOW()) 保持一致，
+// 否则弹窗里预览的日期和续期后真实到期的日期会对不上。
+function calcRenewedExpiry(expiresAt: string, days: number): Date | null {
+  const base = new Date(expiresAt).getTime();
+  if (isNaN(base) || !Number.isFinite(days) || days <= 0) return null;
+  return new Date(Math.max(base, Date.now()) + days * 86400000);
+}
+
 function formatExpiry(expiresAt: string | null, plan: string) {
   if (plan !== 'pro') return null;
   if (!expiresAt) return <span style={{ color: '#a78bfa', fontSize: 11 }}>永久</span>;
@@ -57,7 +80,7 @@ function formatExpiry(expiresAt: string | null, plan: string) {
   const days = Math.ceil((d.getTime() - now.getTime()) / 86400000);
   const color = days <= 3 ? '#ef4444' : days <= 7 ? '#f59e0b' : '#a78bfa';
   return (
-    <span style={{ color, fontSize: 11, display: 'flex', alignItems: 'center', gap: 3 }}>
+    <span title={`到期：${formatDate(expiresAt)}`} style={{ color, fontSize: 11, display: 'flex', alignItems: 'center', gap: 3 }}>
       <Clock size={10} />
       {days <= 0 ? '已到期' : `${days}天后到期`}
     </span>
@@ -91,6 +114,11 @@ export default function Merchants() {
   const [planLoading, setPlanLoading] = useState<string | null>(null);
   const [upgradeModal, setUpgradeModal] = useState<UpgradeModal | null>(null);
   const [expiresDays, setExpiresDays] = useState<string>('30');
+
+  // 续期弹窗
+  const [renewModal, setRenewModal] = useState<RenewModal | null>(null);
+  const [renewDays, setRenewDays] = useState<string>('30');
+  const [renewSubmitting, setRenewSubmitting] = useState(false);
 
   // 创建商户弹窗
   const [showCreate, setShowCreate] = useState(false);
@@ -198,6 +226,35 @@ export default function Merchants() {
     finally { setPlanLoading(null); }
   };
 
+  // 续期：在现有到期时间上叠加天数（与「升专业版」的重设有效期是两件事）
+  const openRenew = (m: Merchant) => {
+    if (!m.plan_expires_at) return; // 永久版没有可续的到期时间
+    setRenewModal({ merchantId: m.id, username: m.username, planExpiresAt: m.plan_expires_at });
+    setRenewDays('30');
+  };
+
+  const confirmRenew = async () => {
+    if (!renewModal) return;
+    const days = parseInt(renewDays);
+    if (!Number.isFinite(days) || days < 1 || days > 3650) {
+      toast.error('请输入 1 ~ 3650 之间的天数');
+      return;
+    }
+    setRenewSubmitting(true);
+    try {
+      const res = await adminApi.renewMerchantPlan(renewModal.merchantId, days);
+      if (res.data.success) {
+        const next = res.data.data?.plan_expires_at;
+        toast.success(next ? `已续期 ${days} 天，新到期时间 ${formatDate(next)}` : `已续期 ${days} 天`);
+        setRenewModal(null);
+        load();
+      } else {
+        toast.error(res.data.message ?? '续期失败');
+      }
+    } catch { toast.error('续期失败'); }
+    finally { setRenewSubmitting(false); }
+  };
+
   // 创建商户
   const handleCreate = async () => {
     if (!create.username.trim()) { toast.error('请输入用户名'); return; }
@@ -255,23 +312,103 @@ export default function Merchants() {
           <div style={modalBox}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <Crown size={18} color="#a78bfa" />
-              <h3 style={{ fontWeight: 700, fontSize: 16 }}>升级专业版</h3>
+              <h3 style={{ fontWeight: 700, fontSize: 16 }}>开通专业版</h3>
             </div>
             <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>
-              为商户 <strong style={{ color: 'var(--text)' }}>{upgradeModal.username}</strong> 设置专业版有效期
+              为商户 <strong style={{ color: 'var(--text)' }}>{upgradeModal.username}</strong> 开通专业版并设置时长
             </p>
             <div>
-              <label style={labelStyle}>有效天数（留空为永久）</label>
+              <label style={labelStyle}>天数（留空为永久）</label>
               <input type="number" min={1} value={expiresDays}
                 onChange={e => setExpiresDays(e.target.value)} placeholder="例如：30" style={inputStyle()} autoFocus />
+              {/* 这里必须说清语义：以前是「设为 N 天」（覆盖），
+                  现在统一为「延长 N 天」（叠加）。管理员按旧直觉操作会以为
+                  「填 30 = 总共 30 天」，实际是在剩余天数上加 30。 */}
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.6 }}>
+                免费版 / 已过期：从<strong style={{ color: 'var(--text)' }}>现在</strong>起算 N 天；
+                专业版有效期内：在<strong style={{ color: 'var(--text)' }}>原到期时间上叠加</strong> N 天（不会缩短已有时间）。
+              </p>
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button className="btn btn-ghost" onClick={() => setUpgradeModal(null)}>取消</button>
-              <button className="btn btn-primary" onClick={confirmUpgrade}><Crown size={13} /> 确认升级</button>
+              <button className="btn btn-primary" onClick={confirmUpgrade}><Crown size={13} /> 确认</button>
             </div>
           </div>
         </div>
       )}
+
+      {/* 续期弹窗 */}
+      {renewModal && (() => {
+        const days = parseInt(renewDays);
+        const preview = calcRenewedExpiry(renewModal.planExpiresAt, days);
+        const expired = new Date(renewModal.planExpiresAt).getTime() <= Date.now();
+        return (
+          <div style={modalOverlay} onClick={() => !renewSubmitting && setRenewModal(null)}>
+            <div style={modalBox} onClick={e => e.stopPropagation()}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <CalendarPlus size={18} color="#a78bfa" />
+                <h3 style={{ fontWeight: 700, fontSize: 16 }}>续期专业版</h3>
+              </div>
+              <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>
+                为商户 <strong style={{ color: 'var(--text)' }}>{renewModal.username}</strong> 延长专业版有效期
+              </p>
+
+              <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--surface)', border: '1px solid var(--border)', fontSize: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-muted)' }}>
+                  <span>当前到期时间</span>
+                  <span style={{ color: expired ? '#ef4444' : 'var(--text)', fontWeight: 600 }}>
+                    {formatDate(renewModal.planExpiresAt)}{expired ? '（已到期）' : ''}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--text-muted)', marginTop: 6 }}>
+                  <span>续期后到期</span>
+                  <span style={{ color: '#a78bfa', fontWeight: 600 }}>
+                    {preview ? formatDate(preview.toISOString()) : '—'}
+                  </span>
+                </div>
+                {expired && (
+                  <p style={{ color: 'var(--text-muted)', fontSize: 11, marginTop: 8, lineHeight: 1.5 }}>
+                    该商户已过期，续期将从<strong style={{ color: 'var(--text)' }}>现在</strong>开始计算，不会补到已过去的时间。
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label style={labelStyle}>续期天数</label>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap' }}>
+                  {[7, 30, 90, 180, 365].map(d => (
+                    <button
+                      key={d}
+                      onClick={() => setRenewDays(String(d))}
+                      style={{
+                        padding: '4px 12px', borderRadius: 999, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        border: '1px solid',
+                        borderColor: renewDays === String(d) ? 'rgba(124,58,237,0.6)' : 'var(--border)',
+                        background: renewDays === String(d) ? 'rgba(124,58,237,0.15)' : 'transparent',
+                        color: renewDays === String(d) ? '#a78bfa' : 'var(--text-muted)',
+                      }}
+                    >
+                      {d} 天
+                    </button>
+                  ))}
+                </div>
+                <input type="number" min={1} max={3650} value={renewDays}
+                  onChange={e => setRenewDays(e.target.value)} placeholder="自定义天数（1 ~ 3650）"
+                  style={inputStyle()} disabled={renewSubmitting} />
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <button className="btn btn-ghost" onClick={() => setRenewModal(null)} disabled={renewSubmitting}>取消</button>
+                <button className="btn btn-primary" onClick={confirmRenew} disabled={renewSubmitting}
+                  style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  {renewSubmitting ? <span className="spinner" style={{ width: 12, height: 12 }} /> : <CalendarPlus size={13} />}
+                  {renewSubmitting ? '续期中…' : '确认续期'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* 创建商户弹窗 */}
       {showCreate && (
@@ -462,6 +599,18 @@ export default function Merchants() {
                 <td>{new Date(m.created_at).toLocaleDateString('zh-CN')}</td>
                 <td>
                   <div style={{ display: 'flex', gap: 4 }}>
+                    {/* 续期只对「专业版且非永久」有意义：永久版没有到期时间可延长 */}
+                    {m.plan === 'pro' && m.plan_expires_at && (
+                      <button
+                        className="btn btn-sm btn-ghost"
+                        onClick={() => openRenew(m)}
+                        disabled={planLoading === m.id}
+                        title="在现有到期时间上延长专业版有效期"
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#a78bfa' }}
+                      >
+                        <CalendarPlus size={11} /> 续期
+                      </button>
+                    )}
                     <button
                       className={`btn btn-sm ${m.plan === 'pro' ? 'btn-ghost' : 'btn-primary'}`}
                       onClick={() => togglePlan(m.id, m.plan)}

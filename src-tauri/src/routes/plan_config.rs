@@ -1,3 +1,4 @@
+use crate::middleware::audit::admin_audit;
 use crate::middleware::auth::{admin_only, auth_middleware, AppState};
 use crate::models::plan_config::PlanConfig;
 use crate::utils::db_guard;
@@ -24,6 +25,8 @@ pub fn plan_config_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/admin/plan-configs", get(list_plan_configs))
         .route("/admin/plan-configs/:id", patch(update_plan_config))
+        // 审计挂最内层（最前面加的 = 最内层）
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_audit))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }

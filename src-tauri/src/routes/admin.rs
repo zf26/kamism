@@ -1,15 +1,23 @@
 use crate::{
     db::encrypted_fields::EncryptedFieldsOps,
-    middleware::auth::{admin_only, auth_middleware, AppState},
+    middleware::{
+        audit::admin_audit,
+        auth::{admin_only, auth_middleware, AppState},
+    },
     models::merchant::MerchantPublic,
-    utils::{card_gen::generate_api_key, db_guard, mq},
+    utils::{
+        card_gen::generate_api_key,
+        db_guard, mq,
+        plan::{extend_plan, ExtendOutcome},
+    },
 };
 use axum::{
     extract::{Path, Query, State},
     middleware,
     routing::{delete, get, patch},
-    Json, Router,
+    Extension, Json, Router,
 };
+use crate::utils::jwt::Claims;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -28,6 +36,16 @@ pub fn admin_router_with_state(state: AppState) -> Router<AppState> {
         .route("/admin/merchants/:id", delete(delete_merchant))
         .route("/admin/merchants/:id/status", patch(update_merchant_status))
         .route("/admin/merchants/:id/plan", patch(update_merchant_plan))
+        .route("/admin/merchants/:id/renew", patch(renew_merchant_plan))
+        // 管理员自己的账号：改密码。
+        //
+        // 改造前**根本没有这个路由** —— 管理员忘记密码或怀疑泄露时，
+        // 唯一的办法是直接连库改 `admins.password_hash`。
+        // 商户端一直有这个接口（merchant.rs::change_password），管理员端没有，
+        // 于是"权限最大的那类账号反而不能自助改密"。
+        .route("/admin/password", patch(change_admin_password))
+        // 审计日志查询（写入由 middleware::audit 自动完成，不需要单独接口）
+        .route("/admin/audit-logs", get(list_audit_logs))
         .route("/admin/stats", get(get_stats))
         .route("/admin/stats/trends", get(get_trends))
         // 这里曾有两个「管理员 API Key」接口（/admin/api-key、/admin/api-key/regenerate），已删。
@@ -40,6 +58,9 @@ pub fn admin_router_with_state(state: AppState) -> Router<AppState> {
         // 它们文档化的 /v1/activate|verify|unbind 本来就是商户调的业务接口 ——
         // 管理员没有 app、没有卡密，本来就不需要 api key。
         // 见 .workbuddy/batch7-admin-apikey-cleanup.md
+        // 审计挂最内层：在鉴权 / admin_only 之后跑，Claims 一定已注入，
+        // 且能拿到 handler 返回后的状态码。所有管理端写操作自动留痕。
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_audit))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
@@ -422,30 +443,57 @@ async fn update_merchant_plan(
     // expires_days: 仅 pro 有效，None 表示永久，0 表示立即到期
     let expires_days = body.get("expires_days").and_then(|v| v.as_i64());
 
+    // ── 语义统一（见 utils::plan 的模块注释）─────────────────────────────
+    //
+    // 这里曾经是 `plan_expires_at = NOW() + N days`，即**覆盖**：
+    // 一个还剩 100 天的商户，管理员选 30 天会把它**缩短**成 30 天。
+    // 界面上的按钮叫「升专业版」，看起来只是"开通"，没人会想到它在减天数。
+    //
+    // 现在与商户自助续费、管理端续期共用 `plan::extend_plan`：
+    //   · 免费版 / 已过期 → 从现在起算 N 天
+    //   · 专业版在有效期内 → 在剩余时间上叠加 N 天
+    //   · 已是永久版 → 不修改（永久不该被天数覆盖）
+    //
+    // 「设为永久」「降为免费」仍是**赋值**语义，留在下面各自的分支里 ——
+    // 那是管理员的显式意图，与"延长"不是一回事。
     let result = if plan == "pro" {
         match expires_days {
             Some(days) if days > 0 => {
-                // ⚠️ 这里与 `payments.rs` 的商户续费路径**故意不同**，不要「顺手统一」：
-                //   · 商户续费：`COALESCE(plan_expires_at, NOW()) + N days` —— 在已付的时间内**叠加**，
-                //     因为商户买的是时长，不该因为晚几天付款就损失已买的天数。
-                //   · 管理员设置（这里）：`NOW() + N days` —— **覆盖**，管理员是在「设置有效期」，
-                //     想延长就直接给一个更大的天数。
-                // 两者语义不同是有意为之。要改任何一边，先确认产品意图。
-                sqlx::query(
-                    "UPDATE merchants
-                     SET plan = $1,
-                         plan_expires_at = NOW() + ($2 || ' days')::INTERVAL,
-                         updated_at = NOW()
-                     WHERE id = $3",
-                )
-                .bind(&plan)
-                .bind(days.to_string())
-                .bind(id)
-                .execute(&state.pool)
-                .await
+                let mut conn = match state.pool.acquire().await {
+                    Ok(c) => c,
+                    Err(e) => return db_guard::internal_error("更新商户套餐", e),
+                };
+                let outcome = extend_plan(&mut conn, id, days).await;
+                drop(conn); // 先归还连接，后面的 MQ 发布不需要它
+
+                match outcome {
+                    Ok(ExtendOutcome::Extended { expires_at }) => {
+                        // 升级 / 续期后恢复可能被降级禁用的 apps 与卡密。
+                        // 失败只记日志：时长已经写进库了，通知晚到不影响结果。
+                        if let Err(e) = mq::publish_upgrade(&state.mq_channel, &id.to_string()).await {
+                            tracing::error!("发布升级恢复消息失败 {}: {}", id, e);
+                        }
+                        return Json(json!({
+                            "success": true,
+                            "message": format!("已延长 {} 天，到期时间 {}", days, expires_at.format("%Y-%m-%d %H:%M")),
+                            "data": { "plan_expires_at": expires_at }
+                        }));
+                    }
+                    // 永久版：不写库，如实告知（否则就是"点了成功、实际没变"）
+                    Ok(ExtendOutcome::Permanent) => {
+                        return Json(json!({
+                            "success": false,
+                            "message": "该商户已是永久专业版，无需设置有效期"
+                        }))
+                    }
+                    Ok(ExtendOutcome::NotFound) => {
+                        return Json(json!({"success": false, "message": "商户不存在"}))
+                    }
+                    Err(e) => return db_guard::internal_error("更新商户套餐", e),
+                }
             }
+            // 「设为永久」：显式赋值，SET plan_expires_at = NULL
             _ => {
-                // 永久专业版，清空到期时间
                 sqlx::query(
                     "UPDATE merchants
                      SET plan = $1,
@@ -477,14 +525,11 @@ async fn update_merchant_plan(
     match result {
         Ok(r) if r.rows_affected() > 0 => {
             let msg = if plan == "pro" {
-                // 升级为专业版：异步发布恢复消息
+                // 走到这里只剩「设为永久」一种情况（pro + 天数的分支上面已经 return）
                 if let Err(e) = mq::publish_upgrade(&state.mq_channel, &id.to_string()).await {
                     tracing::error!("发布升级恢复消息失败 {}: {}", id, e);
                 }
-                match expires_days {
-                    Some(d) if d > 0 => format!("已升级为专业版，有效期 {} 天", d),
-                    _ => "已升级为专业版（永久）".to_string(),
-                }
+                "已设为永久专业版".to_string()
             } else {
                 // ⚠️ 这一支曾经**什么都不发**，于是同一个「降为 free」出现两种行为：
                 //   · 系统到期降级（worker）→ 超额 apps / 卡密会被禁用
@@ -506,6 +551,343 @@ async fn update_merchant_plan(
         Ok(_) => Json(json!({"success": false, "message": "商户不存在"})),
         Err(e) => db_guard::internal_error("更新商户", e),
     }
+}
+
+/// 管理端「续期」：在商户当前到期时间上**叠加**天数。
+///
+/// 与上面 `update_merchant_plan` 的关系：现在两者都走 [`plan::extend_plan`]，
+/// 语义完全一致（免费的从现在起算、有效期内叠加、已过期从现在起算）。
+/// 之所以保留两个入口，是因为界面上的入口不同：
+///   * 「升专业版」：给 free 商户开通，或直接给一个天数；
+///   * 「续期」：只对"专业版且非永久"的行显示，专治"快到期 / 已到期"。
+/// 两条路最终落到同一个函数，就不会再出现"同一个动作两种算法"的老问题。
+///
+/// 与商户自助续费（`payments.rs` 支付回调）也是同一个函数 —— 那条路径以前用
+/// `COALESCE(plan_expires_at, NOW())`，已过期的商户付钱后到期时间仍在过去，
+/// 下一轮扫描立刻降级，等于白付。
+async fn renew_merchant_plan(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    // days 必填，且限定 1 ~ 3650（10 年）：挡住手滑多打一个 0 把商户续成百年会员
+    let days = match body.get("days").and_then(|v| v.as_i64()) {
+        Some(d) if d > 0 && d <= 3650 => d,
+        Some(_) => {
+            return Json(json!({"success": false, "message": "续期天数需在 1 ~ 3650 天之间"}))
+        }
+        None => return Json(json!({"success": false, "message": "请填写续期天数"})),
+    };
+
+    // 先查一次，只为**给出准确文案**：
+    // 「商户不存在」「不是专业版」「已是永久」三种情况的下一步动作完全不同，
+    // 只靠 UPDATE 的 rows_affected 只能回一句含糊的"失败"。
+    //
+    // 注意这不是"读-改-写"的竞态点：真正的判定与写入在 `extend_plan` 的一条
+    // SQL 里完成（永久版会被 WHERE 挡住），这里只负责措辞。
+    let target = match db_guard::optional(
+        sqlx::query_as::<_, (String, Option<chrono::DateTime<chrono::Utc>>)>(
+            "SELECT plan, plan_expires_at FROM merchants WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&state.pool),
+        "查询商户套餐（续期前校验）",
+    )
+    .await
+    {
+        db_guard::QueryOutcome::Found(r) => r,
+        db_guard::QueryOutcome::NotFound => {
+            return Json(json!({"success": false, "message": "商户不存在"}))
+        }
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+    };
+
+    let (current_plan, expires_at) = target;
+    if current_plan != "pro" {
+        return Json(json!({
+            "success": false,
+            "message": "该商户不是专业版，请先用「升专业版」设置有效期"
+        }));
+    }
+    // plan_expires_at IS NULL = 永久专业版。`extend_plan` 也会挡住它，
+    // 但在这里先拦能给出更具体的提示（而不是让管理员等到返回后自己猜）。
+    if expires_at.is_none() {
+        return Json(json!({
+            "success": false,
+            "message": "该商户已是永久专业版，无需续期"
+        }));
+    }
+
+    let mut conn = match state.pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => return db_guard::internal_error("商户续期", e),
+    };
+    let outcome = extend_plan(&mut conn, id, days).await;
+    drop(conn);
+
+    match outcome {
+        Ok(ExtendOutcome::Extended { expires_at: new_expires_at }) => {
+            tracing::info!(
+                "管理员为商户 {} 续期 {} 天，新到期时间 {}",
+                id,
+                days,
+                new_expires_at
+            );
+            // 与商户自助续费保持一致：投递恢复消息，把可能因降级被禁用的 apps / 卡密放回来。
+            // 这条消息不是必需的（真正到期降级的商户 plan 已被改成 free，走不到这里），
+            // 只兜「清理做完、plan 还没改就被中断」这种半途状态，失败不影响续期结果本身。
+            if let Err(e) = mq::publish_upgrade(&state.mq_channel, &id.to_string()).await {
+                tracing::error!("发布续期恢复消息失败 {}: {}", id, e);
+            }
+            Json(json!({
+                "success": true,
+                "message": format!("已续期 {} 天", days),
+                "data": { "plan_expires_at": new_expires_at }
+            }))
+        }
+        // 预检之后被别的管理员改成永久版 / 被删除：如实说"状态变了"，不要硬算
+        Ok(ExtendOutcome::Permanent) => Json(json!({
+            "success": false,
+            "message": "该商户刚被改为永久专业版，无需续期"
+        })),
+        Ok(ExtendOutcome::NotFound) => Json(json!({
+            "success": false,
+            "message": "商户套餐已变更（可能已被删除），请刷新后重试"
+        })),
+        Err(e) => db_guard::internal_error("商户续期", e),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 管理员账号：改密码
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AdminChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+}
+
+/// 管理员修改自己的密码。
+///
+/// 与商户端 `merchant.rs::change_password` 的逻辑保持一致（校验原密码 →
+/// 写新哈希 → 吊销全部令牌 → 给当前设备补发一对新令牌），差别只在表名与角色。
+///
+/// 为什么必须先吊销：JWT 是无状态的，签名对即有效。不吊销的话**改密码没有任何
+/// 安全效果** —— 已经泄露的 token 照样能用满 2 小时，refresh token 还能滚动续期
+/// 7 天以上。管理员账号能改套餐、改支付密钥，这条尤其不能省。
+async fn change_admin_password(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<AdminChangePasswordRequest>,
+) -> Json<Value> {
+    if body.new_password.chars().count() < 8 {
+        return Json(json!({"success": false, "message": "新密码至少 8 位"}));
+    }
+    // bcrypt 只使用前 72 字节，超长密码会被静默截断（"看起来设了 100 位，
+    // 实际只有前 72 字节有效"）。这里直接拒绝，避免制造这种错觉。
+    if body.new_password.len() > 72 {
+        return Json(json!({"success": false, "message": "新密码过长（最多 72 字节）"}));
+    }
+    if body.new_password == body.old_password {
+        return Json(json!({"success": false, "message": "新密码不能与原密码相同"}));
+    }
+
+    let id = match Uuid::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => return Json(json!({"success": false, "message": "无效的用户标识"})),
+    };
+
+    let (password_hash, email) = match db_guard::optional(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT password_hash, email FROM admins WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&state.pool),
+        "查询管理员账号",
+    )
+    .await
+    {
+        db_guard::QueryOutcome::Found(r) => r,
+        db_guard::QueryOutcome::NotFound => {
+            // 令牌里的 sub 指向一个不存在的管理员：账号已被删除，但 token 还没过期。
+            return Json(json!({"success": false, "message": "账号不存在，请重新登录"}));
+        }
+        db_guard::QueryOutcome::Failed => return db_guard::server_busy(),
+    };
+
+    // ⚠️ bcrypt 是**同步 CPU 密集**调用（cost 12 约 250ms）。直接 .await 之前跑在
+    // tokio worker 线程上，几个并发就能把线程池占满、拖慢全站所有接口。
+    // 这里用 spawn_blocking，把 CPU 活挪到阻塞线程池。
+    // （auth.rs 的登录路径还是同步调用 —— 那属于体检报告里的 P1，另行统一。）
+    let old_input = body.old_password.clone();
+    let hash_in_db = password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || {
+        bcrypt::verify(&old_input, &hash_in_db).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if !valid {
+        return Json(json!({"success": false, "message": "原密码错误"}));
+    }
+
+    let new_input = body.new_password.clone();
+    let new_hash = match tokio::task::spawn_blocking(move || {
+        bcrypt::hash(new_input, bcrypt::DEFAULT_COST)
+    })
+    .await
+    {
+        Ok(Ok(h)) => h,
+        _ => return Json(json!({"success": false, "message": "密码加密失败，请稍后重试"})),
+    };
+
+    match sqlx::query("UPDATE admins SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&new_hash)
+        .bind(id)
+        .execute(&state.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {}
+        Ok(_) => return Json(json!({"success": false, "message": "账号不存在，请重新登录"})),
+        Err(e) => return db_guard::internal_error("更新管理员密码", e),
+    }
+
+    // 吊销该管理员的所有已签发令牌（token_version + 1）。
+    // 失败要如实告知：密码确实改了，但"把别人踢下线"这件事没做成 ——
+    // 这两件事必须分开说，否则用户以为旧会话已经失效。
+    let new_ver = match crate::utils::jwt::revoke_user_tokens(
+        &state.pool,
+        &mut state.redis.clone(),
+        "admin",
+        &id,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("管理员改密码后吊销令牌失败: admin_id={} err={}", id, e);
+            return Json(json!({
+                "success": false,
+                "message": "密码已修改，但会话清理失败，请重新登录一次以确认安全"
+            }));
+        }
+    };
+
+    // 给当前这台设备补发一对新令牌（旧版号已作废，所以它是有效的）
+    let token = crate::utils::jwt::generate_token(&id, "admin", &email, new_ver, &state.jwt_secret);
+    let refresh = crate::utils::jwt::generate_refresh_token(
+        &id,
+        "admin",
+        &email,
+        new_ver,
+        &state.jwt_secret,
+    );
+
+    match (token, refresh) {
+        (Ok(token), Ok(refresh_token)) => Json(json!({
+            "success": true,
+            "message": "密码已修改，其他设备需重新登录",
+            "token": token,
+            "refresh_token": refresh_token
+        })),
+        // 签发失败不影响"密码已改"这个事实，只影响当前设备是否需要重登
+        _ => Json(json!({"success": true, "message": "密码已修改，请重新登录"})),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 审计日志查询
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AuditLogQuery {
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+    /// 只看某个管理员的操作
+    pub admin_id: Option<Uuid>,
+    /// 按路由模板 / 实际路径模糊匹配（如 "merchants" 或 "/admin/plan-configs"）
+    pub keyword: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditLogRow {
+    id: i64,
+    admin_id: Option<Uuid>,
+    admin_email: Option<String>,
+    method: String,
+    route: String,
+    path: String,
+    status: i16,
+    detail: Option<Value>,
+    ip: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    total_count: i64,
+}
+
+/// 查询审计日志。
+///
+/// 写入由 `middleware::audit` 自动完成，这里只负责读。没有任何写入接口 ——
+/// 审计日志**只能追加**，管理端不提供修改/删除，这是审计可信的前提
+/// （真要归档由 DBA 按时间分区处理）。
+async fn list_audit_logs(
+    State(state): State<AppState>,
+    Query(q): Query<AuditLogQuery>,
+) -> Json<Value> {
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    // 关键词限长：避免超长串拼进 LIKE 拖慢扫描
+    let keyword: String = q.keyword.unwrap_or_default().trim().chars().take(100).collect();
+    let like = format!("%{}%", keyword);
+
+    let rows: Vec<AuditLogRow> = match sqlx::query_as(
+        "SELECT id, admin_id, admin_email, method, route, path, status, detail, ip,
+                created_at, COUNT(*) OVER() AS total_count
+           FROM admin_audit_logs
+          WHERE ($1::uuid IS NULL OR admin_id = $1)
+            AND ($2 = '' OR route ILIKE $3 OR path ILIKE $3)
+          ORDER BY created_at DESC
+          LIMIT $4 OFFSET $5",
+    )
+    .bind(q.admin_id)
+    .bind(&keyword)
+    .bind(&like)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return db_guard::internal_error("查询审计日志", e),
+    };
+
+    let total = rows.first().map(|r| r.total_count).unwrap_or(0);
+    let data: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "admin_id": r.admin_id,
+                "admin_email": r.admin_email,
+                "method": r.method,
+                "route": r.route,
+                "path": r.path,
+                "status": r.status,
+                "detail": r.detail,
+                "ip": r.ip,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "success": true,
+        "data": data,
+        "total": total,
+        "page": page,
+        "page_size": page_size
+    }))
 }
 
 async fn get_stats(State(state): State<AppState>) -> Json<Value> {
@@ -532,7 +914,7 @@ async fn get_stats(State(state): State<AppState>) -> Json<Value> {
     let merchant_count = stat_count!("SELECT COUNT(*) FROM merchants", "统计商户总数（大盘）");
     let card_count = stat_count!("SELECT COUNT(*) FROM cards", "统计卡密总数（大盘）");
     let activation_count = stat_count!("SELECT COUNT(*) FROM activations", "统计激活总数（大盘）");
-    let active_card_count = stat_count!("SELECT COUNT(*) FROM cards WHERE status = 'active'", "统计已激活卡密数（大盘）");
+    let active_card_count = stat_count!("SELECT COUNT(DISTINCT card_id) FROM activations", "统计已激活卡密数（大盘）");
     let app_count = stat_count!("SELECT COUNT(*) FROM apps", "统计应用总数（大盘）");
 
     Json(json!({

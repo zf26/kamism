@@ -2,7 +2,7 @@ use crate::{
     db::encrypted_fields::EncryptedFieldsOps,
     middleware::{
         auth::AppState,
-        rate_limit::login_rate_limit,
+        rate_limit::{captcha_rate_limit, email_code_rate_limit, login_rate_limit},
     },
     models::merchant::Merchant,
     utils::{
@@ -16,7 +16,7 @@ use crate::{
 use axum::{
     extract::State,
     middleware,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use bcrypt::{hash, verify};
@@ -32,6 +32,16 @@ pub struct RegisterRequest {
     pub email: String,
     pub password: String,
     pub code: String,
+    /// 人机验证：题面由 `GET /auth/captcha` 下发，答案一次性
+    ///
+    /// `serde(default)` 是刻意加的：老客户端（或脚本）不带这两个字段时，
+    /// 缺字段会先被 axum 的 JSON 反序列化拦成 422 + 框架原文，
+    /// 用户看不到「请先完成人机验证」这句有用的提示。默认成空串交给下面的
+    /// 业务校验，才能给出可读的拒绝理由。
+    #[serde(default)]
+    pub captcha_id: String,
+    #[serde(default)]
+    pub captcha_answer: String,
 }
 
 #[derive(Deserialize)]
@@ -59,17 +69,84 @@ pub struct ResetPasswordRequest {
 
 pub fn auth_router(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/auth/send-code", post(send_code))
+        // 两个「发信」接口都要限流：handler 里的 60 秒冷却按邮箱计数，换邮箱即绕过。
+        // 详见 rate_limit.rs::email_code_rate_limit 的注释。
+        .route(
+            "/auth/send-code",
+            post(send_code).route_layer(
+                middleware::from_fn_with_state(state.clone(), email_code_rate_limit)
+            ),
+        )
         .route("/auth/register", post(register))
         .route("/auth/refresh", post(refresh_token))
-        .route("/auth/send-reset-code", post(send_reset_code))
+        .route(
+            "/auth/send-reset-code",
+            post(send_reset_code).route_layer(
+                middleware::from_fn_with_state(state.clone(), email_code_rate_limit)
+            ),
+        )
         .route("/auth/reset-password", post(reset_password))
+        .route(
+            "/auth/captcha",
+            get(captcha).route_layer(
+                middleware::from_fn_with_state(state.clone(), captcha_rate_limit)
+            ),
+        )
         .route(
             "/auth/login",
             post(login).route_layer(
                 middleware::from_fn_with_state(state, login_rate_limit)
             ),
         )
+}
+
+/// 人机验证答案在 Redis 里的存活时间（秒）
+const CAPTCHA_TTL: u64 = 300;
+
+/// 签发一道人机验证题
+///
+/// 设计取舍：
+///   · **答案只存 Redis，绝不回传**。响应里只有 `captcha_id` 和题面。
+///   · **一次性**：`register` 校验时无论对错都会立刻 DEL。若允许「错了原地重试」，
+///     答案空间只有 2~18，最多 17 次就能撞开 —— 那等于没设防。
+///   · 用加法不用减乘：减法会出负数（用户容易输错），乘法答案范围太大（劝退真人）。
+///   · 这不是「强人机验证」。它挡的是脚本直接 POST /auth/register 批量注册；
+///     真要对抗打码平台，得接 Turnstile / 极验。接入点就在本函数与
+///     `register` 里那段校验，两者一起替换即可，前端调用形态不变。
+async fn captcha(State(state): State<AppState>) -> Json<Value> {
+    let mut redis = state.redis.clone();
+    // ⚠️ `ThreadRng` 不是 Send 的（内部用 Rc），一旦跨过下面的 `.await`
+    // 整个 future 就不是 Send，axum 会报 `Handler is not satisfied` —— 报错
+    // 完全指不到这里。所以用一个块把 rng 关在同步段里，出块即释放。
+    let (a, b) = {
+        let mut rng = rand::thread_rng();
+        (rng.gen_range(1..=9u32), rng.gen_range(1..=9u32))
+    };
+    let answer = a + b;
+
+    let captcha_id = Uuid::new_v4().to_string();
+    let key = format!("captcha:{}", captcha_id);
+
+    // 答案写不进 Redis 时**不能**把题发出去：用户算完交卷必然得到「已过期」，
+    // 而他无从得知真实原因（Redis 写失败），只会一直点「换一题」。
+    // 与发送验证码走 `required` 是同一个判断。
+    if redis_guard::required::<()>(
+        redis.set_ex(&key, answer.to_string(), CAPTCHA_TTL).await,
+        "写入人机验证答案",
+    )
+    .is_err()
+    {
+        return Json(json!({"success": false, "message": "服务暂时不可用，请稍后重试"}));
+    }
+
+    Json(json!({
+        "success": true,
+        "data": {
+            "captcha_id": captcha_id,
+            "question": format!("{} + {} = ?", a, b),
+            "expires_in": CAPTCHA_TTL,
+        }
+    }))
 }
 
 /// 发送注册验证码
@@ -192,6 +269,48 @@ async fn register(
     }
 
     let mut redis = state.redis.clone();
+
+    // ── 人机验证 ────────────────────────────────────────────────────────
+    //
+    // 顺序很重要：**必须在读取/消费邮箱验证码之前**。
+    // 邮箱验证码是「用完即删」的一次性凭据（下面 `redis.del`），
+    // 若先消费验证码再验人机，填错一次人机就得重新收一封邮件 —— 把防机器的
+    // 成本转嫁给了真人。
+    //
+    // Redis 故障时**拒绝**（fail-closed），与限流那套 fail-open 有意不同：
+    // 限流失效只是少了一层防护，而人机验证本身就是这层防护，它失效等于
+    // 注册接口在无保护状态下敞着。宁可让注册短暂不可用，也不能静默放行。
+    if body.captcha_id.trim().is_empty() || body.captcha_answer.trim().is_empty() {
+        return Json(json!({"success": false, "message": "请先完成人机验证"}));
+    }
+    // `captcha_id` 原样拼进 Redis key。不设上限的话，axum 的 2MB body 上限
+    // 就是 key 的上限 —— 一条 2MB 的 key 足以把 Redis 内存打鼓，
+    // 而它只需要一个不需要登录的请求。UUID 是 36 字符，64 留了余量。
+    if body.captcha_id.trim().len() > 64 || body.captcha_answer.trim().len() > 8 {
+        return Json(json!({"success": false, "message": "人机验证参数无效"}));
+    }
+    let captcha_key = format!("captcha:{}", body.captcha_id.trim());
+    let expected: Option<String> = match redis.get(&captcha_key).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("读取人机验证答案失败（Redis 错误，不是「题目不存在」）: {}", e);
+            return Json(json!({"success": false, "message": "服务暂时不可用，请稍后重试"}));
+        }
+    };
+    // 无论对错都立刻删除：留着同一个 id 让用户重试，等于把 17 种可能的答案
+    // 摊开给脚本逐个试。这里属于「防护」而非「业务凭据」，删失败不阻塞注册，
+    // 但必须留痕（否则「同一题被复用」将来无从查起）。
+    redis_guard::protection_lost::<()>(redis.del(&captcha_key).await, "消耗人机验证答案");
+    match expected {
+        None => {
+            return Json(json!({"success": false, "message": "人机验证已失效，请点击刷新后重试"}))
+        }
+        Some(ans) if ans != body.captcha_answer.trim() => {
+            return Json(json!({"success": false, "message": "人机验证答案错误，请重试"}))
+        }
+        Some(_) => {}
+    }
+
     let code_key = format!("code:verify:{}", body.email);
 
     // 从 Redis 取出验证码
@@ -443,7 +562,6 @@ async fn login(
             return db_guard::server_busy();
         }
     };
-    tracing::info!("查询 merchants 表结果: email_hash={:?}, result={:?}", email_hash, merchant);
 
     let merchant = match merchant {
         Some(m) => m,

@@ -59,6 +59,8 @@ export default function Cards() {
 
   // 搜索过滤状态
   const [searchCode, setSearchCode] = useState('');
+  // 模糊搜索结果是否被后端的扫描上限截断（见后端 cards::SEARCH_SCAN_LIMIT）
+  const [searchTruncated, setSearchTruncated] = useState(false);
   const [filterAppId, setFilterAppId] = useState('');
   const [filterExpireDate, setFilterExpireDate] = useState('');
   // 激活与否过滤：走后端 status 参数（全量过滤，分页总数也正确）。
@@ -86,6 +88,9 @@ export default function Cards() {
         }
         setCards(filtered);
         setTotal(res.data.total);
+        // 后端对模糊搜索有扫描上限（卡密是加密存储，只能解密后比对）。
+        // 超限时必须提示，否则用户会以为"就这几张"，进而以为卡密丢了。
+        setSearchTruncated(!!res.data.truncated);
       }
     }).catch(() => {
       toast.error('加载卡密失败');
@@ -262,7 +267,7 @@ export default function Cards() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 20 }}>
         <div className="form-group" style={{ margin: 0 }}>
           <label className="form-label" style={{ fontSize: 12 }}>搜索卡密</label>
-          <input type="text" placeholder="输入卡密代码..." value={searchCode} onChange={e => setSearchCode(e.target.value)} style={{ fontSize: 13 }} />
+          <input type="text" placeholder="输入卡密代码（完整卡密可精确匹配）..." value={searchCode} onChange={e => setSearchCode(e.target.value)} style={{ fontSize: 13 }} />
         </div>
         <div className="form-group" style={{ margin: 0 }}>
           <label className="form-label" style={{ fontSize: 12 }}>按应用过滤</label>
@@ -293,6 +298,17 @@ export default function Cards() {
           </div>
         )}
       </div>
+
+      {searchTruncated && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14,
+          padding: '8px 14px', borderRadius: 8, fontSize: 12,
+          background: 'rgba(245,158,11,0.10)', border: '1px solid rgba(245,158,11,0.35)',
+          color: '#f59e0b',
+        }}>
+          结果较多，仅扫描了最近的若干张卡密；请输入更长的搜索词，或直接粘贴完整卡密（可精确匹配）。
+        </div>
+      )}
 
       <div className="table-wrap">
         <table>

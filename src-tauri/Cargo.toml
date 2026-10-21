@@ -88,6 +88,11 @@ base64 = "0.22"
 # HTTP 客户端（Webhook 推送、OAuth）
 reqwest = { version = "0.12", features = ["json"] }
 
+# URL 解析：出站地址校验（utils::url_guard）需要用到 url::Host。
+# 它本来就是 reqwest 的传递依赖，显式声明只是为了让代码能直接 use，
+# 不会额外增加依赖树体积。
+url = "2"
+
 # 支付签名
 md5 = "0.7"
 bytes = "1"

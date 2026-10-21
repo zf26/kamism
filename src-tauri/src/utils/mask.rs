@@ -58,6 +58,56 @@ pub fn mask_middle(s: &str) -> String {
     format!("{}****{}", prefix_chars(s, 4), suffix_chars(s, 4))
 }
 
+/// 把连接串里的密码替换成 `***`，用于日志 / 错误信息。
+///
+/// ── 为什么必须单独抽出来 ──────────────────────────────────────────────────
+///
+/// 启动失败时最需要打日志，而那正是凭据最容易被写出去的时刻：
+///
+/// ```text
+/// .map_err(|e| anyhow!("RabbitMQ 连接失败: {} (AMQP_URL={})", e, amqp_url))?;
+/// ```
+///
+/// `AMQP_URL` 形如 `amqp://user:password@host:5672/vhost`，整条打进 stderr 之后，
+/// `docker logs`、supervisor 日志文件、日志采集、排障时截的图都会**长期**留下口令。
+/// 更糟的是这类泄露发生时没人会觉得有问题（"就是一条连接失败的日志"），
+/// 事后也无从判断谁看过。
+///
+/// 输出形如 `amqp://user:***@host:5672/vhost`：足以定位「连的是谁、哪台机器、
+/// 哪个 vhost」，但不含口令 —— 排障需要的信息一个不少。
+///
+/// 解析失败时（比如连接串本身语法就不对，而这恰恰是最常见的报错场景）
+/// 退回按 `://` 与最后一个 `@` 手工切分，保证**任何输入都不会把原文原样吐出**。
+pub fn redact_url(raw: &str) -> String {
+    // 1) 优先按 URL 语义处理：能正确处理密码里的特殊字符（`%40`、`:` 等）
+    //    用 reqwest::Url：它就是 url::Url 的再导出，不额外引入依赖。
+    if let Ok(mut u) = reqwest::Url::parse(raw) {
+        if u.password().is_some() {
+            // set_password 只改口令，用户名 / 主机 / 端口 / 路径全部保留
+            let _ = u.set_password(Some("***"));
+        }
+        return u.to_string();
+    }
+
+    // 2) 解析不了：手工把 `scheme://userinfo@` 里的 userinfo 处理掉
+    //
+    //    注意取**最后一个** `@`：密码里可能含 `@`，而主机名里不可能有。
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        // 连 `://` 都没有（例如只写了主机名）：无法判断哪一段是口令，
+        // 干脆整个遮掉 —— 宁可少一条排障信息，也不能把疑似口令写进日志。
+        return if raw.is_empty() { String::new() } else { "***".to_string() };
+    };
+    match rest.rsplit_once('@') {
+        Some((userinfo, hostpart)) => match userinfo.split_once(':') {
+            Some((user, _)) => format!("{}://{}:***@{}", scheme, user, hostpart),
+            // 只有用户名、没有口令：本来就没有秘密可遮
+            None => raw.to_string(),
+        },
+        // 没有 userinfo：本来就没有口令，原样返回
+        None => raw.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +179,44 @@ mod tests {
         assert_eq!(suffix_chars("ab", 4), "ab");
         assert_eq!(suffix_chars("", 4), "");
         assert_eq!(suffix_chars("中文abc", 4), "文abc");
+    }
+
+    // ── redact_url：日志里不能出现口令 ────────────────────────────────────
+
+    #[test]
+    fn redact_url_hides_password_but_keeps_routing_info() {
+        let out = redact_url("amqp://kamism:s3cr3t-pw@186.241.74.205:5673/km");
+        assert!(!out.contains("s3cr3t-pw"), "口令必须被移除: {}", out);
+        // 排障需要的信息必须还在
+        assert!(out.contains("kamism"), "用户名要保留: {}", out);
+        assert!(out.contains("186.241.74.205"), "主机要保留: {}", out);
+        assert!(out.contains("5673"), "端口要保留: {}", out);
+        assert!(out.contains("/km"), "vhost 要保留: {}", out);
+    }
+
+    #[test]
+    fn redact_url_handles_redis_and_query_params() {
+        let out = redact_url("redis://default:topsecret@redis:6379/0");
+        assert!(!out.contains("topsecret"), "{}", out);
+        assert!(out.contains("redis:6379"), "{}", out);
+    }
+
+    #[test]
+    fn redact_url_never_leaks_on_unparseable_input() {
+        // 连接串写错是最常见的失败场景 —— 恰恰是这条路径最容易把原文打进日志。
+        // 只写了主机名、没有 `://`：无法区分哪段是口令，整个遮掉。
+        assert_eq!(redact_url("s3cr3t-pw"), "***");
+        assert_eq!(redact_url(""), "");
+        // 有 `://` 但格式不合法：仍要按 userinfo 切掉口令
+        let out = redact_url("amqp://u:p@ss@host:5672/%2f");
+        assert!(!out.contains("p@ss"), "{}", out);
+        assert!(out.ends_with("host:5672/%2f"), "{}", out);
+    }
+
+    #[test]
+    fn redact_url_leaves_credential_free_urls_alone() {
+        assert_eq!(redact_url("redis://127.0.0.1:6379"), "redis://127.0.0.1:6379");
+        // 只有用户名、没有口令：没有秘密可遮，保持原样
+        assert_eq!(redact_url("amqp://guest@localhost"), "amqp://guest@localhost");
     }
 }

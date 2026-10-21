@@ -153,6 +153,15 @@ impl CardStatusFilter {
     }
 }
 
+/// 模糊搜索最多解密多少行（`code_encrypted` 无法用 SQL 过滤，只能解密后比对）。
+///
+/// 取 2000：单行 AES-GCM 解密约 1~2 µs，2000 行 ≈ 几毫秒，对列表接口完全够用；
+/// 而改造前是**无上限**的，10 万张卡时一次搜索要解密 10 万次、占百 MB 内存。
+///
+/// 超过上限时接口返回 `truncated: true`，前端提示"结果较多，请输入更长的搜索词"。
+/// 完整卡密不受这个限制 —— 它走 `code_hash` 精确索引，见 `list_cards`。
+pub(crate) const SEARCH_SCAN_LIMIT: i64 = 2000;
+
 #[derive(Deserialize)]
 pub struct BatchCardStatusRequest {
     pub ids: Vec<Uuid>,
@@ -217,13 +226,35 @@ async fn list_cards(
     // 枚举保证片段只可能是三个受控字符串，无注入面。
     let status_filter = q.status.as_deref().and_then(CardStatusFilter::parse);
 
-    // 卡密代码搜索词（trim + 小写，供解密后 contains 匹配）。
-    let card_code_filter = q.card_code.as_deref().unwrap_or("").trim().to_lowercase();
+    // 卡密代码搜索词。
+    //
+    // ⚠️ 两个都必须留：`raw` 用于精确哈希（哈希对大小写敏感，必须用**原样**输入），
+    // `lower` 用于模糊匹配（用户不该需要记住大小写）。
+    // 原先只有 `to_lowercase()` 一份，导致"粘贴完整卡密"也只能走全量解密。
+    let card_code_raw = q.card_code.as_deref().unwrap_or("").trim().to_string();
+    let card_code_filter = card_code_raw.to_lowercase();
 
-    // ── 搜索路径：code 是加密存储的，SQL 无法 LIKE ─────────────────────────
-    // 先按 app_id/status 把该商户的卡**全量**拉出来（不分页），解密后在内存里
-    // contains 过滤，再做内存分页。这样搜索结果是**全量**的，而不是「只搜当前页」。
-    // 代价是全量解密（单商户卡密量级通常几百到几千，毫秒级，可接受）。
+    // ── 搜索路径 ───────────────────────────────────────────────────────────
+    //
+    // `code_encrypted` 是 AES-256-GCM，SQL 没法 LIKE，这一点无法改变。
+    // 但"搜一次就全量解密一遍"是设计上的浪费 —— 改造前这里不分页地拉出该商户
+    // 的**全部**卡密、逐行解密、内存里 contains 过滤、再内存切片分页：
+    //
+    //   | 卡密量 | 单次搜索代价 |
+    //   | 1 万   | 1 万次 AES-GCM，几十 ms |
+    //   | 10 万  | 10 万次解密 + 百 MB 内存，秒级卡顿，几个并发就雪崩 |
+    //
+    // 现在分两层：
+    //
+    //   ① **精确命中**（`code_hash` 唯一索引）：用户最常见的行为是把一张卡密
+    //      粘过来查。一次索引查找 + 一行解密，与总量无关。
+    //   ② **模糊匹配**：仍然需要解密，但**有明确上限**（SEARCH_SCAN_LIMIT），
+    //      超限时如实告诉前端"结果被截断"，而不是悄悄只返回前 N 条。
+    //
+    // 为什么不给模糊匹配也做索引：加密存储 + 可搜索索引只能二选一。
+    // 想让 `contains` 走索引就得存明文（或明文 n-gram 哈希）列，
+    // 那等于把"拿到库 = 拿到卡密"这个前提请回来 —— 与 `code_encrypted` 的
+    // 设计目的直接冲突。真正的解法是独立的检索服务，不在这一次改动范围内。
     if !card_code_filter.is_empty() {
         #[derive(sqlx::FromRow)]
         struct CardRow {
@@ -241,21 +272,95 @@ async fn list_cards(
             expires_at: Option<chrono::DateTime<chrono::Utc>>,
         }
 
-        let mut filter_sql = format!("SELECT {} FROM cards WHERE merchant_id = $1", CARD_COLS);
-        if q.app_id.is_some() {
-            filter_sql.push_str(" AND app_id = $2");
+        // ① 精确命中。
+        //
+        // `($2::uuid IS NULL OR app_id = $2)` 让有/无 app_id 两种情况共用一套
+        // 占位符编号 —— 动态拼 `$3/$4` 是这类查询最容易出错的地方
+        // （参数错位不会报错，只会查不到行）。
+        let mut exact_sql = format!(
+            "SELECT {} FROM cards
+             WHERE merchant_id = $1 AND ($2::uuid IS NULL OR app_id = $2) AND code_hash = $3",
+            CARD_COLS
+        );
+        if let Some(f) = status_filter {
+            exact_sql.push_str(" AND ");
+            exact_sql.push_str(f.sql_fragment());
         }
+
+        // 卡密按大写字符集生成，但用户可能粘小写。两种大小写各算一次哈希，
+        // 命中任意一个即可（去重后最多查 2 次，都是索引查找）。
+        let mut candidates: Vec<String> = vec![card_code_raw.clone()];
+        let upper = card_code_raw.to_uppercase();
+        if upper != card_code_raw {
+            candidates.push(upper);
+        }
+
+        // 太短的输入不可能是完整卡密（最短格式 `KAMI-AB` 也有 7 个字符），
+        // 少于 6 个字符时直接跳过精确查询，省掉两次必然落空的索引查找。
+        if card_code_raw.len() >= 6 {
+            for cand in &candidates {
+                let code_hash = EncryptedFieldsOps::generate_hash(cand);
+                let found: Result<Option<CardRow>, sqlx::Error> = sqlx::query_as(&exact_sql)
+                    .bind(merchant_id)
+                    .bind(q.app_id)
+                    .bind(&code_hash)
+                    .fetch_optional(&state.pool)
+                    .await;
+
+                match found {
+                    Ok(Some(r)) => {
+                        let code = match EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &r.code) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                // 精确命中却解不开：数据损坏，如实报错（不要静默返回空）
+                                tracing::error!("精确命中卡密但解密失败: card_id={} err={}", r.id, e);
+                                return db_guard::server_busy();
+                            }
+                        };
+                        return Json(json!({
+                            "success": true,
+                            "data": [Card {
+                                id: r.id, app_id: r.app_id, merchant_id: r.merchant_id,
+                                code, duration_days: r.duration_days, max_devices: r.max_devices,
+                                status: r.status, note: r.note, created_at: r.created_at,
+                                activated_at: r.activated_at, expires_at: r.expires_at,
+                            }],
+                            "total": 1,
+                            "page": 1,
+                            "page_size": page_size,
+                            "exact": true
+                        }));
+                    }
+                    Ok(None) => continue, // 这种大小写没命中，试下一个
+                    Err(e) => {
+                        tracing::error!("按哈希精确查询卡密失败: err={}", e);
+                        return db_guard::server_busy();
+                    }
+                }
+            }
+        }
+
+        // ② 模糊匹配：有界扫描。
+        //
+        // 多取 1 行（`LIMIT $3` 传 N+1）用来判断"是否还有更多"，
+        // 而不是拿被截断的结果冒充全量。
+        let mut filter_sql = format!(
+            "SELECT {} FROM cards WHERE merchant_id = $1 AND ($2::uuid IS NULL OR app_id = $2)",
+            CARD_COLS
+        );
         if let Some(f) = status_filter {
             filter_sql.push_str(" AND ");
             filter_sql.push_str(f.sql_fragment());
         }
-        filter_sql.push_str(" ORDER BY created_at DESC");
+        filter_sql.push_str(" ORDER BY created_at DESC LIMIT $3");
 
-        let mut fq = sqlx::query_as::<_, CardRow>(&filter_sql).bind(merchant_id);
-        if q.app_id.is_some() {
-            fq = fq.bind(q.app_id.unwrap());
-        }
-        let all: Vec<CardRow> = match fq.fetch_all(&state.pool).await {
+        let all: Vec<CardRow> = match sqlx::query_as(&filter_sql)
+            .bind(merchant_id)
+            .bind(q.app_id)
+            .bind(SEARCH_SCAN_LIMIT + 1)
+            .fetch_all(&state.pool)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("查询卡密列表失败: err={}", e);
@@ -263,9 +368,13 @@ async fn list_cards(
             }
         };
 
+        // 命中上限说明还有更多没被扫描到。**必须**如实告知前端：
+        // 静默截断会让用户以为"就这几张"，进而以为卡密丢了。
+        let truncated = all.len() as i64 > SEARCH_SCAN_LIMIT;
+
         // 解密 + contains 过滤
         let mut matched: Vec<Card> = Vec::new();
-        for r in all {
+        for r in all.into_iter().take(SEARCH_SCAN_LIMIT as usize) {
             let plain = match EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &r.code) {
                 Ok(p) => p,
                 Err(e) => {
@@ -298,7 +407,9 @@ async fn list_cards(
             "data": page_cards,
             "total": total,
             "page": page,
-            "page_size": page_size
+            "page_size": page_size,
+            "truncated": truncated,
+            "scanned": SEARCH_SCAN_LIMIT,
         }));
     }
 

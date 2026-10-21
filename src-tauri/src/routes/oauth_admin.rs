@@ -1,5 +1,8 @@
 use crate::{
-    middleware::auth::{admin_only, auth_middleware, AppState},
+    middleware::{
+        audit::admin_audit,
+        auth::{admin_only, auth_middleware, AppState},
+    },
     models::oauth_config::{CreateOAuthProvider, OAuthConfig, OAuthConfigPublic, UpdateOAuthConfig},
     utils::db_guard,
 };
@@ -50,6 +53,9 @@ pub fn oauth_admin_router(state: AppState) -> Router<AppState> {
         .route("/admin/oauth/configs/:provider", get(get_oauth_config))
         .route("/admin/oauth/configs/:provider", patch(update_oauth_config))
         .route("/admin/oauth/configs/:provider/toggle", post(toggle_oauth_config))
+        // 审计挂最内层：此时鉴权与 admin_only 都已通过，Claims 一定在 extensions 里。
+        // 加在最前面 = 最内层（axum 后加的 layer 在外层）。
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_audit))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }

@@ -1,16 +1,42 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { authApi } from '../../lib/api';
-import { Mail, Lock, User, ArrowRight, ShieldCheck } from 'lucide-react';
+import { Mail, Lock, User, ArrowRight, ShieldCheck, RefreshCw } from 'lucide-react';
 import appIcon from '../../assets/app-icon.png';
 import toast from 'react-hot-toast';
 
+// 从 axios 错误里取后端文案：429（限流）等情况下后端给的是有用的中文提示，
+// 直接吞掉换成「请检查网络」会让用户以为是自己网络问题。
+const errMsg = (e: unknown, fallback: string) =>
+  (e as { response?: { data?: { message?: string } } })?.response?.data?.message || fallback;
+
 export default function Register() {
   const navigate = useNavigate();
-  const [form, setForm] = useState({ username: '', email: '', password: '', confirm: '', code: '' });
+  const [form, setForm] = useState({ username: '', email: '', password: '', confirm: '', code: '', captchaAnswer: '' });
   const [loading, setLoading] = useState(false);
   const [codeSending, setCodeSending] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [captcha, setCaptcha] = useState<{ id: string; question: string } | null>(null);
+  const [captchaLoading, setCaptchaLoading] = useState(false);
+
+  const loadCaptcha = async () => {
+    setCaptchaLoading(true);
+    try {
+      const res = await authApi.getCaptcha();
+      if (res.data.success) {
+        setCaptcha({ id: res.data.data.captcha_id, question: res.data.data.question });
+        setForm(f => ({ ...f, captchaAnswer: '' }));
+      } else {
+        setCaptcha(null);
+      }
+    } catch {
+      setCaptcha(null);
+    } finally {
+      setCaptchaLoading(false);
+    }
+  };
+
+  useEffect(() => { loadCaptcha(); }, []);
 
   const startCountdown = () => {
     setCountdown(60);
@@ -33,8 +59,8 @@ export default function Register() {
       } else {
         toast.error(res.data.message || '发送失败');
       }
-    } catch {
-      toast.error('发送失败，请检查网络');
+    } catch (e) {
+      toast.error(errMsg(e, '发送失败，请检查网络'));
     } finally {
       setCodeSending(false);
     }
@@ -44,6 +70,8 @@ export default function Register() {
     e.preventDefault();
     if (form.password !== form.confirm) { toast.error('两次密码不一致'); return; }
     if (!form.code) { toast.error('请输入验证码'); return; }
+    if (!captcha) { toast.error('人机验证未加载，请点击刷新'); loadCaptcha(); return; }
+    if (!form.captchaAnswer.trim()) { toast.error('请填写人机验证答案'); return; }
     setLoading(true);
     try {
       const res = await authApi.register({
@@ -51,15 +79,20 @@ export default function Register() {
         email: form.email,
         password: form.password,
         code: form.code,
+        captcha_id: captcha.id,
+        captcha_answer: form.captchaAnswer.trim(),
       });
       if (res.data.success) {
         toast.success('注册成功，请登录');
         navigate('/login');
       } else {
         toast.error(res.data.message || '注册失败');
+        // 人机验证是一次性的，无论失败原因是什么，这一题都已经作废
+        loadCaptcha();
       }
-    } catch {
-      toast.error('注册失败，请检查网络');
+    } catch (e) {
+      toast.error(errMsg(e, '注册失败，请检查网络'));
+      loadCaptcha();
     } finally {
       setLoading(false);
     }
@@ -124,6 +157,37 @@ export default function Register() {
                   placeholder="6位数字验证码" required maxLength={6}
                   style={{ paddingLeft: 36, letterSpacing: '6px', fontFamily: 'var(--mono)', fontSize: 16 }}
                 />
+              </div>
+            </div>
+
+            {/* 人机验证 */}
+            <div className="form-group">
+              <label className="form-label">人机验证</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  minWidth: 104, height: 42, padding: '0 10px',
+                  borderRadius: 8, border: '1px solid var(--border)',
+                  background: 'rgba(124,106,247,0.08)',
+                  fontFamily: 'var(--mono)', fontSize: 15,
+                  letterSpacing: 1, userSelect: 'none',
+                  color: captcha ? 'var(--text)' : 'var(--text-muted)',
+                }}>
+                  {captchaLoading ? <span className="spinner" /> : (captcha?.question ?? '加载失败')}
+                </div>
+                <input
+                  type="text" inputMode="numeric" value={form.captchaAnswer}
+                  onChange={e => setForm({ ...form, captchaAnswer: e.target.value.replace(/[^\d]/g, '').slice(0, 3) })}
+                  placeholder="计算结果" required
+                  style={{ flex: 1, height: 42 }}
+                />
+                <button
+                  type="button" className="btn btn-ghost" onClick={loadCaptcha}
+                  disabled={captchaLoading} title="换一题"
+                  style={{ flexShrink: 0, padding: '0 12px' }}
+                >
+                  <RefreshCw size={14} />
+                </button>
               </div>
             </div>
 

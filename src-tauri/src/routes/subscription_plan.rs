@@ -1,3 +1,4 @@
+use crate::middleware::audit::admin_audit;
 use crate::middleware::auth::{admin_only, auth_middleware, AppState};
 use crate::models::subscription_plan::{CreatePlanRequest, SubscriptionPlan, UpdatePlanRequest};
 use crate::utils::db_guard;
@@ -23,6 +24,10 @@ pub fn subscription_plan_router(state: AppState) -> Router<AppState> {
         .route("/admin/subscription-plans", post(create_plan))
         .route("/admin/subscription-plans/:id", put(update_plan))
         .route("/admin/subscription-plans/:id", delete(delete_plan))
+        // 审计挂最内层（最前面加的 = 最内层）。
+        // 注意它只包住上面这几条 /admin/* 路由 —— 下面那条商户端公开接口
+        // 是另一个 route + layer 组合，不会被审计包进去（也不该被包）。
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_audit))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         // 商户端公开接口（仅需登录，无需管理员）

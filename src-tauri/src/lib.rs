@@ -93,14 +93,29 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     tracing::info!("正在连接 Redis...");
     let redis_client = redis::Client::open(redis_url.as_str())
-        .map_err(|e| anyhow::anyhow!("Redis URL 无效: {} (REDIS_URL={})", e, redis_url))?;
+        // ⚠️ 这里**不能**直接打 `redis_url`：它形如 `redis://user:password@host`，
+        // 整条写进 stderr 之后 docker logs / 日志采集 / 排障截图都会长期留着口令。
+        // 脱敏后仍保留主机与端口，排障信息一个不少。见 utils::mask::redact_url。
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Redis URL 无效: {} (REDIS_URL={})",
+                e,
+                utils::mask::redact_url(&redis_url)
+            )
+        })?;
     let redis_conn = redis::aio::ConnectionManager::new(redis_client).await
         .map_err(|e| anyhow::anyhow!("Redis 连接失败: {}", e))?;
     tracing::info!("Redis 连接成功");
 
     tracing::info!("正在连接 RabbitMQ...");
     let mq_channel = utils::mq::connect(&amqp_url).await
-        .map_err(|e| anyhow::anyhow!("RabbitMQ 连接失败: {} (AMQP_URL={})", e, amqp_url))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "RabbitMQ 连接失败: {} (AMQP_URL={})",
+                e,
+                utils::mask::redact_url(&amqp_url)
+            )
+        })?;
     let mq_channel = Arc::new(mq_channel);
     tracing::info!("RabbitMQ 连接成功");
 

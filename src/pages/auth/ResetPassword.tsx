@@ -5,6 +5,11 @@ import { Mail, Lock, ArrowRight, ShieldCheck } from 'lucide-react';
 import appIcon from '../../assets/app-icon.png';
 import toast from 'react-hot-toast';
 
+// 429（限流）时后端会给出「请求过于频繁，请 X 秒后重试」，这是有效信息，
+// 不要被通用的「请检查网络」盖掉。
+const errMsg = (e: unknown, fallback: string) =>
+  (e as { response?: { data?: { message?: string } } })?.response?.data?.message || fallback;
+
 export default function ResetPassword() {
   const navigate = useNavigate();
   const [step, setStep] = useState<'email' | 'code' | 'password'>('email');
@@ -35,8 +40,8 @@ export default function ResetPassword() {
       } else {
         toast.error(res.data.message || '发送失败');
       }
-    } catch {
-      toast.error('发送失败，请检查网络');
+    } catch (e) {
+      toast.error(errMsg(e, '发送失败，请检查网络'));
     } finally {
       setCodeSending(false);
     }

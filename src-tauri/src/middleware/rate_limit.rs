@@ -46,6 +46,43 @@ pub async fn api_rate_limit(
     rate_limit_check(state.redis.clone(), &key, 60, 60, req, next).await
 }
 
+/// 邮箱验证码发送限流：同一 IP 每 10 分钟最多 5 次
+///
+/// 作用于 `/auth/send-code`（注册）与 `/auth/send-reset-code`（找回密码）。
+///
+/// ⚠️ 为什么 handler 里的「60 秒/邮箱冷却」不够，必须再加这一层：
+///
+///   那条冷却的粒度是**邮箱**，换个邮箱就是一个新桶。脚本可以每秒换一个地址，
+///   每个地址都合法地拿到一封信 —— 冷却永远不触发。而这里消耗的是真实成本：
+///   发件服务的配额、发件域的信誉（被投诉多了整个域进垃圾箱），
+///   以及被打的收件人。成本按「请求数」计，限流就必须按请求方（IP）计。
+///
+/// 取值考虑：正常用户一次注册/找回最多点 2~3 次（收不到邮件会重发），
+/// 5 次/10 分钟留了余量；共享出口（公司 NAT、校园网）也不会被一个人拖垮。
+pub async fn email_code_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip = state.trusted_proxies.resolve(req.headers(), addr);
+    let key = format!("rl:email_code:{}", bucket_key(ip));
+    rate_limit_check(state.redis.clone(), &key, 5, 600, req, next).await
+}
+
+/// 人机验证挑战签发限流：同一 IP 每分钟最多 30 次
+/// 挑战本身只是一次 Redis 写入，成本低，但不能让它变成无成本的白嫖接口
+pub async fn captcha_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let ip = state.trusted_proxies.resolve(req.headers(), addr);
+    let key = format!("rl:captcha:{}", bucket_key(ip));
+    rate_limit_check(state.redis.clone(), &key, 30, 60, req, next).await
+}
+
 /// 激活专用限流：同一 IP 每分钟最多 20 次激活请求（防黄牛批量激活）
 /// 比通用 api_rate_limit 更严格，单独作用于 /v1/activate
 pub async fn activate_rate_limit(

@@ -79,20 +79,68 @@ export async function initApiUrl() {
   // 地址已在构建时确定，无需运行时初始化
 }
 
-// 是否正在刷新 token，防止并发请求重复刷新
-let isRefreshing = false;
-// 刷新期间等待的请求队列
-let refreshQueue: Array<(token: string) => void> = [];
+// ── Token 续期：全站**单飞**（single-flight）──────────────────────────────
+//
+// 为什么必须单飞，而不是各调用点自己刷（这里踩过坑，记下来）：
+//   触发续期的地方有两个 —— ① REST 请求拿到 401；② WebSocket 断线重连前主动续期
+//   （见 hooks/useWs.ts）。两者可能同时发生，各自发一次 /auth/refresh，于是服务端
+//   收到多个并发的 refresh，各自滚动签发新的 refresh token；localStorage 最后只留
+//   下「最后完成的那次」的结果，其余响应里的 refresh token 直接作废浪费。
+//   本项目服务端**不吊销旧 refresh**（只验签 + 校验 token_version，见
+//   auth.rs::refresh_token），所以并发不会互相踢下线，但每多一次就是一次多余的
+//   DB + Redis 查询。单飞之后：一次续期只发一个请求，所有等待方共享同一个结果。
+let refreshInFlight: Promise<RefreshOutcome> | null = null;
 
-const flushQueue = (token: string) => {
-  refreshQueue.forEach(cb => cb(token));
-  refreshQueue = [];
+/**
+ * 续期结果。
+ *
+ * ⚠️ 必须区分「凭据失效」和「服务端临时故障」：调用方拿它决定**是登出还是重试**。
+ * 混为一谈的后果很严重 —— 服务端 Redis 抖一下（refresh 走 fail-closed 会返回
+ * 「服务暂时不可用」），如果当成「凭据失效」就会把全站用户踢到登录页。
+ */
+export type RefreshOutcome = {
+  /** 新 access token；失败为 null */
+  token: string | null;
+  /** true = 服务端明确拒绝（令牌无效/过期/被吊销/账号禁用），只能重新登录 */
+  authLost: boolean;
 };
 
-const flushQueueReject = () => {
-  refreshQueue.forEach(cb => cb(''));
-  refreshQueue = [];
-};
+/** 从 JWT 里读 exp（秒）。**不验签** —— 只用于判断「要不要提前续期」，不能当安全依据。 */
+function readJwtExp(token: string): number | null {
+  try {
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, '=');
+    const bin = atob(padded);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    const payload = JSON.parse(new TextDecoder().decode(bytes)) as { exp?: unknown };
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** token 剩余有效期（毫秒）；非 JWT / 解析失败返回 null（不猜，交给服务端裁决）。 */
+export function getTokenRemainingMs(token: string | null): number | null {
+  if (!token) return null;
+  const exp = readJwtExp(token);
+  if (exp === null) return null;
+  return exp * 1000 - Date.now();
+}
+
+/**
+ * token 是否已过期或即将过期（默认提前 120 秒算「要过期了」）。
+ *
+ * 余量的意义：网络往返 + 服务端处理要时间，卡在「还剩 3 秒」时建连，
+ * 到达服务端时可能刚好过期 —— 这种 401 最难查（本地看 token 明明没过期）。
+ */
+export function isTokenExpiring(token: string | null, skewMs = 120_000): boolean {
+  if (!token) return true;
+  const remaining = getTokenRemainingMs(token);
+  if (remaining === null) return false;
+  return remaining <= skewMs;
+}
 
 // ── 请求拦截器 ①：GET 去重 ──────────────────────────────────────────────────
 api.interceptors.request.use((config) => {
@@ -154,57 +202,26 @@ api.interceptors.response.use(
 
     // 只处理 401，且不重试 refresh 接口本身，且没有重试过
     if (err.response?.status === 401 && !original?._retry && !original?.url?.includes('/auth/refresh')) {
-      const refreshToken = localStorage.getItem('refreshToken');
-      if (!refreshToken) {
-        logout();
-        return Promise.reject(err);
-      }
-
-      if (isRefreshing) {
-        // 已在刷新中，把请求加入队列，等待新 token
-        return new Promise((resolve, reject) => {
-          refreshQueue.push((token: string) => {
-            if (!token) {
-              reject(err);
-            } else {
-              original.headers.Authorization = `Bearer ${token}`;
-              resolve(api(original));
-            }
-          });
-        });
-      }
-
       original._retry = true;
-      isRefreshing = true;
+      // 单飞续期：并发多个 401、以及 WebSocket 重连前的主动续期，共用同一次请求
+      const outcome = await refreshSessionOutcome();
 
-      try {
-        const res = await axios.post(`${BASE_URL}/auth/refresh`, { refresh_token: refreshToken });
-        if (res.data.success) {
-          const { token: newToken, refresh_token: newRefresh } = res.data;
-          localStorage.setItem('token', newToken);
-          localStorage.setItem('refreshToken', newRefresh);
-          api.defaults.headers.common.Authorization = `Bearer ${newToken}`;
-          flushQueue(newToken);
-          original.headers.Authorization = `Bearer ${newToken}`;
-          return api(original);
-        } else {
-          flushQueueReject();
-          logout();
-          return Promise.reject(err);
-        }
-      } catch {
-        flushQueueReject();
-        logout();
-        return Promise.reject(err);
-      } finally {
-        isRefreshing = false;
+      if (outcome.token) {
+        original.headers.Authorization = `Bearer ${outcome.token}`;
+        return api(original);
       }
+
+      // 只有**确认**凭据失效才登出。服务端临时故障（Redis/MQ 抖动、5xx）时
+      // 不能把人踢下线 —— 那会把一次基础设施抖动放大成「全站被强制登出」。
+      if (outcome.authLost) logout();
+      return Promise.reject(err);
     }
     return Promise.reject(err);
   }
 );
 
-function logout() {
+/** 清空本地会话并跳登录页。WS 侧确认会话失效时也会调它（见 hooks/useWs.ts）。 */
+export function logout() {
   localStorage.removeItem('token');
   localStorage.removeItem('refreshToken');
   localStorage.removeItem('role');
@@ -212,11 +229,75 @@ function logout() {
   window.location.href = '/login';
 }
 
+/** 写入新 token 并同步 axios 默认头（续期成功后唯一的落盘点）。 */
+function applyToken(token: string, nextRefreshToken?: string) {
+  localStorage.setItem('token', token);
+  if (nextRefreshToken) localStorage.setItem('refreshToken', nextRefreshToken);
+  api.defaults.headers.common.Authorization = `Bearer ${token}`;
+}
+
+/**
+ * 续期，并告诉调用方失败的类型（凭据失效 vs 临时故障）。
+ *
+ * 单飞：并发调用共享同一个 Promise，只有第一个真正发请求。
+ *
+ * 用裸 `axios` 而不是 `api` 实例：后者会再过一遍请求/响应拦截器，
+ * 一旦续期本身返回 401 就会递归调用本函数。
+ */
+export function refreshSessionOutcome(): Promise<RefreshOutcome> {
+  if (refreshInFlight) return refreshInFlight;
+
+  const storedRefresh = localStorage.getItem('refreshToken');
+  if (!storedRefresh) {
+    // 没有 refresh token = 本地会话不完整，重试也不会有结果
+    return Promise.resolve({ token: null, authLost: true });
+  }
+
+  refreshInFlight = (async (): Promise<RefreshOutcome> => {
+    try {
+      const res = await axios.post(`${BASE_URL}/auth/refresh`, { refresh_token: storedRefresh });
+      const body = (res.data ?? {}) as { success?: boolean; token?: string; refresh_token?: string; message?: string };
+
+      if (body.success && typeof body.token === 'string' && body.token) {
+        applyToken(body.token, typeof body.refresh_token === 'string' ? body.refresh_token : undefined);
+        return { token: body.token, authLost: false };
+      }
+
+      // refresh 接口在业务失败时也回 200，只能看 message。这里**宁可判成临时故障**：
+      // 误判成「临时故障」最坏是多重试几次（有上限），误判成「凭据失效」会把人踢下线。
+      const message = typeof body.message === 'string' ? body.message : '';
+      const authLost = /无效|过期|失效|禁用|重新登录/.test(message) && !/稍后重试|暂时不可用/.test(message);
+      return { token: null, authLost };
+    } catch (e) {
+      // HTTP 层的 4xx 才是凭据问题；5xx / 超时 / 断网都属于临时故障
+      const status = (e as { response?: { status?: number } })?.response?.status;
+      const authLost = status === 400 || status === 401 || status === 403;
+      return { token: null, authLost };
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
+}
+
+/** 续期并只要 token（大多数调用方只关心这个）。 */
+export async function refreshSession(): Promise<string | null> {
+  const outcome = await refreshSessionOutcome();
+  return outcome.token;
+}
+
 // ─── Auth ───────────────────────────────────────────
 export const authApi = {
   sendCode: (email: string) =>
     api.post('/auth/send-code', { email }),
-  register: (data: { username: string; email: string; password: string; code: string }) =>
+  // 人机验证题面：答案只存在服务端，这里拿到的只有 id 和题面
+  getCaptcha: () =>
+    api.get('/auth/captcha'),
+  register: (data: {
+    username: string; email: string; password: string; code: string;
+    captcha_id: string; captcha_answer: string;
+  }) =>
     api.post('/auth/register', data),
   login: (data: { email: string; password: string }) =>
     api.post('/auth/login', data),
@@ -242,6 +323,16 @@ export const adminApi = {
     api.patch(`/admin/merchants/${id}/status`, { status }),
   updateMerchantPlan: (id: string, plan: 'free' | 'pro', expires_days?: number) =>
     api.patch(`/admin/merchants/${id}/plan`, { plan, expires_days }),
+  // 续期：在已有到期时间上叠加天数（与 updateMerchantPlan 现在是同一套语义，
+  // 都走后端 utils::plan::extend_plan；保留两个入口是因为界面上的场景不同）
+  renewMerchantPlan: (id: string, days: number) =>
+    api.patch(`/admin/merchants/${id}/renew`, { days }),
+  // 管理员改自己的密码（成功后返回新的 token 对，需替换本地凭据）
+  changeAdminPassword: (data: { old_password: string; new_password: string }) =>
+    api.patch('/admin/password', data),
+  // 审计日志（只读，写入由后端中间件自动完成）
+  getAuditLogs: (params?: { page?: number; page_size?: number; admin_id?: string; keyword?: string }) =>
+    api.get('/admin/audit-logs', { params }),
   getPlanConfigs: () => api.get('/admin/plan-configs'),
   updatePlanConfig: (id: string, data: {
     label?: string;
@@ -344,10 +435,14 @@ export const merchantMessagesApi = {
 };
 
 // ─── WebSocket URL helper ────────────────────────────
-export function getWsUrl(): string {
+//
+// 浏览器无法给 WebSocket 加 Authorization 头，只能把 token 放 query。
+// `token` 参数不是为了方便 —— 是为了**消除竞态**：调用方先用
+// `refreshSessionOutcome` 拿到一个确定有效的 token，再把它传进来；
+// 如果这里自己去 localStorage 读，读到的可能是别的标签页刚刷新前的旧值。
+export function getWsUrl(token: string = localStorage.getItem('token') ?? ''): string {
   const base = (import.meta.env.VITE_API_URL || 'http://localhost:9527') as string;
   const ws = base.replace(/^http/, 'ws');
-  const token = localStorage.getItem('token') ?? '';
   return `${ws}/ws/messages?token=${encodeURIComponent(token)}`;
 }
 

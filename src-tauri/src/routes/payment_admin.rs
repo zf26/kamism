@@ -1,5 +1,8 @@
 use crate::{
-    middleware::auth::{admin_only, auth_middleware, AppState},
+    middleware::{
+        audit::admin_audit,
+        auth::{admin_only, auth_middleware, AppState},
+    },
     models::payment_config::{PaymentConfig, PaymentConfigPublic, UpdatePaymentConfig},
     utils::db_guard,
 };
@@ -19,6 +22,8 @@ pub fn payment_admin_router(state: AppState) -> Router<AppState> {
         .route("/admin/payment/configs/:channel", patch(update_payment_config))
         .route("/admin/payment/configs/:channel/toggle", post(toggle_payment_config))
         .route("/admin/payment/orders", get(list_all_orders))
+        // 审计挂最内层（最前面加的 = 最内层）
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_audit))
         .route_layer(middleware::from_fn(admin_only))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
 }

@@ -58,21 +58,100 @@ async fn list_activations(
     let page = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).min(100);
     let offset = (page - 1) * page_size;
-    let card_code_filter = q.card_code.as_deref().unwrap_or("").trim().to_lowercase();
+    let card_code_raw = q.card_code.as_deref().unwrap_or("").trim().to_string();
+    let card_code_filter = card_code_raw.to_lowercase();
 
     // 搜索路径：card_code 是加密存储的（cards.code_encrypted），SQL 无法 LIKE。
-    // 先全量拉出该商户的激活记录（不分页），解密后在内存 contains 过滤，再内存分页。
-    // 否则会出现「先 LIMIT 再过滤」的假搜索：结果只出现在当前页，翻页就漏。
+    //
+    // 改造前这里**不分页**地拉出该商户的全部激活记录、逐行解密、内存 contains
+    // 过滤、再内存分页。激活记录比卡密多（一张卡可能有多次设备绑定/解绑），
+    // 所以这里的放大倍数比 cards 列表更高。
+    //
+    // 现在两层（与 cards.rs 的 list_cards 保持同一套策略）：
+    //   ① 完整卡密 → `c.code_hash` 精确命中（唯一索引，代价与总量无关）
+    //   ② 部分匹配 → 有界扫描，超过上限时返回 `truncated: true`
     if !card_code_filter.is_empty() {
-        let all: Vec<(Uuid, Uuid, String, Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>)> = match sqlx::query_as(
+        type Row = (Uuid, Uuid, String, Uuid, String, Option<String>, Option<String>, DateTime<Utc>, DateTime<Utc>);
+
+        // ① 精确命中
+        let mut exact_sql = String::from(
+            r#"SELECT a.id, a.card_id, c.code_encrypted, a.app_id, a.device_id_encrypted,
+                      a.device_name, a.ip_address, a.activated_at, a.last_verified_at
+               FROM activations a
+               JOIN cards c ON c.id = a.card_id
+               WHERE c.merchant_id = $1 AND c.code_hash = $2
+               ORDER BY a.activated_at DESC"#,
+        );
+        // 记录数上限同 cards：一张卡理论上可以有多次绑定记录，这里也封顶
+        exact_sql.push_str(" LIMIT $3");
+
+        let mut candidates: Vec<String> = vec![card_code_raw.clone()];
+        let upper = card_code_raw.to_uppercase();
+        if upper != card_code_raw {
+            candidates.push(upper);
+        }
+
+        if card_code_raw.len() >= 6 {
+            for cand in &candidates {
+                let code_hash = EncryptedFieldsOps::generate_hash(cand);
+                let rows: Result<Vec<Row>, sqlx::Error> = sqlx::query_as(&exact_sql)
+                    .bind(merchant_id)
+                    .bind(&code_hash)
+                    .bind(crate::routes::cards::SEARCH_SCAN_LIMIT + 1)
+                    .fetch_all(&state.pool)
+                    .await;
+
+                let rows = match rows {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("按哈希精确查询激活记录失败: err={}", e);
+                        return db_guard::server_busy();
+                    }
+                };
+
+                if rows.is_empty() {
+                    continue; // 这种大小写没命中
+                }
+
+                let truncated = rows.len() as i64 > crate::routes::cards::SEARCH_SCAN_LIMIT;
+                let mut matched = Vec::new();
+                for (id, card_id, encrypted_code, app_id, encrypted_device_id, device_name, ip_address, activated_at, last_verified_at)
+                    in rows.into_iter().take(crate::routes::cards::SEARCH_SCAN_LIMIT as usize)
+                {
+                    let card_code = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &encrypted_code)
+                        .unwrap_or_else(|_| "[解密失败]".to_string());
+                    let device_id = EncryptedFieldsOps::decrypt_device_id(&state.encryptor, &encrypted_device_id)
+                        .unwrap_or_else(|_| "[解密失败]".to_string());
+                    matched.push(ActivationWithCode {
+                        id, card_id, card_code, app_id, device_id,
+                        device_name, ip_address, activated_at, last_verified_at,
+                    });
+                }
+
+                return Json(json!({
+                    "success": true,
+                    "data": matched,
+                    "total": matched.len(),
+                    "page": 1,
+                    "page_size": page_size,
+                    "truncated": truncated,
+                    "exact": true
+                }));
+            }
+        }
+
+        // ② 模糊匹配：有界扫描（多取 1 行用于判断是否被截断）
+        let all: Vec<Row> = match sqlx::query_as(
             r#"SELECT a.id, a.card_id, c.code_encrypted, a.app_id, a.device_id_encrypted,
                       a.device_name, a.ip_address, a.activated_at, a.last_verified_at
                FROM activations a
                JOIN cards c ON c.id = a.card_id
                WHERE c.merchant_id = $1
-               ORDER BY a.activated_at DESC"#,
+               ORDER BY a.activated_at DESC
+               LIMIT $2"#,
         )
         .bind(merchant_id)
+        .bind(crate::routes::cards::SEARCH_SCAN_LIMIT + 1)
         .fetch_all(&state.pool)
         .await
         {
@@ -83,8 +162,12 @@ async fn list_activations(
             }
         };
 
+        let truncated = all.len() as i64 > crate::routes::cards::SEARCH_SCAN_LIMIT;
+
         let mut matched: Vec<ActivationWithCode> = Vec::new();
-        for (id, card_id, encrypted_code, app_id, encrypted_device_id, device_name, ip_address, activated_at, last_verified_at) in all {
+        for (id, card_id, encrypted_code, app_id, encrypted_device_id, device_name, ip_address, activated_at, last_verified_at)
+            in all.into_iter().take(crate::routes::cards::SEARCH_SCAN_LIMIT as usize)
+        {
             let card_code = EncryptedFieldsOps::decrypt_card_code(&state.encryptor, &encrypted_code)
                 .unwrap_or_else(|_| "[解密失败]".to_string());
             if !card_code.to_lowercase().contains(&card_code_filter) {
@@ -108,7 +191,8 @@ async fn list_activations(
             "data": page_acts,
             "total": total,
             "page": page,
-            "page_size": page_size
+            "page_size": page_size,
+            "truncated": truncated
         }));
     }
 

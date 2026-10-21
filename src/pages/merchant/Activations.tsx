@@ -24,6 +24,8 @@ export default function Activations() {
   const [pageSize, setPageSize] = useState(20);
   const [total, setTotal] = useState(0);
   const [searchCode, setSearchCode] = useState('');
+  // 模糊搜索是否被后端扫描上限截断
+  const [searchTruncated, setSearchTruncated] = useState(false);
   const PAGE_SIZE_OPTIONS = [10, 20, 50];
   // 搜索词防抖：停止输入 300ms 后才真正触发查询
   const debouncedSearch = useDebouncedValue(searchCode, 300);
@@ -32,7 +34,12 @@ export default function Activations() {
     setLoading(true);
     setList([]);
     activationsApi.list({ page: p, page_size: ps, card_code: code || undefined }).then(res => {
-      if (res.data.success) { setList(res.data.data); setTotal(res.data.total); }
+      if (res.data.success) {
+        setList(res.data.data);
+        setTotal(res.data.total);
+        // 模糊搜索有后端扫描上限，被截断时如实提示（见后端 activations::list_activations）
+        setSearchTruncated(!!res.data.truncated);
+      }
     }).catch(() => {
       toast.error('加载激活记录失败');
     }).finally(() => setLoading(false));
@@ -91,6 +98,16 @@ export default function Activations() {
           </button>
         )}
       </div>
+
+      {searchTruncated && (
+        <div style={{
+          marginBottom: 14, padding: '8px 14px', borderRadius: 8, fontSize: 12,
+          background: 'rgba(245,158,11,0.10)', border: '1px solid rgba(245,158,11,0.35)',
+          color: '#f59e0b',
+        }}>
+          结果较多，仅扫描了最新的若干条记录；请输入更长的搜索词，或直接粘贴完整卡密（可精确匹配）。
+        </div>
+      )}
 
       <div className="table-wrap">
         <table>

@@ -137,8 +137,28 @@ async fn upsert_webhook(
     if body.url.trim().is_empty() {
         return Json(json!({ "success": false, "message": "URL 不能为空" }));
     }
-    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
-        return Json(json!({ "success": false, "message": "URL 必须以 http:// 或 https:// 开头" }));
+    // ── 出站地址校验（SSRF）────────────────────────────────────────────────
+    //
+    // ⚠️ 这里曾经只有一句 `starts_with("http://") || starts_with("https://")`。
+    // 注册是开放的，于是任何注册用户都能把回调指向 `127.0.0.1:5432`、
+    // `http://redis:6379`、`169.254.169.254/latest/meta-data/`（云厂商元数据），
+    // 或者拿它当内网端口扫描器 —— 而且能通过"有没有收到回调"读到探测结果。
+    //
+    // 保存时校验只能挡住"填的那一刻就是内网"的情况；真正兜底的是投递前的
+    // 二次校验（`fire_webhook` 里），因为域名解析结果随时可能变（DNS rebinding）。
+    match crate::utils::url_guard::check_outbound_url(&body.url).await {
+        Ok(_) => {}
+        // 域名解析失败：**不拦**。DNS 抖动不该让商户存不了配置，
+        // 而且投递前还会再校验一次，安全边界不在这一步。
+        Err(crate::utils::url_guard::UrlReject::DnsFailed(e)) => {
+            tracing::warn!("保存 Webhook 时域名解析失败，暂按可用处理（投递前会再校验）: url={} err={}", body.url, e);
+        }
+        Err(reject) => {
+            return Json(json!({
+                "success": false,
+                "message": format!("回调地址不可用：{}", reject.message())
+            }));
+        }
     }
 
     // 验证 app 归属
@@ -423,15 +443,44 @@ pub async fn fire_webhook(
     let signature = hmac_sha256_hex(&secret, &body);
 
     tokio::spawn(async move {
+        // ── 投递前再次校验目标地址 ─────────────────────────────────────────
+        //
+        // 保存配置时校验过，但那是**过去**的事实：域名可以改解析（DNS rebinding：
+        // 存的时候返回公网 IP 过校验，投递时返回 127.0.0.1），
+        // 库里也可能留着升级前存进去的内网地址。所以每次投递都自己验一遍。
+        let target = match crate::utils::url_guard::check_outbound_url(&url).await {
+            Ok(t) => t,
+            Err(reject) => {
+                tracing::error!(
+                    "Webhook 目标地址校验不通过，本次投递已放弃（不是网络故障）: event={} url={} 原因={}",
+                    event,
+                    url,
+                    reject.message()
+                );
+                return;
+            }
+        };
+
         // ⚠️ 曾用 `.unwrap_or_default()`。两个问题：
         //   1. 构建失败时 `Client::default()` **丢掉上面那个 10 秒超时** ——
         //      一个连不上的回调地址可能让这个连接永久挂着（不阻塞主流程，
         //      但会慢慢堆积，直到连接数耗尽）。
         //   2. 失败完全无痕。
         // 这里改成：失败就放弃本次投递，但明确记日志。
-        let client = match reqwest::Client::builder()
+        //
+        // 另外两个**安全相关**的设置不能省：
+        //   · `redirect::Policy::none()` —— 默认跟随重定向，一条 `302 → 127.0.0.1`
+        //     就能绕过上面所有的地址校验。真实回调服务极少依赖重定向，
+        //     拒绝跟随是最划算的取舍。
+        //   · `resolve(host, ip)` —— 把域名钉死到**刚刚校验过**的那个 IP，
+        //     否则 reqwest 建连时会再解析一次 DNS，两次解析之间就是 rebinding 窗口。
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            .build()
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some((host, addr)) = &target.pin {
+            builder = builder.resolve(host, *addr);
+        }
+        let client = match builder.build()
         {
             Ok(c) => c,
             Err(e) => {

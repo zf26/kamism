@@ -1,6 +1,7 @@
 use crate::middleware::auth::{auth_middleware, AppState};
 use crate::utils::db_guard;
 use crate::utils::jwt::Claims;
+use crate::utils::plan::{extend_plan, ExtendOutcome};
 use crate::models::payment_config::PaymentConfig;
 use axum::{
     extract::{Query, State},
@@ -1363,21 +1364,56 @@ async fn pay_notify(
     // 套餐升级：只有 pro 套餐才需要动商户
     let mut need_upgrade_msg = false;
     if plan == "pro" {
+        // ── 时长落地：统一走 utils::plan::extend_plan ─────────────────────
+        //
+        // ⚠️ 这里曾经是：
+        //     plan_expires_at = COALESCE(plan_expires_at, NOW()) + N days
+        // 两个方向都会错：
+        //   · 商户 40 天前就过期了，现在付 30 天 → 基准是 40 天前 →
+        //     新到期时间仍在 10 天前 → 下一轮扫描立刻降级，**30 天白买**；
+        //   · 永久专业版（plan_expires_at IS NULL）付 30 天 →
+        //     COALESCE(NULL, NOW()) 把**永久**降成 30 天。
+        // 现在的口径见 utils::plan：有效期内叠加、已过期从现在起算、
+        // 免费版从现在起算、永久版不动。
         let update_result = if let Some(days) = expires_days {
-            sqlx::query(
-                "UPDATE merchants SET plan = 'pro', plan_expires_at = COALESCE(plan_expires_at, NOW()) + ($1 || ' days')::INTERVAL, updated_at = NOW() WHERE id = $2",
-            )
-            .bind(days.to_string())
-            .bind(merchant_id)
-            .execute(&mut *tx)
-            .await
+            match extend_plan(&mut *tx, merchant_id, days as i64).await {
+                Ok(ExtendOutcome::Extended { .. }) => Ok(()),
+                Ok(ExtendOutcome::Permanent) => {
+                    // 永久版付费：钱收了，但没有"更多时间"可加。
+                    // 绝不能静默当成成功（那就是收了钱什么都不给），
+                    // 也不能把永久改成 N 天（那是把用户已有的权益收回）。
+                    // 这里保留永久、确认订单、**大声报错**，剩下的退款由人处理。
+                    tracing::error!(
+                        "[{}] 商户 {} 已是永久专业版，本次付费的 {} 天无法叠加（订单已确认收款，需人工处理退款）: order_id={}",
+                        channel_name,
+                        merchant_id,
+                        days,
+                        order_id
+                    );
+                    Ok(())
+                }
+                Ok(ExtendOutcome::NotFound) => {
+                    // 订单的 merchant_id 有 FK 且 ON DELETE CASCADE，
+                    // 订单还在就说明商户还在 —— 正常不可达，出现即异常，记下来但不拦收款。
+                    tracing::error!(
+                        "[{}] 支付回调找不到商户，时长未写入: merchant_id={}, order_id={}",
+                        channel_name,
+                        merchant_id,
+                        order_id
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         } else {
+            // 永久套餐（下单时 expires_days 为空）：显式赋值，与"延长"不是一回事
             sqlx::query(
                 "UPDATE merchants SET plan = 'pro', plan_expires_at = NULL, updated_at = NOW() WHERE id = $1",
             )
             .bind(merchant_id)
             .execute(&mut *tx)
             .await
+            .map(|_| ())
         };
 
         if let Err(e) = update_result {

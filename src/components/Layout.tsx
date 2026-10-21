@@ -4,7 +4,8 @@ import { useAuthStore } from '../stores/auth';
 import { useThemeStore } from '../stores/theme';
 import {
   LayoutDashboard, Package, Key, Activity, Users,
-  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard, KeyRound, Wallet, Monitor, Search
+  Settings, LogOut, Shield, X, Bell, Megaphone, Sun, Moon, ShieldAlert, Network, BookOpen, CreditCard, KeyRound, Wallet, Monitor, Search,
+  ScrollText, UserCog
 } from 'lucide-react';
 import appIcon from '../assets/app-icon.png';
 import { merchantMessagesApi } from '../lib/api';
@@ -45,6 +46,8 @@ const adminPlatformNav: NavItem[] = [
   { label: '支付配置', path: '/admin/payment', icon: <Wallet size={16} /> },
   { label: '订单管理', path: '/admin/orders', icon: <Search size={16} /> },
   { label: '消息管理', path: '/admin/messages', icon: <Megaphone size={16} /> },
+  { label: '操作日志', path: '/admin/audit-logs', icon: <ScrollText size={16} /> },
+  { label: '账号设置', path: '/admin/settings', icon: <UserCog size={16} /> },
 ];
 
 const merchantNav: NavItem[] = [
@@ -96,8 +99,16 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       .catch(() => { if (import.meta.env.DEV) console.warn('拉取公告失败'); });
   }, [role]);
 
+  const handleLogout = () => {
+    logout();
+    navigate('/login');
+  };
+
   // 仅商户端建立 WebSocket 连接，管理员不需要
   useWs({
+    // WS 侧确认会话失效（refresh token 也换不到新令牌）时，按登出处理。
+    // 不接这个回调的话，页面会停在「看起来已登录、实际永远收不到推送」的状态。
+    onAuthLost: handleLogout,
     onMessage: (evt) => {
       if (role !== 'merchant') return;
       setLastEvent(evt);
@@ -136,11 +147,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   };
 
   const navItems = role === 'admin' ? adminPlatformNav : merchantNav;
-
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
-  };
 
   const handleNav = (path: string) => {
     navigate(path);

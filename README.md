@@ -124,9 +124,14 @@ MASTER_KEY=
 ADMIN_EMAIL=admin@example.com
 ADMIN_PASSWORD=Admin@123456
 # 反向代理信任范围（逗号分隔 CIDR）。部署在 Nginx 之后必须配，否则限流会退化成
-# 「全站共用一个 IP 的额度」、IP 黑名单也认不出真实客户端。
-# Docker Compose：172.16.0.0/12；Nginx 与后端同机：127.0.0.1
-TRUSTED_PROXIES=172.16.0.0/12,127.0.0.1
+# 「全站共用一个 IP 的额度」、IP 黑名单也认不出真实客户端。留空 = 不信任任何代理（安全默认值）。
+# 取值必须与实际拓扑一致，且**只写真正会转发请求的那一段**（写大了等于信任了
+# 不该信任的地址，X-Forwarded-For 可以被伪造）：
+#   多容器部署（docker-compose.yml）：172.28.0.0/16
+#       —— 文件末尾 networks 已把网段钉死，两边必须一致，否则「配了也不生效」
+#   单容器部署（docker-compose.standalone.yml）：127.0.0.1
+#   非 Docker、Nginx 与后端同机：127.0.0.1；Nginx 在另一台机器则填它的出口 IP
+TRUSTED_PROXIES=172.28.0.0/16,127.0.0.1
 ```
 
 **支付通道配置**（二选一，默认 MbdPay）：
@@ -169,6 +174,10 @@ docker compose up -d --build
 ```
 
 > 首次构建约需 **10~20 分钟**。
+>
+> ⚠️ 这种方式 `.env` 里的 `TRUSTED_PROXIES` 必须是 `172.28.0.0/16`（或包含它），
+> 因为 `docker-compose.yml` 末尾把容器网段钉死成了 `172.28.0.0/16`。若你改动了该网段，
+> 两处必须同步修改，否则后端看不到真实客户端 IP，限流会退化成「全站共用一个额度」。
 
 ---
 
@@ -259,67 +268,75 @@ npm run tauri build
 
 ### 一、部署服务器端（手动，不使用 Docker）
 
+> 完整版（依赖安装、PostgreSQL/Redis/RabbitMQ 初始化、Nginx 站点与证书、升级与备份、排错表）见
+> [`docs/deploy-baremetal.md`](docs/deploy-baremetal.md)。下面是速查步骤。
+
 ```bash
-# 1. 安装 Rust（服务器上执行）
+# 1. 安装编译工具链（服务器上执行，Rust 需 ≥ 1.88）
+sudo apt install -y build-essential pkg-config libssl-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# 2. 上传源码到服务器（本机执行）
-scp -r src-tauri/ server/ Cargo.toml user@your-server:/opt/kamism/
+# 2. 上传源码：先在服务器上建目录并授权
+#    [服务器] sudo mkdir -p /opt/kamism && sudo chown "$USER" /opt/kamism
+#    再在本机执行（排除 target/ 与 node_modules/，否则要传几百 MB）
+rsync -av --exclude target --exclude node_modules \
+  Cargo.toml Cargo.lock src-tauri server user@your-server:/opt/kamism/
 
-# 3. 服务器上编译
+# 3. 编译后端
 cd /opt/kamism
 cargo build --release -p kamism-server
+sudo install -m 755 target/release/kamism-server /opt/kamism/kamism-server
 
-# 4. 创建数据库
-psql -U postgres -c "CREATE DATABASE kamism;"
+# 4. 建库（用独立角色，不要用 postgres 超级用户跑业务）
+sudo -u postgres psql -c "CREATE USER kamism WITH PASSWORD '数据库强密码';"
+sudo -u postgres psql -c "CREATE DATABASE kamism OWNER kamism;"
 
-# 5. 创建 .env 配置文件
-cat > /opt/kamism/.env << 'EOF'
-DATABASE_URL=postgres://用户名:密码@localhost:5432/kamism
+# 5. 写 .env（三个密钥现场生成，别照抄占位符）
+cat > /opt/kamism/.env << EOF
+DATABASE_URL=postgres://kamism:数据库强密码@127.0.0.1:5432/kamism
 REDIS_URL=redis://127.0.0.1:6379
-AMQP_URL=amqp://guest:guest@localhost:5672/%2f
-RABBITMQ_PASSWORD=mq密码
-JWT_SECRET=随机长密钥
-PORT=9527
+AMQP_URL=amqp://kamism:MQ强密码@127.0.0.1:5672/%2f
+JWT_SECRET=$(openssl rand -hex 32)
+MASTER_KEY=$(openssl rand -hex 32)
 ADMIN_EMAIL=admin@yourdomain.com
-ADMIN_PASSWORD=Admin@强密码
-SMTP_HOST=smtp.qq.com
-SMTP_PORT=465
-SMTP_USER=your@qq.com
-SMTP_PASS=授权码
-SMTP_FROM_NAME=KamiSM
-SMTP_FROM_EMAIL=your@qq.com
+ADMIN_PASSWORD=$(openssl rand -hex 16)
+PORT=9527
+# 同机 Nginx：只信任回环。漏了这行 → 全站共用一个限流额度、IP 黑名单失效
+TRUSTED_PROXIES=127.0.0.1
+FRONTEND_URL=https://yourdomain.com
+VITE_API_URL=https://yourdomain.com/api
 RUST_LOG=info
-VITE_API_URL=https://yourdomain/api
-API_URL=https://yourdomain/api
-MASTER_KEY=xxx(64位16进制字符串)
 EOF
+chmod 600 /opt/kamism/.env
 
-# 6. 用 systemd 守护进程
-sudo tee /etc/systemd/system/kamism.service << 'EOF'
+# 6. systemd 守护
+sudo tee /etc/systemd/system/kamism.service > /dev/null << 'EOF'
 [Unit]
 Description=KamiSM Server
-After=network.target postgresql.service redis.service rabbitmq-server.service
+After=network-online.target postgresql.service redis-server.service rabbitmq-server.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/kamism
 EnvironmentFile=/opt/kamism/.env
-ExecStart=/opt/kamism/target/release/kamism-server
-Restart=on-failure
-RestartSec=5
+ExecStart=/opt/kamism/kamism-server
+# release 用 panic=abort，任何 panic 都会让进程退出 → 必须 always
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable kamism
-sudo systemctl start kamism
+sudo systemctl enable --now kamism
+sudo journalctl -u kamism -n 40 --no-pager   # 看到「数据库迁移完成」「监听端口: 9527」
 ```
 
-首次启动会自动执行数据库迁移并创建管理员账号。
+首次启动会自动执行数据库迁移并创建管理员账号。启动日志里的
+`客户端 IP 策略: 已信任 N 条代理网段` 一定要确认——它是限流和 IP 黑名单是否认得真实客户端的分界线。
 
 ### 二、部署前端（Nginx + 宝塔）
 
@@ -333,9 +350,10 @@ sudo systemctl start kamism
 **构建前端：**
 
 ```bash
-# 前端控制台（在 .env.production 中配置 VITE_API_URL=https://yourdomain.com/api）
-npm install
-npm run build
+# 前端控制台：VITE_API_URL 是**编译期**注入的，换域名必须重新 build
+# 同域部署推荐相对路径 /api（写成 https://yourdomain.com/api 也可以）
+# 注意仓库自带的 .env.production 存的是别的域名，下面这行前置变量会覆盖它
+VITE_API_URL=/api npm run build
 # 上传 dist/ 到服务器 /www/wwwroot/yourdomain.com
 ```
 
@@ -355,18 +373,20 @@ location /api/ {
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
     # 实时推送走 WebSocket，必须带这两个头；用 map 而不是写死 "upgrade"，
     # 否则普通请求也会被声明成长连接（keep-alive 失效）
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
     proxy_read_timeout 3600s;   # 长连接空闲 60s 会被默认超时掐断
     proxy_buffering off;        # 长连接/SSE 必须关闭缓冲
+    client_max_body_size 100m;  # Nginx 默认 1MB，后端放宽到 100MB
 }
 
 # 前端控制台（SPA fallback）
 location / {
-    alias /www/wwwroot/yourdomain.com/;
-    try_files $uri $uri/ /kamism/index.html;
+    root /www/wwwroot/yourdomain.com;
+    try_files $uri $uri/ /index.html;
 }
 ```
 
